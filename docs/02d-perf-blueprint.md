@@ -99,6 +99,30 @@ TMPDIR=$SP/nvtmp nsys profile -t cuda --stats=true -o $SP/sp --force-overwrite t
 - **A1 방향(ncu 지목)**: warp당 다중 output(mMO식, X 재사용 + outstanding W load↑) + float4 vectorized load → MLP↑.
   학습 자산 reference의 m1/mMO 변형 참고(단 X-shared 함정: in-engine으로만 판정).
 
+### STEP A1 — gemv MO + float4 [측정 완료, 한계]
+변경: gemv_f32 → warp당 MO output + float4 load (X는 global/L1, smem 안 씀 = bank conflict 회피).
+정확성: 전 스위트 오차0, spec on==off mismatch 0 (불변).
+| 버전 | plain | spec | ncu |
+|---|---|---|---|
+| baseline(naive) | 65.3 | 80.1 | occupancy 98%, reg 36 |
+| MO=4 | 65.5 | 81.3 | **occupancy 98%→20% 붕괴**, reg 46 (X-shared 함정 재현) |
+| MO=2 (채택) | 66.7 | 81.4 | reg ~40, occupancy 손실 완화 |
+- **결론: gemv MO 최적화 = +2% in-engine (미미).** decode shape가 작아 MO가 병렬성을 latency 은닉 한계 아래로
+  떨굼(occupancy collapse). gemv-internal 헤드룸 거의 없음. MO=2는 작은 실이득이라 유지(정확성 안전).
+
+### ★ nsys가 드러낸 더 큰 레버 (gemv 아님)
+N=80 spec+plain nsys:
+- GPU 커널: gemv 94%(2038M ns), gdn_step 3%, 나머지 <1%. **lm_head gemv 1콜 = 59ms (1GB/59ms = 17GB/s 비정상)**.
+- CUDA API: **cudaMalloc 337M ns(7856콜) + cudaFree 73M = 0.41s** ← mtp_step/decode가 매 호출 scratch malloc/free.
+  cudaLaunchKernel 138M(45100콜), cudaMemcpy 134M.
+- **발견: A1 gemv-internal(+2%)보다 (a) malloc churn 0.41s 제거, (b) lm_head gemv(17GB/s) 수리가 훨씬 큰 레버.**
+  둘 다 gemv 커널 내부 튜닝이 아님 → 전략 재조정 필요. (malloc=낭비제거, lm_head=특정 gemv shape 비효율.)
+
+## PHASE A 게이트 — 결론 (A1 후)
+- gemv MO/float4 = +2% (occupancy-limited, 헤드룸 소진).
+- 진짜 레버 = ① **scratch malloc churn 제거(persistent 버퍼, 0.41s)** ② **lm_head gemv 비효율 진단/수리(17GB/s)**.
+- → 사용자 결정: A1 종료하고 ①②로 갈지 / q4로 갈지 / 종료.
+
 ## PHASE B 게이트 — 결론
 - B1 무효(−2%, draft는 gemv-bound), B2 무효(lm_head memory-bound 불가피). **PHASE B 헤드룸 없음.**
 - 진짜 레버 = PHASE A(gemv, 40%→상향 여지) 또는 q4(8× weight 트래픽↓, 범위 밖이나 대역폭의 본질 레버).
