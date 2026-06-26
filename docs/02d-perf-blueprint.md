@@ -69,6 +69,36 @@ TMPDIR=$SP/nvtmp nsys profile -t cuda --stats=true -o $SP/sp --force-overwrite t
 - PHASE A(gemv 최적화)는 정확히 X-shared 함정 영역(microbench↑ ≠ in-engine↑) — ncu 진단 없이 진행은 위험.
 - 해결: admin이 `NVreg_RestrictProfilingToAdminUsers=0` + 드라이버 리로드, 또는 ncu sudo 실행.
 
+## PHASE A — STEP A0 (ncu 진단, 권한 해결 후)
+
+**환경 변화**: ncu 권한 작업 시 GPU 클럭도 해제된 듯 — baseline t/s ~2× 상승.
+새 baseline: **plain 65.3 / spec 80.1 t/s = 1.227×** (accept 3.76, mismatch 0). 비율은 1.165→1.227로 개선.
+
+### gemv_f32 ncu 지표 (여러 shape)
+| gemv (grid) | Mem TP% | Compute% | sectors/req | Occupancy | Dur | 실제 BW(역산) |
+|---|---|---|---|---|---|---|
+| 768 (in_proj_qkv S=1) | 12% | 7.9% | 4.0 | — | 107us | 235 GB/s* |
+| 11520 (in_proj_qkv S=15) | — | — | 4.0 | — | 410us | ~61 GB/s (25MB W) |
+| 448 (FFN) | 11% | 7% | 4.0 | 89% | 70us | — |
+| 256 | 9.7% | 6.2% | 4.0 | 98% | 46us | — |
+| 30/2 (in_proj_a/b OUT=16) | 0.6% | 0.1% | 4.0 | 21% | 6-16us | 순수 오버헤드 |
+
+(*GB10은 `dram__throughput` 미노출(unified LPDDR5X). ncu "Memory TP%"는 L1/L2 파이프 기준이라 실제 DRAM과
+ 다름. 실제 BW는 duration+W바이트로 역산.)
+
+### 진단 (확정, 추측 아님)
+1. **coalescing 최적**: sectors/req=4.0 (float 32thread×4B=128B=4sector). 접근 패턴 문제 없음.
+2. **compute-bound 아님**: SM throughput 3-8%.
+3. **대역폭 포화 아님**: 큰 gemv도 ~22-86% 변동, 디코드 shape(작은 S)는 22% 수준. tiny gemv는 순수 launch/latency.
+4. **latency/MLP-bound**: occupancy 높아도(89-98%) BW 못 채움 → naive(1 warp/output + 끝 warp-reduce 직렬)가
+   메모리 latency 미은닉, warp당 outstanding load 부족.
+
+### ★ 전략 분기 (게이트 결정)
+- **"비효율 존재" 분기 확정** — fp32 gemv 커널 헤드룸 있음.
+- **q4 아직 무효**: BW의 ~22%만 쓰는 latency-bound 커널은 weight 1/8(q4) 줘도 안 빨라짐. **fp32 gemv 먼저.**
+- **A1 방향(ncu 지목)**: warp당 다중 output(mMO식, X 재사용 + outstanding W load↑) + float4 vectorized load → MLP↑.
+  학습 자산 reference의 m1/mMO 변형 참고(단 X-shared 함정: in-engine으로만 판정).
+
 ## PHASE B 게이트 — 결론
 - B1 무효(−2%, draft는 gemv-bound), B2 무효(lm_head memory-bound 불가피). **PHASE B 헤드룸 없음.**
 - 진짜 레버 = PHASE A(gemv, 40%→상향 여지) 또는 q4(8× weight 트래픽↓, 범위 밖이나 대역폭의 본질 레버).
