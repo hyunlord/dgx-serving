@@ -28,4 +28,16 @@ static inline void launch_add(float *out, const float *a, const float *b, int n,
     add_kernel<<<grid, block, 0, s>>>(out, a, b, n);
 }
 
+// y[i] *= sigmoid(gate[i])  — Qwen3.5 full-attn output gate (gate는 sigmoid, silu 아님)
+__global__ void gate_sigmoid_kernel(float *y, const float *gate, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = y[i] * (1.0f / (1.0f + expf(-gate[i])));
+}
+
+static inline void launch_gate_sigmoid(float *y, const float *gate, int n, cudaStream_t s = 0) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    gate_sigmoid_kernel<<<grid, block, 0, s>>>(y, gate, n);
+}
+
 #endif // DGX_ELEMENTWISE_CUH
