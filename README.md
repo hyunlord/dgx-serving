@@ -37,7 +37,10 @@ make clean
 **2a 완료 (PASS).** Qwen3.5-0.8B 본체 (full attention 6 + GDN/linear attention 18, partial RoPE,
 q/k_norm, output gate, gated delta net). fp32 경로는 HF-fp32와 일치(next-token=11751), q4 경로는
 golden_q4와 단계별 <1e-4. pre-norm hidden(MTP 입력)도 검증. [`docs/02a-qwen35-blueprint.md`](./docs/02a-qwen35-blueprint.md).
-(MTP head = 2b 예정.)
+**2b 완료 (PASS).** MTP(Multi-Token Prediction) head — 과거 Python 4회 0% accept를 돌파.
+torch 레퍼런스(`tools/mtp_reference.py`) 78.6% accept, CUDA 구현(`tests/test_mtp.cu`)이 부품별 <1e-4로
+재현하고 동일 78.6% accept. 핵심: h=post-norm(h_nextn) 확정, prefix attend, partial rope, e=token[P+1].
+[`docs/02b-mtp-blueprint.md`](./docs/02b-mtp-blueprint.md). (speculative 생성 루프 = decode 인프라 단계 예정.)
 
 검증 재현:
 ```bash

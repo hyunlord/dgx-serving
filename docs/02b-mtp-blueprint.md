@@ -115,6 +115,16 @@ accept = mean_P(MTP draft[P] == body greedy argmax[P+1]):
 - pos P1/P0 무차이(짧은 text). 페어링 민감도: token 변경 → draft 4종(정상, e 살아있음 → eh_proj/concat 정확).
 - → **이 torch forward(post-norm)가 CUDA 이식의 검증 골든.** 부품별/최종 logits 대조 후 엔진 accept=78.6% 재현.
 
+## 4.9 ★ STEP 2-3 결과 — CUDA MTP가 골든 재현 (tests/test_mtp.cu)
+
+CUDA MTP head (fp32 경로, eh_proj + 2a full-attn 커널 재사용 + ffn + head):
+- 부품별 vs torch golden: eh_proj x **1.4e-5**, attn cur2 **1.6e-5**, logits **5.0e-5**.
+- **accept = 78.6% (11/14)** — torch 골든과 동일. 과거 0% 완전 돌파를 CUDA에서 입증.
+- 신규 커널 없음 — eh_proj는 rmsnorm_zc+concat(memcpy2D)+gemv_f32, 나머지 2a 재사용.
+
+남은 것(STEP 4 speculative 루프)은 **autoregressive decode + KV 캐시 인프라** 필요(2a에서 stage2+로 미룸).
+2b 핵심 목표(0% 돌파 + 의미있는 accept)는 **달성**. 생성 루프는 decode 인프라 단계에서.
+
 ## 5. (확정) STEP 0 결론 요약
 - KV: 자체+catch-up. pos: 본체 동일(IMRoPE=partial rope). concat: e먼저. eh_proj `{2H,H}`. enorm/hnorm RMS.
 - h 정의: **llama.cpp=post-norm(h_nextn)** 가 유일 권위 레퍼런스(HF 무모듈). 의뢰서=pre-norm. → **양쪽 실측**.

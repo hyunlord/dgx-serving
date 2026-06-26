@@ -24,6 +24,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
     ap.add_argument("--prompt", default="The capital of France is Paris, and the capital of Japan is Tokyo.")
+    ap.add_argument("--dump", default=None, help="CUDA 대조용 골든 디렉토리 (post-norm/P1 기준)")
     args = ap.parse_args()
     import torch
     import torch.nn.functional as F
@@ -70,9 +71,9 @@ def main():
         v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
         return v * (1.0 + weight.float())
 
-    def mtp_forward(h_src, pos_mode):
+    def mtp_forward(h_src, pos_mode, inter=None):
         """h_src: [S,H] body hidden. pos_mode: 'P1'(token pos=P+1) or 'P0'(=P).
-        returns draft argmax per P (length S-1), and a sensitivity probe."""
+        returns draft argmax per P (length S-1). inter(dict) 주면 중간값 채움(CUDA 골든)."""
         M = S - 1
         e = E[ids[0, 1:S]]                         # [M,H] = embed(token[P+1]), P=0..S-2
         h = h_src[0:M]                              # [M,H] = body hidden[P]
@@ -90,6 +91,7 @@ def main():
         # rope (transformers util, partial+mrope). positions:
         pos = torch.arange(1, S) if pos_mode == "P1" else torch.arange(0, M)   # [M]
         cos, sin = rotary(cur.unsqueeze(0), pos.unsqueeze(0))   # [1,M,rot]
+        if inter is not None: inter["cos"] = cos[0]; inter["sin"] = sin[0]
         qh = q.transpose(0, 1).unsqueeze(0)                     # [1,NQ,M,HD]
         kh = k.transpose(0, 1).unsqueeze(0)                     # [1,NKV,M,HD]
         qh, kh = apply_rotary_pos_emb(qh, kh, cos, sin)
@@ -106,6 +108,8 @@ def main():
         g = ff @ w("layers.0.mlp.gate_proj.weight").T; u = ff @ w("layers.0.mlp.up_proj.weight").T
         cur3 = (F.silu(g) * u) @ w("layers.0.mlp.down_proj.weight").T + cur2
         logits = rmsnorm_zc(cur3, w("norm.weight")) @ E.T       # lm_head tie
+        if inter is not None:
+            inter["x"] = x; inter["cur2"] = cur2; inter["logits"] = logits
         return logits.argmax(-1)                                # [M]
 
     print(f"\n=== accept 표: draft[P]==body_argmax[P+1], P=0..{S-2} ===")
@@ -138,6 +142,38 @@ def main():
 
     print(f"\n[mtp-ref] best={best} accept={results[best]*100:.1f}%  "
           f"{'NON-ZERO ✓ (과거 0% 돌파)' if results[best] > 0.01 else '0% — 단계 격리 디버그 필요'}")
+
+    # --- CUDA 대조 골든 덤프 (post-norm / P1 기준) ---
+    if args.dump:
+        import os, json
+        os.makedirs(args.dump, exist_ok=True)
+        d = {}
+        with torch.no_grad():
+            draft = mtp_forward(h_post, "P1", inter=d)
+        def W32(name, t): t.detach().cpu().float().numpy().astype(np.float32).tofile(os.path.join(args.dump, name + ".bin"))
+        W32("body_h_post", h_post)                  # [S,H] MTP 입력 h (post-norm)
+        ids[0].cpu().numpy().astype(np.int32).tofile(os.path.join(args.dump, "token_ids.bin"))  # [S]
+        body_argmax.cpu().numpy().astype(np.int32).tofile(os.path.join(args.dump, "body_argmax.bin"))  # [S]
+        W32("rope_cos", d["cos"]); W32("rope_sin", d["sin"])     # [M,rot]
+        W32("mtp_x", d["x"]); W32("mtp_cur2", d["cur2"]); W32("mtp_logits", d["logits"])  # [M,H]/[M,H]/[M,V]
+        json.dump({"S": S, "M": S - 1, "rot": d["cos"].shape[-1],
+                   "accept_post_P1": results[("post", "P1")],
+                   "draft": draft.cpu().tolist(), "body_next": body_argmax[1:S].cpu().tolist()},
+                  open(os.path.join(args.dump, "meta.json"), "w"), indent=2)
+        # MTP weights (fp32; 2b는 fp32 기준선, q4 MTP는 이후). matmul→_f32.bin, norm→.bin
+        wd = args.dump
+        def wf32(name, t): t.detach().cpu().float().numpy().astype(np.float32).tofile(os.path.join(wd, name + ".bin"))
+        wf32("mtp_fc_f32", w("fc.weight"))
+        wf32("mtp_enorm", w("pre_fc_norm_embedding.weight")); wf32("mtp_hnorm", w("pre_fc_norm_hidden.weight"))
+        wf32("mtp_norm", w("norm.weight"))
+        wf32("mtp_input_layernorm", w("layers.0.input_layernorm.weight"))
+        wf32("mtp_post_attention_layernorm", w("layers.0.post_attention_layernorm.weight"))
+        wf32("mtp_q_norm", w("layers.0.self_attn.q_norm.weight")); wf32("mtp_k_norm", w("layers.0.self_attn.k_norm.weight"))
+        for nm in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            wf32("mtp_" + nm + "_f32", w("layers.0.self_attn." + nm + ".weight"))
+        for nm in ["gate_proj", "up_proj", "down_proj"]:
+            wf32("mtp_" + nm + "_f32", w("layers.0.mlp." + nm + ".weight"))
+        print(f"[mtp-ref] golden+weights(fp32) dumped → {args.dump} (post-norm/P1, accept={results[('post','P1')]*100:.1f}%)")
 
 
 if __name__ == "__main__":
