@@ -26,6 +26,30 @@ static inline void launch_gdn_conv1d_silu(const float *in, const float *w, float
     gdn_conv1d_silu_kernel<<<grid, block, 0, st>>>(in, w, out, S, C, K);
 }
 
+// decode/verify용 conv1d+silu: 직전 K-1 토큰 context(prev [K-1, C]) 를 prepend (zero-pad 대신).
+//   in: [Sq, C], prev: [K-1, C] (시간순; prev[K-2]=가장 최근), out: [Sq, C].
+//   ti = t-(K-1)+j ; ti>=0 → in[ti], ti<0 → prev[K-1+ti]. prev=NULL 이면 zero-pad(=prefill 첫 청크).
+__global__ void gdn_conv1d_silu_decode_kernel(const float *in, const float *prev, const float *w,
+                                              float *out, int Sq, int C, int K) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)Sq * C) return;
+    int c = (int)(idx % C), t = (int)(idx / C);
+    float acc = 0.f;
+    for (int j = 0; j < K; j++) {
+        int ti = t - (K - 1) + j;
+        float xv = 0.f;
+        if (ti >= 0) xv = in[(size_t)ti * C + c];
+        else if (prev) xv = prev[(size_t)(K - 1 + ti) * C + c];
+        acc += w[(size_t)c * K + j] * xv;
+    }
+    out[(size_t)t * C + c] = acc / (1.0f + expf(-acc));
+}
+static inline void launch_gdn_conv1d_silu_decode(const float *in, const float *prev, const float *w,
+                                                 float *out, int Sq, int C, int K, cudaStream_t st = 0) {
+    int block = 256; long n = (long)Sq * C; int grid = (int)((n + block - 1) / block);
+    gdn_conv1d_silu_decode_kernel<<<grid, block, 0, st>>>(in, prev, w, out, Sq, C, K);
+}
+
 // ---- (2) decay g + beta (per head 스칼라) ----
 //   a,b: [S,H] (in_proj_a/b 출력). g[s,h] = -exp(A_log[h]) * softplus(a+dt_bias[h]); beta = sigmoid(b).
 __device__ __forceinline__ float softplus_stable(float x) { return x > 20.f ? x : log1pf(expf(x)); }
@@ -89,6 +113,52 @@ static inline void launch_gdn_delta_rule(const float *Q, const float *K, const f
                                          int S, int NH, int D, cudaStream_t st = 0) {
     size_t shmem = (size_t)(2 * D + 32) * sizeof(float);
     gdn_delta_rule_kernel<<<NH, D, shmem, st>>>(Q, K, V, G, Bt, O, S, NH, D);
+}
+
+// decode/verify용 gated delta rule: 초기 state Sin 에서 시작, Sq 토큰 순차 처리,
+//   각 스텝 후 state 스냅샷을 Ssnap[t] 에 기록(임시 승격용), core_attn_out 출력.
+//   state 레이아웃 [NH, D(k), D(v)] = h*D*D + k*D + v. Sin=NULL 이면 0에서 시작.
+//   block=head, thread=v. (delta rule 수식은 gdn_delta_rule 과 동일 — docs §7.5)
+__global__ void gdn_step_kernel(const float *Q, const float *K, const float *V,
+                                const float *G, const float *Bt,
+                                const float *Sin, float *Ssnap, float *O,
+                                int Sq, int NH, int D) {
+    int h = blockIdx.x, v = threadIdx.x;
+    if (v >= D) return;
+    extern __shared__ float sh[];
+    float *qs = sh, *ks = sh + D, *red = sh + 2 * D;
+    float scol[128];
+    for (int k = 0; k < D; k++) scol[k] = Sin ? Sin[((size_t)h * D + k) * D + v] : 0.f;
+    const float invsD = rsqrtf((float)D);
+
+    for (int t = 0; t < Sq; t++) {
+        size_t base = ((size_t)t * NH + h) * D;
+        float qe = Q[base + v], ke = K[base + v];
+        float sq = block_reduce_sum(qe * qe, red);
+        float sk = block_reduce_sum(ke * ke, red);
+        qs[v] = qe * rsqrtf(sq + 1e-6f) * invsD;
+        ks[v] = ke * rsqrtf(sk + 1e-6f);
+        __syncthreads();
+        float g_t = expf(G[(size_t)t * NH + h]), beta_t = Bt[(size_t)t * NH + h];
+        float kv = 0.f;
+        #pragma unroll 4
+        for (int k = 0; k < D; k++) { scol[k] *= g_t; kv += scol[k] * ks[k]; }
+        float delta = (V[base + v] - kv) * beta_t, out = 0.f;
+        #pragma unroll 4
+        for (int k = 0; k < D; k++) { scol[k] += ks[k] * delta; out += scol[k] * qs[k]; }
+        O[base + v] = out;
+        // 스냅샷 (스텝 t 후 state)
+        float *snap = Ssnap + (size_t)t * NH * D * D + (size_t)h * D * D;
+        for (int k = 0; k < D; k++) snap[(size_t)k * D + v] = scol[k];
+        __syncthreads();
+    }
+}
+
+static inline void launch_gdn_step(const float *Q, const float *K, const float *V,
+                                   const float *G, const float *Bt, const float *Sin,
+                                   float *Ssnap, float *O, int Sq, int NH, int D, cudaStream_t st = 0) {
+    size_t shmem = (size_t)(2 * D + 32) * sizeof(float);
+    gdn_step_kernel<<<NH, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Ssnap, O, Sq, NH, D);
 }
 
 // ---- (4) gated RMSNorm (Qwen3_5RMSNormGated) ----
