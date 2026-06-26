@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.exe
+# compiled test/engine binaries (no extension, produced by nvcc)
+/tests/test_*
+!/tests/*.cu
+!/tests/*.cuh
+
+# Weight dumps / quantized blobs / goldens — never commit big binaries
+*.bin
+*.safetensors
+*.gguf
+ref/
+ref_full/
+ref_mini/
+golden/
+weights/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OMC orchestration runtime state
+.omc/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
