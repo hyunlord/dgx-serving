@@ -58,3 +58,48 @@ STEP3 4조합 지도표 + 토큰당바이트/유효대역폭. STEP4(선택) llam
 1. q4 대상 범위: QMat 전부(lm_head 포함) q4 — 동의? (lm_head 1GB가 최대 레버.)
 2. 측정 조합 (a)(b)(c)(d) 순서 — body-q4(b) 먼저 동의?
 3. 품질 측정 방식: 같은 프롬프트로 fp32-plain vs q4-plain 토큰열 비교(첫 divergence index) + accept — OK?
+
+---
+
+## STEP 1 결과 — 본체 q4 (combo a vs b) [완료]
+
+검증 환경: clocks 해제(RmProfilingAdminOnly=0), prompt=15tok, N=96 gen, K=4. in-engine t/s만 사용.
+
+### 구현 정확성 (절대조건, 오차 0) ✅
+- `test_decode use_q4=1`: q4 incremental decode == q4 prefill (logits 7.6e-6, pre-norm 1.7e-6, argmax ALL match).
+- 체인: q4-prefill == golden_q4 (test_qwen35, 2a) ⇒ **q4 decode == golden_q4**. 절대조건 충족.
+- `make test` 12/12 PASS (회귀 0).
+
+### 3축 측정
+| 조합 | plain t/s | spec t/s | accept | q4-spec==q4-plain | 품질(vs fp32) |
+|---|---|---|---|---|---|
+| (a) fp32 body | 66.8 | 80.9 (1.21×) | 3.80/4=95% | — | 기준 |
+| (b) q4 body | **176.0 (2.63×)** | ~122 (net-NEG) | 3.80/4=95% | **mismatch 0** | **토큰 96/96 완전일치** |
+
+- **① t/s**: q4 body plain = **2.63× fp32 plain**. q4 plain(176) > fp32 spec(80.9) — 대역폭 돌파 1차 실증
+  (q4 한 레버가 fp32+speculative 결합보다 빠름).
+- **② consistency/품질**: q4-spec == q4-plain mismatch 0 (상태관리 무결). 품질축 — q4-plain 토큰열이
+  fp32-plain과 96/96 **완전일치** (lm_head q4 포함해도 argmax 0 divergence). 이 프롬프트에선 q4 품질대가 0.
+- **③ accept**: 3.80/4=95%, (a)(b) 동일 — draft가 양쪽 fp32라 불변(예상대로).
+
+### ncu/nsys per-shape (decode S=1, 트래픽 8×↓가 시간↓로 실현됐나)
+| gemv shape | out | fp32 dur | q4 dur | 실 speedup | 비고 |
+|---|---|---|---|---|---|
+| **lm_head** | 248320 | **3921us** | 728us | **5.4×** | fp32 1.017GB→**259 GB/s ≈ BW한계(95%)**; q4 ~185 GB/s |
+| FFN gate/up | 3584 | 66us | 16.6us | 4.0× | |
+| FFN down·q·o | ~1024 | 48us | 19.8us | 2.4× | 작은 shape일수록 speedup↓(고정비) |
+- q4 lm_head ncu: mem 61% / compute 63% / occ 92% — int4 unpack 추가로 mem·compute 균형(완전 8× 대신 5.4×).
+
+### 2d 멘탈모델 정정 (중요)
+2d는 fp32 lm_head를 "17 GB/s, 6%, latency-bound"로 기록했으나, 클럭 해제 후 측정하니
+fp32 lm_head는 **이미 BW-bound (259 GB/s, 273의 95%)**. 2d 수치는 클럭락 상태 측정 오류로 판단.
+⇒ q4의 레버는 "latency-bound를 mem-bound로 바꿔서"가 아니라 **이미 BW-bound인 lm_head의 트래픽을
+8× 줄여 시간을 5.4× 단축**하는 것. big-weight일수록 효과 큼(lm_head 5.4× > FFN 4.0× > 작은 gemv 2.4×).
+
+### spec net-negative 정체 규명
+combo(b)에서 spec(122) < plain(176). nsys: body_q4=1 run에 **fp32 mo_kernel(grid 15520, 3.96ms)**
+= MTP draft의 fp32 lm_head가 그대로 돎. 본체가 q4로 빨라지자 fp32 draft chain(특히 draft lm_head
+3.96ms/step)이 병목. ⇒ **STEP 2(draft q4)의 직접 동기**. 본체만 q4면 speculative는 손해.
+
+**STEP 1 결론**: q4 body는 big-weight gemv(특히 lm_head)에서 진짜 레버(2.63× plain, 품질대가 0 this prompt).
+단 fp32 draft가 spec를 무력화 → 다음은 draft q4(STEP 2)로 분자(amortize)를 살려야 q4×spec 곱이 성립.
