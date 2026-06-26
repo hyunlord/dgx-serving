@@ -100,6 +100,21 @@ HF 무모듈이므로 **손수 만든 torch MTP가 곧 골든**이다. 과거 0%
 3. 그 torch 레퍼런스의 부품별 중간값을 덤프 → CUDA 부품과 오차 0 대조 → 조립 → 엔진 accept = torch accept 재현.
 → "Python 0%"를 Python에서 먼저 해결(빠른 반복)하고, CUDA는 검증된 레퍼런스를 재현만. 위험 최소.
 
+## 4.8 ★ STEP 1 결과 — 과거 0% 돌파 (tools/mtp_reference.py)
+
+프롬프트 "The capital of France is Paris, and the capital of Japan is Tokyo." (15토큰, 14 draft 위치).
+accept = mean_P(MTP draft[P] == body greedy argmax[P+1]):
+
+| h 시점 | pos | accept |
+|---|---|---|
+| pre  | P1/P0 | 57.1% |
+| **post (h_nextn)** | **P1/P0** | **78.6%** ← best |
+
+- **78.6% accept** — 과거 4번(0%)을 깸. 진범 4개 동시 반영의 결과.
+- **h = post-norm(h_nextn) 확정** (78.6 vs pre 57.1). llama.cpp 일치. **4번째 진범=h 시점** 실증.
+- pos P1/P0 무차이(짧은 text). 페어링 민감도: token 변경 → draft 4종(정상, e 살아있음 → eh_proj/concat 정확).
+- → **이 torch forward(post-norm)가 CUDA 이식의 검증 골든.** 부품별/최종 logits 대조 후 엔진 accept=78.6% 재현.
+
 ## 5. (확정) STEP 0 결론 요약
 - KV: 자체+catch-up. pos: 본체 동일(IMRoPE=partial rope). concat: e먼저. eh_proj `{2H,H}`. enorm/hnorm RMS.
 - h 정의: **llama.cpp=post-norm(h_nextn)** 가 유일 권위 레퍼런스(HF 무모듈). 의뢰서=pre-norm. → **양쪽 실측**.
