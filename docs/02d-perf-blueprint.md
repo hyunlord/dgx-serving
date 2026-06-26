@@ -118,10 +118,24 @@ N=80 spec+plain nsys:
 - **발견: A1 gemv-internal(+2%)보다 (a) malloc churn 0.41s 제거, (b) lm_head gemv(17GB/s) 수리가 훨씬 큰 레버.**
   둘 다 gemv 커널 내부 튜닝이 아님 → 전략 재조정 필요. (malloc=낭비제거, lm_head=특정 gemv shape 비효율.)
 
-## PHASE A 게이트 — 결론 (A1 후)
-- gemv MO/float4 = +2% (occupancy-limited, 헤드룸 소진).
-- 진짜 레버 = ① **scratch malloc churn 제거(persistent 버퍼, 0.41s)** ② **lm_head gemv 비효율 진단/수리(17GB/s)**.
-- → 사용자 결정: A1 종료하고 ①②로 갈지 / q4로 갈지 / 종료.
+### STEP A2 — malloc churn 제거 [측정 완료, ~0% — 내 nsys 해석 오류 정정]
+- qwen35_decode per-call scratch → persistent workspace(ws, ensure-capacity). 정확성 불변(12 tests).
+- **정정**: cudaMalloc 0.41s는 **per-call churn 아니라 startup weight 로딩**(median 848ns 싼 것, max 176ms 1회성).
+  persistent로 콜수 7856→4622 줄었으나 시간 그대로(제거된 게 싼 848ns) → **t/s ~0 이득** (plain 66.7→66.9).
+- persistent scratch는 코드 정리상 유지(해롭지 않음). 단 "malloc churn이 레버"는 **오판이었음** (정직히 기록).
+
+### lm_head 진단 [측정 — outlier였음]
+- lm_head gemv(grid 15760, S=1) = **585us** (정상). nsys의 60ms max는 cold/outlier 1회. 병목 outlier 아님.
+- 진짜 GPU 시간 = **~20000개 medium gemv(median 59us)의 누적** = 94% GPU. GPU 93% busy → gemv-bound 확정.
+
+## PHASE A 게이트 — 결론 (정직한 최종)
+- **fp32 gemv-internal 헤드룸 소진**: MO/float4 +2%(occupancy 한계), malloc ~0%(startup 오판). 합 ~2%.
+- 근본: 단일토큰 decode gemv는 **latency-bound(BW 22%)** — 의뢰서의 알려진 교훈("배칭이 레버"). spec verify(S=5
+  배칭)가 plain보다 빠른 이유. 더 가려면 batching(수준3) 또는:
+- **q4 재평가 (A0 과소평가 정정)**: 큰 weight gemv(lm_head 1GB, FFN, GDN in_proj — weight 바이트의 대부분)는
+  weight-read가 지배적이라 **q4(8× 바이트↓)가 그 gemv들엔 실효 win**. 작은 latency-bound gemv엔 효과 적음.
+  → 즉 q4는 "big-weight gemv"의 레버. fp32 gemv 소진된 지금이 q4 전환 적기.
+- → 사용자 결정: q4 전환(별도 의뢰서) / batching(수준3) / 2d 종료.
 
 ## PHASE B 게이트 — 결론
 - B1 무효(−2%, draft는 gemv-bound), B2 무효(lm_head memory-bound 불가피). **PHASE B 헤드룸 없음.**

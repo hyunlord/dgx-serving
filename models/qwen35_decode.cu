@@ -16,6 +16,16 @@
     fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 
 static float *dm(size_t n){ float*p; DK(cudaMalloc(&p,n*4)); return p; }
+
+// persistent scratch workspace: 호출 순서가 결정적이라 idx별 버퍼가 일관됨. 첫 호출시 할당, 이후 재사용
+// (capacity 부족하면 grow). per-call cudaMalloc/Free churn 제거 (2d 성능).
+#include <vector>
+static std::vector<float*> g_ws; static std::vector<size_t> g_wscap;
+static float *ws(int &idx, size_t n){
+    if ((int)g_ws.size() <= idx) { g_ws.push_back(nullptr); g_wscap.push_back(0); }
+    if (g_wscap[idx] < n) { if (g_ws[idx]) cudaFree(g_ws[idx]); DK(cudaMalloc(&g_ws[idx], n*4)); g_wscap[idx]=n; }
+    return g_ws[idx++];
+}
 static void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4) {
     if (use_q4) launch_gemv_q4(X, m.wq, m.sc, Y, IN, OUT, S);
     else        launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
@@ -74,16 +84,17 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     const int base=st.n_past;
     const size_t SH=(size_t)Sq*H;
 
-    float *x=dm(SH),*norm=dm(SH),*after=dm(SH),*n2=dm(SH);
-    float *qg=dm((size_t)Sq*qdim2),*qb=dm((size_t)Sq*qdim),*gate=dm((size_t)Sq*qdim),*qn=dm((size_t)Sq*qdim);
-    float *kb=dm((size_t)Sq*kvdim),*kn=dm((size_t)Sq*kvdim),*vb=dm((size_t)Sq*kvdim),*attn=dm((size_t)Sq*qdim),*ob=dm(SH);
-    float *mixed=dm((size_t)Sq*convd),*mconv=dm((size_t)Sq*convd);
-    float *qg2=dm((size_t)Sq*kdim),*kg2=dm((size_t)Sq*kdim),*vg2=dm((size_t)Sq*vdim);
-    float *zb=dm((size_t)Sq*vdim),*ab=dm((size_t)Sq*nvh),*bb=dm((size_t)Sq*nvh),*gg=dm((size_t)Sq*nvh),*beta=dm((size_t)Sq*nvh);
-    float *core=dm((size_t)Sq*vdim),*normed=dm((size_t)Sq*vdim),*gout=dm(SH);
-    float *gm=dm((size_t)Sq*FFN),*um=dm((size_t)Sq*FFN),*act=dm((size_t)Sq*FFN),*dbuf=dm(SH),*fn=dm(SH);
-    float *snap=dm((size_t)Sq*nvh*hv*hv);   // per-layer GDN snapshot scratch
-    float *convfull=dm((size_t)(Kk-1+Sq)*convd);
+    int wi=0;  // persistent workspace index (호출마다 0부터, 순서 결정적)
+    float *x=ws(wi,SH),*norm=ws(wi,SH),*after=ws(wi,SH),*n2=ws(wi,SH);
+    float *qg=ws(wi,(size_t)Sq*qdim2),*qb=ws(wi,(size_t)Sq*qdim),*gate=ws(wi,(size_t)Sq*qdim),*qn=ws(wi,(size_t)Sq*qdim);
+    float *kb=ws(wi,(size_t)Sq*kvdim),*kn=ws(wi,(size_t)Sq*kvdim),*vb=ws(wi,(size_t)Sq*kvdim),*attn=ws(wi,(size_t)Sq*qdim),*ob=ws(wi,SH);
+    float *mixed=ws(wi,(size_t)Sq*convd),*mconv=ws(wi,(size_t)Sq*convd);
+    float *qg2=ws(wi,(size_t)Sq*kdim),*kg2=ws(wi,(size_t)Sq*kdim),*vg2=ws(wi,(size_t)Sq*vdim);
+    float *zb=ws(wi,(size_t)Sq*vdim),*ab=ws(wi,(size_t)Sq*nvh),*bb=ws(wi,(size_t)Sq*nvh),*gg=ws(wi,(size_t)Sq*nvh),*beta=ws(wi,(size_t)Sq*nvh);
+    float *core=ws(wi,(size_t)Sq*vdim),*normed=ws(wi,(size_t)Sq*vdim),*gout=ws(wi,SH);
+    float *gm=ws(wi,(size_t)Sq*FFN),*um=ws(wi,(size_t)Sq*FFN),*act=ws(wi,(size_t)Sq*FFN),*dbuf=ws(wi,SH),*fn=ws(wi,SH);
+    float *snap=ws(wi,(size_t)Sq*nvh*hv*hv);   // per-layer GDN snapshot scratch
+    float *convfull=ws(wi,(size_t)(Kk-1+Sq)*convd);
 
     launch_embedding(d_tokens, w.embed, x, Sq, H);
     int lin=0;  // linear-layer 카운터 (S_snap 인덱싱)
@@ -154,8 +165,7 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     if (commit) st.n_past += Sq;
     DK(cudaDeviceSynchronize());
 
-    float* all[]={x,norm,after,n2,qg,qb,gate,qn,kb,kn,vb,attn,ob,mixed,mconv,qg2,kg2,vg2,zb,ab,bb,gg,beta,core,normed,gout,gm,um,act,dbuf,fn,snap,convfull};
-    for(float*p:all) cudaFree(p);
+    // scratch는 persistent (g_ws) — free 안 함. 재사용으로 per-call malloc churn 제거.
     (void)lin;
 }
 
