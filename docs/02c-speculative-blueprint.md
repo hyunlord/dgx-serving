@@ -64,6 +64,36 @@
 1. incremental decode == prefill (오차 0)  2. verify 토큰 == decode 토큰
 3. 사이클 후 상태 == 일반 decode 상태 (오차 0)  4. spec on==off 출력 + t/s + ncu
 
+## 9. ★ 2c 결과 (STEP 1-4 완료, PASS)
+
+검증 4단계 모두 오차 0:
+| STEP | 검증 | 결과 |
+|---|---|---|
+| 1 | incremental decode == prefill | logits 6.2e-6, pre-norm 1.9e-6, argmax ALL |
+| 2 | batch verify == sequential decode + commit=0 불변 | 둘 다 0.0 |
+| 3 | promote(m) 후 상태 == 일반 decode(m) 상태 | 0.0 (GDN S+conv+KV+n_past) |
+| 4 | spec on == off (greedy deterministic) | **mismatch 0** (전 K, N=80) |
+
+**t/s (N=80, fp32 기준선, naive 커널):**
+| K | plain | spec | speedup | avg accept |
+|---|---|---|---|---|
+| 2 | 36.9 | 40.1 | 1.09× | 1.93/2 |
+| **3~4** | 37.0 | **43.3** | **1.17×** | 2.86/3, 3.76/4 (94%) |
+| 5 | 37.0 | 41.0 | 1.11× | 4.67/5 |
+| 6 | 37.0 | 40.9 | 1.11× | 5.54/6 |
+
+**Phase breakdown (K=4, 헌법: 시간 단독 금지)**: draft(MTP chain) 27% / verify(body batch) 68% / catchup+promote 5%.
+- verify(본체 batch)가 가속 엔진: memory-bound라 batch-5가 single decode와 거의 같은 weight 트래픽으로 ~4.76토큰 생산.
+- draft(MTP chain) 27%가 주 오버헤드: 사이클당 K MTP forward(각 full-V lm_head + host argmax) → 수준2 타깃.
+- **catchup+promote 5% — GDN 18MB 임시승격은 무시 가능** (사용자 우려 비용이 실측 미미함을 확인).
+
+**해석**: 78.6% accept(2b)가 생성에서 chain accept 3.76/4(94%)로 이어져 **1.17× 실가속** 달성 — 대역폭 돌파 첫 완결 실증.
+accept-implied 상한(~4.7토큰/사이클)과 갭은 naive 커널의 draft 오버헤드 + 본체 단일decode가 이미 memory-bound라
+batch 이득이 제한된 것. 수준2(device argmax, MTP fuse, gemv 최적화)에서 갭 축소.
+
+### 미완 (수준2+, 별도 의뢰서)
+tree 검증, batch, sampling(temp>0), q4 speculative, 커널 성능 최적화, ncu per-kernel.
+
 ## 8. 사용자 결정 필요
 1. **chain 길이 K** (draft 개수): K=3~4 권장(accept 78.6%면 평균 ~2-3 전진 기대). 시작값?
 2. **GDN 승격 방식**: (a) Stmp K+1 스냅샷 후 accept점 복사(메모리↑ 단순) vs (b) accept 후 committed S에서 n토큰

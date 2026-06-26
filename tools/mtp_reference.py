@@ -155,6 +155,11 @@ def main():
         ids[0].cpu().numpy().astype(np.int32).tofile(os.path.join(args.dump, "token_ids.bin"))  # [S]
         body_argmax.cpu().numpy().astype(np.int32).tofile(os.path.join(args.dump, "body_argmax.bin"))  # [S]
         W32("rope_cos", d["cos"]); W32("rope_sin", d["sin"])     # [M,rot]
+        # 긴 rope 테이블 (생성용, 위치 0..maxpos-1) — spec 루프가 프롬프트 길이 넘어 진행
+        maxpos = 128
+        with torch.no_grad():
+            lc, ls = rotary(h_post.unsqueeze(0), torch.arange(maxpos).unsqueeze(0))
+        W32("rope_cos_long", lc[0]); W32("rope_sin_long", ls[0])  # [maxpos, rot]
         W32("mtp_x", d["x"]); W32("mtp_cur2", d["cur2"]); W32("mtp_logits", d["logits"])  # [M,H]/[M,H]/[M,V]
         json.dump({"S": S, "M": S - 1, "rot": d["cos"].shape[-1],
                    "accept_post_P1": results[("post", "P1")],

@@ -40,7 +40,13 @@ golden_q4와 단계별 <1e-4. pre-norm hidden(MTP 입력)도 검증. [`docs/02a-
 **2b 완료 (PASS).** MTP(Multi-Token Prediction) head — 과거 Python 4회 0% accept를 돌파.
 torch 레퍼런스(`tools/mtp_reference.py`) 78.6% accept, CUDA 구현(`tests/test_mtp.cu`)이 부품별 <1e-4로
 재현하고 동일 78.6% accept. 핵심: h=post-norm(h_nextn) 확정, prefix attend, partial rope, e=token[P+1].
-[`docs/02b-mtp-blueprint.md`](./docs/02b-mtp-blueprint.md). (speculative 생성 루프 = decode 인프라 단계 예정.)
+[`docs/02b-mtp-blueprint.md`](./docs/02b-mtp-blueprint.md).
+
+**2c 완료 (PASS).** Speculative 생성 루프 (chain, greedy, 단일 시퀀스). KV 캐시 3종(full-attn /
+MTP 자체 / GDN recurrent state) + incremental decode + draft/verify/accept + GDN 임시승격. 4단계
+검증 전부 오차 0 (incremental==prefill, verify==decode, promote==decode, spec on==off greedy 완전 일치).
+fp32 기준선에서 **1.17× t/s 가속** (K=4, avg accept 3.76/4=94%) — 대역폭 돌파 첫 완결 실증.
+[`docs/02c-speculative-blueprint.md`](./docs/02c-speculative-blueprint.md). (tree/batch/q4/커널최적화 = 수준2 예정.)
 
 검증 재현:
 ```bash

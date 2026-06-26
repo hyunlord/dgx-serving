@@ -63,7 +63,8 @@ void free_verify_artifacts(VerifyArtifacts &v) { if(v.gdn_snap)cudaFree(v.gdn_sn
 
 void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                    const int *d_tokens, int Sq, const float *d_cos, const float *d_sin,
-                   float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4) {
+                   float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4,
+                   float *d_postnorm) {
     const int H=c.hidden_size, FFN=c.intermediate_size, HD=c.head_dim, V=c.vocab_size;
     const int NQ=c.num_q_heads, NKV=c.num_kv_heads, rot=c.rotary_dim;
     const float eps=c.rms_norm_eps;
@@ -148,6 +149,7 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     }
     if (d_prenorm) DK(cudaMemcpy(d_prenorm,x,SH*4,cudaMemcpyDeviceToDevice));
     launch_rmsnorm_zc(x,w.final_norm,fn,Sq,H,eps);
+    if (d_postnorm) DK(cudaMemcpy(d_postnorm,fn,SH*4,cudaMemcpyDeviceToDevice));  // h_nextn (MTP 입력)
     mm(w.lm_head,fn,d_logits,H,V,Sq,use_q4);
     if (commit) st.n_past += Sq;
     DK(cudaDeviceSynchronize());
