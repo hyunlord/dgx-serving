@@ -103,3 +103,40 @@ combo(b)에서 spec(122) < plain(176). nsys: body_q4=1 run에 **fp32 mo_kernel(g
 
 **STEP 1 결론**: q4 body는 big-weight gemv(특히 lm_head)에서 진짜 레버(2.63× plain, 품질대가 0 this prompt).
 단 fp32 draft가 spec를 무력화 → 다음은 draft q4(STEP 2)로 분자(amortize)를 살려야 q4×spec 곱이 성립.
+
+---
+
+## STEP 2a 결과 — draft lm_head q4 (tied 재사용) [완료]
+
+draft 비용의 94%는 lm_head(254M param=1GB fp32). lm_head는 embedding과 tie_word_embeddings →
+**body의 이미 검증된 `w.lm_head` q4를 draft lm_head 투영에 재사용**(test_spec mtp_step, dq4 토글, argv[6]).
+추가 추출/golden 불필요 — 동일 q4 weight·동일 gemv_q4 커널(2a·STEP1 검증)이라 **구현 정확성 상속**.
+
+### 4조합 지도 (N=96, K=4, clocks 해제, 다회 안정)
+| 조합 | body | draft | plain t/s | spec t/s | spec/plain | accept | mismatch |
+|---|---|---|---|---|---|---|---|
+| (a) fp32 | fp32 | fp32 | 65.5 | 80.9 | 1.24× | 3.80/4 | 0 |
+| (b) body-q4 | q4 | fp32 | 176.0 | 124.5 | **0.71× NEG** | 3.80/4 | 0 |
+| (c) **both-q4** | q4 | q4 | 176.4 | **191~193** | **1.08× POS** | 3.80/4 | 0 |
+| (d) draft-q4 | fp32 | q4 | 65.7 | 102.0 | 1.55× | 3.80/4 | 0 |
+
+### 핵심 결과
+1. **q4×spec 곱 실증 (#1 질문 답).** (c) both-q4 spec = 191~193 t/s로 **net-POSITIVE 회복**
+   (= fp32 plain 65.5의 **2.9×**, fp32 spec 80.9의 **2.36×**). draft도 q4여야 곱이 성립 — 대역폭 돌파 공식 그대로.
+   (b)의 net-negative(0.71×)는 fp32 draft lm_head(3.96ms)가 병목이었고, draft lm_head q4(728us)가 제거.
+2. **accept 전 조합 3.80/4 불변 — draft q4의 accept 대가 0.** lm_head q4 노이즈가 draft argmax를 안 바꿈
+   (STEP 1 body lm_head q4와 동일 현상: argmax가 q4 logits 노이즈 견딤). draft lm_head q4 = **순수 속도 이득**.
+3. **consistency 절대조건 충족.** mismatch 0 전 조합 — draft 정밀도는 최종 출력에 영향 없음(본체 verify가 진실원).
+   (d)는 body fp32라 출력이 fp32-plain과 동일(불변), draft q4로 spec만 1.55× 가속.
+4. **phase breakdown이 기전 확증.** draft(MTP chain) 비중: (b) 50% → (c) **25%** (draft lm_head 절반↓).
+   (c)에서 verify(body batch) 60%가 재차 지배 — 다음 레버는 배칭/verify(별도 챕터).
+
+### draft lm_head이 BW-bound인가 (예측 검증)
+draft lm_head는 body lm_head와 동일 weight(1GB)·동일 커널 → STEP 1의 per-shape 그대로 적용:
+fp32 3.96ms(259 GB/s BW한계) → q4 728us(5.4×). 사용자 예측("draft lm_head도 BW-bound면 q4 효과 클 것") 적중.
+
+### STEP 2a 결론 + 미측정 범위
+lm_head-only draft q4가 **draft-q4 Pareto 최적 후보**: 지배비용(94%) 제거, accept 대가 0, 신규 추출/리스크 0.
+미측정: **MTP 본체 gemv(fc/Wq/Wk/Wv/Wo/Wg/Wu/Wd) q4**는 아직 fp32. 이들은 작은 latency-bound gemv(각 2~4M,
+합 ~15M ≪ lm_head 254M)라 속도 이득은 작을 것이나, draft hidden을 바꿔 **accept를 실제로 떨어뜨릴 수 있음**
+(work order의 "draft 품질 손실→accept↓" 측정 대상). 이건 mtp.* q4 추출+golden(2a 방식)이 필요 → STEP 2b 후보.

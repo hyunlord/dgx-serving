@@ -16,6 +16,7 @@
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemv_f32.cuh"
+#include "../kernels/gemv_q4.cuh"
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
@@ -49,7 +50,8 @@ struct MtpKV { float *Kc,*Vc; int n; };
 static int* g_dmax=nullptr;   // persistent argmax 출력 (per-call malloc 회피)
 static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
                     int e_tok, const float*h_post, int rope_pos, bool append,
-                    const float*d_cos,const float*d_sin, float*d_own, bool want_logits=true){
+                    const float*d_cos,const float*d_sin, float*d_own, bool want_logits=true,
+                    const QMat* lmq=nullptr, int dq4=0){
     const int H=c.hidden_size,HD=c.head_dim,NQ=c.num_q_heads,NKV=c.num_kv_heads,FFN=c.intermediate_size,rot=c.rotary_dim,V=c.vocab_size;
     const int qdim2=NQ*HD*2,qdim=NQ*HD,kvdim=NKV*HD; const float eps=c.rms_norm_eps;
     auto B=[&](size_t n){float*d;CK(cudaMalloc(&d,n*4));return d;};
@@ -82,7 +84,8 @@ static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
     launch_rmsnorm_zc(cur3,m.norm,d_own,1,H,eps);      // own post-norm (다음 step h)
     int best=-1;
     if(want_logits){
-        launch_gemv_f32(d_own,E,logits,H,V,1);          // lm_head tie
+        if(dq4&&lmq) launch_gemv_q4(d_own,lmq->wq,lmq->sc,logits,H,V,1);  // draft lm_head q4 (tied=body lm_head q4, 2a 검증)
+        else         launch_gemv_f32(d_own,E,logits,H,V,1);               // lm_head tie (fp32)
         // B1(device argmax) 측정 결과 역효과(-2%) — draft 비용은 lm_head gemv지 argmax 아님(nsys gemv 90%).
         // host argmax 유지 (DMA+CPU루프가 단일블록 GPU argmax보다 빠름).
         CK(cudaDeviceSynchronize());
@@ -97,16 +100,16 @@ static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
 
 int main(int argc,char**argv){
     WD=argc>1?argv[1]:"artifacts/qwen35-0.8b/weights"; GD=(argc>2?argv[2]:"artifacts/qwen35-0.8b/mtp_golden")+std::string("/");
-    int N=argc>3?atoi(argv[3]):40, K=argc>4?atoi(argv[4]):4;
+    int N=argc>3?atoi(argv[3]):40, K=argc>4?atoi(argv[4]):4, bq4=argc>5?atoi(argv[5]):0, dq4=argc>6?atoi(argv[6]):0;
     ModelConfig c=load_config_qwen((WD+"/manifest.json").c_str());
     const int H=c.hidden_size,V=c.vocab_size,rot=c.rotary_dim,NKV=c.num_kv_heads,HD=c.head_dim;
     std::vector<int> prompt=ri("token_ids.bin"); int P=prompt.size();
     int maxlen=P+N+K+8;
-    printf("[spec] prompt=%d gen=%d K=%d maxlen=%d\n",P,N,K,maxlen);
+    printf("[spec] prompt=%d gen=%d K=%d maxlen=%d body_q4=%d draft_q4=%d\n",P,N,K,maxlen,bq4,dq4);
     std::vector<float> cl=rfg("rope_cos_long.bin",(size_t)128*rot), sl=rfg("rope_sin_long.bin",(size_t)128*rot);
     if(P+N+K>=128){printf("need longer rope table\n");return 1;}
     float *d_cos=up(cl),*d_sin=up(sl);
-    QwenWeights w=load_weights_qwen(WD.c_str(),c,0,1);
+    QwenWeights w=load_weights_qwen(WD.c_str(),c,1,1);  // q4+fp32 둘 다 (use_q4 토글)
     MtpW mw=load_mtp(c); float*E=w.embed;
     int *d_tok; CK(cudaMalloc(&d_tok,maxlen*4));
 
@@ -118,14 +121,14 @@ int main(int argc,char**argv){
         DecodeState st=alloc_decode_state(c,maxlen);
         CK(cudaMemcpy(d_tok,prompt.data(),P*4,cudaMemcpyHostToDevice));
         float *dl,*dpn; CK(cudaMalloc(&dl,(size_t)P*V*4)); CK(cudaMalloc(&dpn,(size_t)P*H*4));
-        qwen35_decode(c,w,st,d_tok,P,d_cos,d_sin,dl,nullptr,1,nullptr,0,dpn);
+        qwen35_decode(c,w,st,d_tok,P,d_cos,d_sin,dl,nullptr,1,nullptr,bq4,dpn);
         std::vector<float> lg((size_t)P*V); CK(cudaMemcpy(lg.data(),dl,lg.size()*4,cudaMemcpyDeviceToHost));
         int cur=argmaxV(lg,P-1);
         clock_t t0=clock();
         for(int i=0;i<N;i++){ out_plain.push_back(cur);
             CK(cudaMemcpy(d_tok,&cur,4,cudaMemcpyHostToDevice));
             float*o; CK(cudaMalloc(&o,(size_t)V*4));
-            qwen35_decode(c,w,st,d_tok,1,d_cos,d_sin,o,nullptr,1,nullptr,0,nullptr);
+            qwen35_decode(c,w,st,d_tok,1,d_cos,d_sin,o,nullptr,1,nullptr,bq4,nullptr);
             std::vector<float> hl(V); CK(cudaMemcpy(hl.data(),o,(size_t)V*4,cudaMemcpyDeviceToHost)); cudaFree(o);
             int b=0;float bv=hl[0];for(int j=1;j<V;j++)if(hl[j]>bv){bv=hl[j];b=j;} cur=b;
         }
@@ -141,7 +144,7 @@ int main(int argc,char**argv){
         MtpKV kv; CK(cudaMalloc(&kv.Kc,(size_t)maxlen*NKV*HD*4)); CK(cudaMalloc(&kv.Vc,(size_t)maxlen*NKV*HD*4)); kv.n=0;
         CK(cudaMemcpy(d_tok,prompt.data(),P*4,cudaMemcpyHostToDevice));
         float *dl,*dpn; CK(cudaMalloc(&dl,(size_t)P*V*4)); CK(cudaMalloc(&dpn,(size_t)P*H*4));
-        qwen35_decode(c,w,st,d_tok,P,d_cos,d_sin,dl,nullptr,1,nullptr,0,dpn);  // prefill, commit
+        qwen35_decode(c,w,st,d_tok,P,d_cos,d_sin,dl,nullptr,1,nullptr,bq4,dpn);  // prefill, commit
         std::vector<float> lg((size_t)P*V); CK(cudaMemcpy(lg.data(),dl,lg.size()*4,cudaMemcpyDeviceToHost));
         int cur=argmaxV(lg,P-1);
         // MTP catch-up over prompt: entry q (1..P-1): (e=token[q], h=Hpost[q-1], pos=q)
@@ -165,7 +168,7 @@ int main(int argc,char**argv){
             int e_tok=cur; float* h_in=h_cur; int pos=st.n_past;
             for(int i=0;i<K;i++){
                 float* own; CK(cudaMalloc(&own,(size_t)H*4));
-                int d=mtp_step(c,mw,kv,E,e_tok,h_in,pos,true,d_cos,d_sin,own);
+                int d=mtp_step(c,mw,kv,E,e_tok,h_in,pos,true,d_cos,d_sin,own,true,&w.lm_head,dq4);
                 drafts.push_back(d); owns.push_back(own);
                 e_tok=d; h_in=own; pos++;
             }
@@ -173,7 +176,7 @@ int main(int argc,char**argv){
             // verify [cur, drafts] at positions n_past..n_past+K
             std::vector<int> vt; vt.push_back(cur); for(int d:drafts) vt.push_back(d);
             CK(cudaMemcpy(d_tok,vt.data(),(K+1)*4,cudaMemcpyHostToDevice));
-            qwen35_decode(c,w,st,d_tok,K+1,d_cos,d_sin,vl,nullptr,/*commit*/0,&va,0,vpn);
+            qwen35_decode(c,w,st,d_tok,K+1,d_cos,d_sin,vl,nullptr,/*commit*/0,&va,bq4,vpn);
             std::vector<float> vlh((size_t)(K+1)*V); CK(cudaMemcpy(vlh.data(),vl,vlh.size()*4,cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(hpn.data(),vpn,hpn.size()*4,cudaMemcpyDeviceToHost));
             // accept: drafts[i]==argmax(verify[i]) longest prefix
@@ -214,6 +217,7 @@ int main(int argc,char**argv){
     printf("  first 12 plain: "); for(int i=0;i<12&&i<N;i++)printf("%d ",out_plain[i]); printf("\n");
     printf("  first 12 spec : "); for(int i=0;i<12&&i<N;i++)printf("%d ",out_spec[i]); printf("\n");
     printf("  mismatches: %d / %d\n",mism,N);
+    printf("  PLAINTOK(bq4=%d):",bq4); for(int i=0;i<N;i++)printf(" %d",out_plain[i]); printf("\n");
 
     free_weights_qwen(w); free_config_qwen(c);
     cudaFree(d_cos);cudaFree(d_sin);cudaFree(d_tok);
