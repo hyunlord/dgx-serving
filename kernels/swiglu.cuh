@@ -2,7 +2,7 @@
 #define DGX_SWIGLU_CUH
 
 // SwiGLU (모델 독립): Y = silu(g) * u, silu(x) = x / (1 + e^-x). g,u,Y: [n].
-__global__ void swiglu_kernel(const float *g, const float *u, float *Y, size_t n) {
+static __global__ void swiglu_kernel(const float *g, const float *u, float *Y, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { float gg = g[i]; float s = gg / (1.0f + expf(-gg)); Y[i] = s * u[i]; }
 }

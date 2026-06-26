@@ -4,13 +4,13 @@
 // 모델 독립 elementwise 커널. residual add 등에 사용.
 // y[i] += x[i]  (in-place 누적). n은 런타임 인자.
 
-__global__ void add_inplace_kernel(float *y, const float *x, int n) {
+static __global__ void add_inplace_kernel(float *y, const float *x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += x[i];
 }
 
 // out[i] = a[i] + b[i]
-__global__ void add_kernel(float *out, const float *a, const float *b, int n) {
+static __global__ void add_kernel(float *out, const float *a, const float *b, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
 }
@@ -29,7 +29,7 @@ static inline void launch_add(float *out, const float *a, const float *b, int n,
 }
 
 // y[i] *= sigmoid(gate[i])  — Qwen3.5 full-attn output gate (gate는 sigmoid, silu 아님)
-__global__ void gate_sigmoid_kernel(float *y, const float *gate, int n) {
+static __global__ void gate_sigmoid_kernel(float *y, const float *gate, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = y[i] * (1.0f / (1.0f + expf(-gate[i])));
 }

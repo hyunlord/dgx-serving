@@ -4,7 +4,7 @@
 
 // fp32 행렬-벡터곱 (양자화 안 한 작은 weight 용, 예: GDN in_proj_a/b).
 //   X: [S, IN], W: [OUT, IN] row-major fp32, Y: [S, OUT].  warp당 1 (s,o).
-__global__ void gemv_f32_kernel(const float *X, const float *W, float *Y, int IN, int OUT, int S) {
+static __global__ void gemv_f32_kernel(const float *X, const float *W, float *Y, int IN, int OUT, int S) {
     long gw = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     if (gw >= (long)S * OUT) return;

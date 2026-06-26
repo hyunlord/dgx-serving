@@ -9,7 +9,7 @@
 //   dequant: (q-8)*scale.  (docs/01-stage1-blueprint.md)
 //   warp당 1 (s,o) 출력. lane이 IN을 32 stride로 누적. 1단계는 정확성 우선(m0 방식).
 // X: [S, IN], Y: [S, OUT]. IN은 QBLK 배수.
-__global__ void gemv_q4_kernel(const float *X, const uint8_t *Wq, const float *sc,
+static __global__ void gemv_q4_kernel(const float *X, const uint8_t *Wq, const float *sc,
                                float *Y, int IN, int OUT, int S) {
     long gw = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;

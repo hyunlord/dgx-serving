@@ -4,7 +4,7 @@
 // RoPE (rotate-half, Llama/HF 방식). 모델 독립.
 //   T: [S, NH, HD] in-place. cos/sin: [S, HD] (앞 HD/2 = 뒤 HD/2, HF cat(freqs,freqs)).
 //   pair (i, i+half): t1'=t1*c - t2*sn ; t2'=t2*c + t1*sn, c=cos[s*HD+i], sn=sin[s*HD+i], i<half.
-__global__ void rope_kernel(float *T, const float *cos, const float *sin,
+static __global__ void rope_kernel(float *T, const float *cos, const float *sin,
                             int S, int NH, int HD) {
     int half = HD >> 1;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -32,7 +32,7 @@ static inline void launch_rope(float *T, const float *cos, const float *sin,
 //   T: [S, NH, HD] in-place. cos/sin: [S, rot_dim] (HF apply_rotary_pos_emb, rotary_dim=cos.shape[-1]).
 //   pair (i, i+rot_dim/2), i<rot_dim/2: t1'=t1*c - t2*sn ; t2'=t2*c + t1*sn, c=cos[s*rot_dim+i].
 //   rot_dim==HD 이면 1단계 full rope 와 동일.
-__global__ void rope_partial_kernel(float *T, const float *cos, const float *sin,
+static __global__ void rope_partial_kernel(float *T, const float *cos, const float *sin,
                                     int S, int NH, int HD, int rot_dim) {
     int half = rot_dim >> 1;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

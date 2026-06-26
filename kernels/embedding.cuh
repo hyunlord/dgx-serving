@@ -2,7 +2,7 @@
 #define DGX_EMBEDDING_CUH
 
 // 임베딩 룩업 (모델 독립). ids: [S], W: [V, H] fp32, Y: [S, H]. 블록당 1 토큰.
-__global__ void embedding_kernel(const int *ids, const float *W, float *Y, int S, int H) {
+static __global__ void embedding_kernel(const int *ids, const float *W, float *Y, int S, int H) {
     int s = blockIdx.x;
     if (s >= S) return;
     int id = ids[s];

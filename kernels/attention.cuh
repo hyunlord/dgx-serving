@@ -7,7 +7,7 @@
 //   블록 = (head h, query qi). blockDim.x = HD. threadIdx.x 가 dim(d) 와 key-pos(j) 두 역할.
 //   ⇒ 제약: S <= HD (1단계 prefill 용도). 동적 shared: qs[HD] + scores[S] + probs[S].
 //   kv head = h / (NQ/NKV) (GQA group).
-__global__ void attn_kernel(const float *Q, const float *K, const float *V, float *O,
+static __global__ void attn_kernel(const float *Q, const float *K, const float *V, float *O,
                             int S, int NQ, int NKV, int HD) {
     int h = blockIdx.x, qi = blockIdx.y, d = threadIdx.x;
     if (qi >= S) return;
@@ -56,7 +56,7 @@ static inline void launch_attn(const float *Q, const float *K, const float *V, f
 //   Q: [Sq, NQ, HD] (decode Sq=1, verify Sq=K+1). Kc/Vc: [Lc, NKV, HD] cache (신규토큰 이미 append됨).
 //   query i (절대위치 base+i) 는 cache[0 .. base+i] 를 causal attend. scale=1/sqrt(HD), GQA.
 //   block=(query i, head h), blockDim=HD. dynamic shared: qs[HD] + scores[base+Sq] (>= 최대 attendlen).
-__global__ void attn_decode_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
+static __global__ void attn_decode_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
                                    int Sq, int NQ, int NKV, int HD, int base) {
     int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     int GRP = NQ / NKV, kv = h / GRP;

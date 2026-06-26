@@ -9,7 +9,7 @@
 // ---- (1) depthwise causal conv1d + silu ----
 //   in: [S, C] (row=time), w: [C, K] (conv1d.weight [C,1,K] squeeze), out: [S, C].
 //   causal: out[t,c] = silu( Σ_{j=0..K-1} w[c,j] * in[t-(K-1)+j, c] ), in[<0]=0. (HF F.conv1d pad=K-1 후 [:S])
-__global__ void gdn_conv1d_silu_kernel(const float *in, const float *w, float *out, int S, int C, int K) {
+static __global__ void gdn_conv1d_silu_kernel(const float *in, const float *w, float *out, int S, int C, int K) {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long)S * C) return;
     int c = (int)(idx % C), t = (int)(idx / C);
@@ -29,7 +29,7 @@ static inline void launch_gdn_conv1d_silu(const float *in, const float *w, float
 // decode/verify용 conv1d+silu: 직전 K-1 토큰 context(prev [K-1, C]) 를 prepend (zero-pad 대신).
 //   in: [Sq, C], prev: [K-1, C] (시간순; prev[K-2]=가장 최근), out: [Sq, C].
 //   ti = t-(K-1)+j ; ti>=0 → in[ti], ti<0 → prev[K-1+ti]. prev=NULL 이면 zero-pad(=prefill 첫 청크).
-__global__ void gdn_conv1d_silu_decode_kernel(const float *in, const float *prev, const float *w,
+static __global__ void gdn_conv1d_silu_decode_kernel(const float *in, const float *prev, const float *w,
                                               float *out, int Sq, int C, int K) {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long)Sq * C) return;
@@ -52,8 +52,8 @@ static inline void launch_gdn_conv1d_silu_decode(const float *in, const float *p
 
 // ---- (2) decay g + beta (per head 스칼라) ----
 //   a,b: [S,H] (in_proj_a/b 출력). g[s,h] = -exp(A_log[h]) * softplus(a+dt_bias[h]); beta = sigmoid(b).
-__device__ __forceinline__ float softplus_stable(float x) { return x > 20.f ? x : log1pf(expf(x)); }
-__global__ void gdn_decay_beta_kernel(const float *a, const float *b, const float *A_log,
+static __device__ __forceinline__ float softplus_stable(float x) { return x > 20.f ? x : log1pf(expf(x)); }
+static __global__ void gdn_decay_beta_kernel(const float *a, const float *b, const float *A_log,
                                       const float *dt_bias, float *g, float *beta, int S, int H) {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long)S * H) return;
@@ -73,7 +73,7 @@ static inline void launch_gdn_decay_beta(const float *a, const float *b, const f
 //   block = head, thread = v(0..D-1), state S[k,v] 의 v열(scol[k]) 을 thread 가 소유. D<=128 가정(head_k=head_v).
 //   못박은 3개(blueprint §7.5): l2norm(q)&l2norm(k) 둘다(sum, eps1e-6) → q만 *1/sqrt(D);
 //   g 스칼라 decay S*=e^g; kv[v]=Σ_k S[k,v]k[k]; Δ=(v-kv)β; S[k,v]+=k[k]Δ; out[v]=Σ_k S[k,v]q[k].
-__global__ void gdn_delta_rule_kernel(const float *Q, const float *K, const float *V,
+static __global__ void gdn_delta_rule_kernel(const float *Q, const float *K, const float *V,
                                       const float *G, const float *Bt, float *O,
                                       int S, int NH, int D) {
     int h = blockIdx.x, v = threadIdx.x;
@@ -119,7 +119,7 @@ static inline void launch_gdn_delta_rule(const float *Q, const float *K, const f
 //   각 스텝 후 state 스냅샷을 Ssnap[t] 에 기록(임시 승격용), core_attn_out 출력.
 //   state 레이아웃 [NH, D(k), D(v)] = h*D*D + k*D + v. Sin=NULL 이면 0에서 시작.
 //   block=head, thread=v. (delta rule 수식은 gdn_delta_rule 과 동일 — docs §7.5)
-__global__ void gdn_step_kernel(const float *Q, const float *K, const float *V,
+static __global__ void gdn_step_kernel(const float *Q, const float *K, const float *V,
                                 const float *G, const float *Bt,
                                 const float *Sin, float *Ssnap, float *O,
                                 int Sq, int NH, int D) {
@@ -163,7 +163,7 @@ static inline void launch_gdn_step(const float *Q, const float *K, const float *
 
 // ---- (4) gated RMSNorm (Qwen3_5RMSNormGated) ----
 //   X,gate: [R, D], W: [D]. y = (x*rsqrt(mean(x^2)+eps) * W) * silu(gate). (weight 표준, 1+w 아님)
-__global__ void rms_norm_gated_kernel(const float *X, const float *gate, const float *W,
+static __global__ void rms_norm_gated_kernel(const float *X, const float *gate, const float *W,
                                       float *Y, int D, float eps) {
     int row = blockIdx.x, tid = threadIdx.x;
     const float *xr = X + (size_t)row * D, *gr = gate + (size_t)row * D;

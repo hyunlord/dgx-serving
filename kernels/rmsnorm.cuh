@@ -4,7 +4,7 @@
 
 // RMSNorm (모델 독립). 블록당 1 row. y = x * rsqrt(mean(x^2)+eps) * W.
 // X,Y: [rows, hh]. W: [hh]. grid = rows, block = THREADS(권장 256).
-__global__ void rmsnorm_kernel(const float *X, const float *W, float *Y, int hh, float eps) {
+static __global__ void rmsnorm_kernel(const float *X, const float *W, float *Y, int hh, float eps) {
     int row = blockIdx.x, tid = threadIdx.x;
     const float *xr = X + (size_t)row * hh;
     float *yr = Y + (size_t)row * hh;
@@ -26,7 +26,7 @@ static inline void launch_rmsnorm(const float *X, const float *W, float *Y,
 // Zero-centered RMSNorm (Qwen3.5 컨벤션): y = x * rsqrt(mean(x^2)+eps) * (1 + W).
 // HF Qwen3_5RMSNorm: output = _norm(x) * (1.0 + weight.float()). input/post/final + q/k_norm 에 사용.
 // q/k_norm 으로 쓸 때: rows = S*num_heads, hh = head_dim (per-head 정규화).
-__global__ void rmsnorm_zc_kernel(const float *X, const float *W, float *Y, int hh, float eps) {
+static __global__ void rmsnorm_zc_kernel(const float *X, const float *W, float *Y, int hh, float eps) {
     int row = blockIdx.x, tid = threadIdx.x;
     const float *xr = X + (size_t)row * hh;
     float *yr = Y + (size_t)row * hh;
