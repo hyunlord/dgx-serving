@@ -3,6 +3,20 @@
 > 2c(정확성·상태관리 완성, 1.17× 가속) 위에서 **성능만**. 정확성 불변이 절대 조건.
 > 헌법: microbench 신뢰 금지 — in-engine end-to-end t/s + ncu/nsys로 판정. 하나씩 측정.
 
+## 0. 2d 완료 — 설계대화 인계 요약 (TL;DR)
+
+**진짜 성과는 +2% t/s가 아니라 진단이다** (성능 영역 = 해석이 가치).
+
+- **gemv는 2종류, 레버가 갈린다**: ① 작은 단일토큰 decode gemv = **latency-bound(BW 22%)** → 레버 = **배칭**
+  (speculative verify가 S=5 배칭이라 spec 82 > plain 67). ② 큰 weight gemv(lm_head 1GB/FFN/in_proj) =
+  weight-read 지배 → 레버 = **q4(8× 바이트↓)**.
+- **fp32 gemv-internal 한계 확정**: MO/float4 = +2%. MO=4는 occupancy 98%→20% 붕괴 — **X-shared 함정을
+  이번엔 ncu로 진단**(과거엔 못 잡고 데였던 것). sectors/req=4.0(coalescing 이미 최적).
+- **두 가설 기각(헌법 추측 금지 모범)**: ⓐ malloc churn 0.41s → 실은 startup weight 로딩(per-call 아님).
+  ⓑ q4 무효(A0) → 실은 big-weight gemv엔 유효(재평가).
+- **상태**: 정확성 100% 불변(spec on==off mismatch 0), 1.227× 유지. 채택 변경 = MO=2 gemv + persistent scratch(안전·중립).
+- **다음 레버(별도 의뢰서)**: big-weight gemv q4 / 배칭 확대(수준3). fp32 gemv 미세최적은 여기서 종료.
+
 ## B0 — Baseline 고정 (재현 가능)
 
 명령: `./tests/test_spec artifacts/qwen35-0.8b/weights artifacts/qwen35-0.8b/mtp_golden 80 4`

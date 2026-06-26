@@ -46,7 +46,12 @@ torch 레퍼런스(`tools/mtp_reference.py`) 78.6% accept, CUDA 구현(`tests/te
 MTP 자체 / GDN recurrent state) + incremental decode + draft/verify/accept + GDN 임시승격. 4단계
 검증 전부 오차 0 (incremental==prefill, verify==decode, promote==decode, spec on==off greedy 완전 일치).
 fp32 기준선에서 **1.17× t/s 가속** (K=4, avg accept 3.76/4=94%) — 대역폭 돌파 첫 완결 실증.
-[`docs/02c-speculative-blueprint.md`](./docs/02c-speculative-blueprint.md). (tree/batch/q4/커널최적화 = 수준2 예정.)
+[`docs/02c-speculative-blueprint.md`](./docs/02c-speculative-blueprint.md).
+
+**2d 완료 (성능 진단).** ncu/nsys 기반 gemv 최적화. 클럭 해제로 baseline 1.227×. fp32 gemv-internal(MO+float4)
+헤드룸 소진(+2%, occupancy 한계 — X-shared 함정을 이번엔 ncu로 진단). 핵심 진단: gemv 2종(작은 decode=latency-bound→
+배칭이 레버 / 큰 weight=read 지배→q4가 레버). 정확성 100% 불변. 다음 레버(q4 / 배칭)는 별도.
+[`docs/02d-perf-blueprint.md`](./docs/02d-perf-blueprint.md).
 
 검증 재현:
 ```bash
