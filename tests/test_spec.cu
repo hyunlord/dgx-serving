@@ -20,6 +20,7 @@
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
+#include "../kernels/argmax.cuh"
 
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 static std::string WD,GD;
@@ -45,6 +46,7 @@ struct MtpKV { float *Kc,*Vc; int n; };
 
 // MTP 1-스텝: (e_tok, h_post) → draft(argmax), own post-norm hidden(d_own[H]). append이면 KV에 추가.
 // want_logits=false(catch-up): lm_head/argmax/host복사 생략 (KV+own hidden만 필요). draft 안 씀.
+static int* g_dmax=nullptr;   // persistent argmax 출력 (per-call malloc 회피)
 static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
                     int e_tok, const float*h_post, int rope_pos, bool append,
                     const float*d_cos,const float*d_sin, float*d_own, bool want_logits=true){
@@ -81,6 +83,8 @@ static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
     int best=-1;
     if(want_logits){
         launch_gemv_f32(d_own,E,logits,H,V,1);          // lm_head tie
+        // B1(device argmax) 측정 결과 역효과(-2%) — draft 비용은 lm_head gemv지 argmax 아님(nsys gemv 90%).
+        // host argmax 유지 (DMA+CPU루프가 단일블록 GPU argmax보다 빠름).
         CK(cudaDeviceSynchronize());
         std::vector<float> hl(V); CK(cudaMemcpy(hl.data(),logits,(size_t)V*4,cudaMemcpyDeviceToHost));
         best=0; float bv=hl[0]; for(int j=1;j<V;j++) if(hl[j]>bv){bv=hl[j];best=j;}
