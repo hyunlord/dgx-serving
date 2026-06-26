@@ -114,7 +114,8 @@ def main():
         if rel == "embed_tokens.weight":
             save_f32("w_embed", t)
             if manifest["tie_word_embeddings"]:
-                errs.append(save_q4("w_lm_head", t))  # tied lm_head
+                errs.append(save_q4("w_lm_head", t))  # tied lm_head (q4)
+                save_f32("w_lm_head_f32", t)           # + fp32 (검증/MTP 기준선 경로)
             continue
         if rel == "norm.weight":
             save_f32("w_final_norm", t); continue
@@ -124,7 +125,9 @@ def main():
         if fn is None:
             continue  # 본체 외 (rotary_emb buffers 등)
         if is_q4(key, t.dim()):
-            errs.append(save_q4(fn, t)); n_q4 += 1
+            errs.append(save_q4(fn, t))      # q4 경로
+            save_f32(fn + "_f32", t)         # fp32 경로 (검증/MTP 기준선)
+            n_q4 += 1
         else:
             save_f32(fn, t); n_f32 += 1
 

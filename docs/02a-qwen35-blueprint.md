@@ -157,7 +157,23 @@ state S 첫 업데이트가 HF와 맞는지 확인 (수식 방향 오류를 가�
 - chunk vs recurrent delta rule 동치 확인(7e-9)이라 GDN 구현 문제 아님 — 순수 양자화 손실.
 - **결정 필요**: (A) q4 본체 유지(프로젝트의 bandwidth 취지에 부합, golden_q4로 정확성 증명 완료) +
   2b MTP도 q4 hidden 위에 구축, vs (B) 2a/MTP는 fp32 경로로 HF-fp32 일치 확인 후 q4는 별도 최적화.
-  → 설계 대화로 가져갈 항목.
+  → **결정(완료): 옵션 B+ — fp32/q4 dual-path.** 아래 §10 참고.
+
+## 10. fp32/q4 dual-path (사용자 결정 반영, 구현·검증 완료)
+
+이유: **MTP head는 fp32 원본 본체에 맞춰 학습** → 2b 검증 기준선은 fp32 본체여야 함.
+q4 본체 위에서 MTP 검증하면 "MTP 오류 vs q4 손실"이 섞여 안 갈림(과거 함정).
+
+구현: `QMat{wq,sc,wf}` 추상화로 precision 1급 토글. `qwen35_forward(..., use_q4)`. extract가 q4+fp32 둘 다 덤프.
+- in_proj_a/b 는 항상 fp32(작은 gating), 나머지 matmul 은 use_q4 로 q4/fp32 선택.
+
+검증 (두 경로 모두 PASS):
+| 경로 | per-layer | pre-norm(MTP) | logits | last-token |
+|---|---|---|---|---|
+| **fp32 vs golden_fp32** | 8.7e-5 | 1.4e-5 | 5.9e-5 | **11751 = HF fp32** ✓ (STEP4c 충족) |
+| **q4 vs golden_q4** | 8.0e-5 | 1.3e-5 | 6.7e-5 | 279 (bandwidth 런타임, 구현 정확성 증명) |
+
+→ **2a 완료.** 2b MTP 는 fp32 본체(11751 경로)를 기준선으로. q4 예측 변화는 양자화 물리현상(버그 아님).
 
 ### (원래) 결정 필요했던 포인트
 1. **GDN 양자화 범위**: in_proj_qkv[6144,1024]/out_proj/in_proj_z만 q4, 작은 것(A_log/dt_bias/conv/norm/in_proj_a,b)은 fp32 — 동의?

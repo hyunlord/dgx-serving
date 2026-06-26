@@ -32,9 +32,12 @@ make clean
 
 ## 상태
 
-**1단계 완료 (PASS).** 공용 커널 라이브러리 + SmolLM3 graph. 5토큰 prefill에서 HF 골든과 레이어별 단계
-대조 통과 (최종 logits vs golden_q4 = 1.3e-4, next-token = HF fp32 일치). 자세한 결과는
-[`docs/01-stage1-blueprint.md`](./docs/01-stage1-blueprint.md).
+**1단계 완료 (PASS).** 공용 커널 라이브러리 + SmolLM3 graph. [`docs/01-stage1-blueprint.md`](./docs/01-stage1-blueprint.md).
+
+**2a 완료 (PASS).** Qwen3.5-0.8B 본체 (full attention 6 + GDN/linear attention 18, partial RoPE,
+q/k_norm, output gate, gated delta net). fp32 경로는 HF-fp32와 일치(next-token=11751), q4 경로는
+golden_q4와 단계별 <1e-4. pre-norm hidden(MTP 입력)도 검증. [`docs/02a-qwen35-blueprint.md`](./docs/02a-qwen35-blueprint.md).
+(MTP head = 2b 예정.)
 
 검증 재현:
 ```bash

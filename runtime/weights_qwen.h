@@ -3,28 +3,30 @@
 #include <cstdint>
 #include "config.h"
 
-// Qwen3.5 디바이스 가중치. full / GDN 레이어 혼합. 미사용 포인터는 NULL.
-// 파일명 = extract_weights_qwen35.py 의 상대키 스킴 (L{i}_<relkey>[_q4|_scale].bin).
+// 행렬곱 weight (q4 또는 fp32, precision 토글로 선택). 둘 다 로드하면 한 엔진이 두 경로 모두 실행 가능.
+//   q4 경로: wq(int4 packed) + sc(scale). fp32 경로: wf.  미로드 포인터는 NULL.
+struct QMat { uint8_t *wq = nullptr; float *sc = nullptr; float *wf = nullptr; };
+
 struct QLayer {
     int      is_full;
     float   *input_ln, *post_ln;
-    // MLP (both)
-    uint8_t *gate, *up, *down;  float *gate_s, *up_s, *down_s;
+    QMat     gate, up, down;                  // MLP (both types)
     // full attention
-    uint8_t *q, *k, *v, *o;     float *q_s, *k_s, *v_s, *o_s;
-    float   *q_norm, *k_norm;
+    QMat     q, k, v, o;  float *q_norm, *k_norm;
     // GDN
-    uint8_t *in_qkv, *in_z, *out_p;  float *in_qkv_s, *in_z_s, *out_s;
+    QMat     in_qkv, in_z, out_p;
     float   *in_a, *in_b, *conv1d, *A_log, *dt_bias, *gdn_norm;
 };
 
 struct QwenWeights {
-    float   *embed, *final_norm;
-    uint8_t *lm_head;  float *lm_head_s;
-    QLayer  *layers;   int L;
+    float  *embed, *final_norm;
+    QMat    lm_head;
+    QLayer *layers;  int L;
+    int     have_q4, have_fp32;   // 로드된 경로
 };
 
-QwenWeights load_weights_qwen(const char *dir, const ModelConfig &c);
+// load_q4/load_fp32: 각 경로 weight 로드 여부. 둘 다 1이면 두 경로 모두 가능.
+QwenWeights load_weights_qwen(const char *dir, const ModelConfig &c, int load_q4, int load_fp32);
 void free_weights_qwen(QwenWeights &w);
 
 #endif // DGX_WEIGHTS_QWEN_H

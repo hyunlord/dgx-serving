@@ -17,10 +17,16 @@
 
 static float *dmalloc(size_t n) { float *p; QK(cudaMalloc(&p, n * 4)); return p; }
 
+// 행렬곱 dispatch: q4(int4 dequant) 또는 fp32 경로.
+static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4) {
+    if (use_q4) launch_gemv_q4(X, m.wq, m.sc, Y, IN, OUT, S);
+    else        launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
+}
+
 // docs/02a-qwen35-blueprint.md 의 forward graph. config 로 dims/레이어타입 받음.
 void qwen35_forward(const ModelConfig &c, const QwenWeights &w,
                     const int *d_ids, int S, const float *d_cos, const float *d_sin,
-                    float *d_logits, float *hidden_dump, float *prenorm_out) {
+                    float *d_logits, float *hidden_dump, float *prenorm_out, int use_q4) {
     const int H = c.hidden_size, FFN = c.intermediate_size, HD = c.head_dim, V = c.vocab_size;
     const int NQ = c.num_q_heads, NKV = c.num_kv_heads, rot = c.rotary_dim;
     const float eps = c.rms_norm_eps;
@@ -53,49 +59,49 @@ void qwen35_forward(const ModelConfig &c, const QwenWeights &w,
 
         if (L.is_full) {
             // q_proj → [S,NQ,2HD] → split Q|gate (per head)
-            launch_gemv_q4(norm, L.q, L.q_s, qg, H, qdim2, S);
+            mm(L.q, norm, qg, H, qdim2, S, use_q4);
             QK(cudaMemcpy2D(qbuf, HD * 4, qg,      2 * HD * 4, HD * 4, (size_t)S * NQ, cudaMemcpyDeviceToDevice));
             QK(cudaMemcpy2D(gate, HD * 4, qg + HD, 2 * HD * 4, HD * 4, (size_t)S * NQ, cudaMemcpyDeviceToDevice));
             launch_rmsnorm_zc(qbuf, L.q_norm, qn, S * NQ, HD, eps);     // q_norm (RoPE 전)
-            launch_gemv_q4(norm, L.k, L.k_s, kbuf, H, kvdim, S);
+            mm(L.k, norm, kbuf, H, kvdim, S, use_q4);
             launch_rmsnorm_zc(kbuf, L.k_norm, kn, S * NKV, HD, eps);    // k_norm
-            launch_gemv_q4(norm, L.v, L.v_s, vbuf, H, kvdim, S);
+            mm(L.v, norm, vbuf, H, kvdim, S, use_q4);
             launch_rope_partial(qn, d_cos, d_sin, S, NQ, HD, rot);
             launch_rope_partial(kn, d_cos, d_sin, S, NKV, HD, rot);
             launch_attn(qn, kn, vbuf, attn, S, NQ, NKV, HD);           // scale=1/sqrt(HD)
             launch_gate_sigmoid(attn, gate, (int)((size_t)S * qdim));  // attn *= sigmoid(gate)
-            launch_gemv_q4(attn, L.o, L.o_s, obuf, qdim, H, S);
+            mm(L.o, attn, obuf, qdim, H, S, use_q4);
             launch_add(after, x, obuf, (int)SH);
         } else {
             // GDN
-            launch_gemv_q4(norm, L.in_qkv, L.in_qkv_s, mixed, H, conv_dim, S);
+            mm(L.in_qkv, norm, mixed, H, conv_dim, S, use_q4);
             launch_gdn_conv1d_silu(mixed, L.conv1d, mconv, S, conv_dim, c.gdn_conv_kernel);
             QK(cudaMemcpy2D(qg2, kdim * 4, mconv,             conv_dim * 4, kdim * 4, S, cudaMemcpyDeviceToDevice));
             QK(cudaMemcpy2D(kg2, kdim * 4, mconv + kdim,      conv_dim * 4, kdim * 4, S, cudaMemcpyDeviceToDevice));
             QK(cudaMemcpy2D(vg2, vdim * 4, mconv + 2 * kdim,  conv_dim * 4, vdim * 4, S, cudaMemcpyDeviceToDevice));
-            launch_gemv_q4(norm, L.in_z, L.in_z_s, zbuf, H, vdim, S);
-            launch_gemv_f32(norm, L.in_a, abuf, H, nvh, S);
+            mm(L.in_z, norm, zbuf, H, vdim, S, use_q4);
+            launch_gemv_f32(norm, L.in_a, abuf, H, nvh, S);            // in_proj_a/b 는 항상 fp32
             launch_gemv_f32(norm, L.in_b, bbuf, H, nvh, S);
             launch_gdn_decay_beta(abuf, bbuf, L.A_log, L.dt_bias, gg, beta, S, nvh);
             launch_gdn_delta_rule(qg2, kg2, vg2, gg, beta, core, S, nvh, hv);
             launch_rms_norm_gated(core, zbuf, L.gdn_norm, normed, S * nvh, hv, eps);
-            launch_gemv_q4(normed, L.out_p, L.out_s, gdnout, vdim, H, S);
+            mm(L.out_p, normed, gdnout, vdim, H, S, use_q4);
             launch_add(after, x, gdnout, (int)SH);
         }
 
         // MLP (공통, SwiGLU)
         launch_rmsnorm_zc(after, L.post_ln, n2, S, H, eps);
-        launch_gemv_q4(n2, L.gate, L.gate_s, g_mlp, H, FFN, S);
-        launch_gemv_q4(n2, L.up,   L.up_s,   u_mlp, H, FFN, S);
+        mm(L.gate, n2, g_mlp, H, FFN, S, use_q4);
+        mm(L.up,   n2, u_mlp, H, FFN, S, use_q4);
         launch_swiglu(g_mlp, u_mlp, act, (size_t)S * FFN);
-        launch_gemv_q4(act, L.down, L.down_s, dbuf, FFN, H, S);
+        mm(L.down, act, dbuf, FFN, H, S, use_q4);
         launch_add(x, after, dbuf, (int)SH);
     }
 
     if (prenorm_out) QK(cudaMemcpy(prenorm_out, x, SH * 4, cudaMemcpyDeviceToDevice));  // MTP 입력 (pre-norm)
     launch_rmsnorm_zc(x, w.final_norm, norm, S, H, eps);                                 // final norm = (1+w)
     if (hidden_dump) QK(cudaMemcpy(hidden_dump + (size_t)c.num_layers * SH, norm, SH * 4, cudaMemcpyDeviceToDevice));
-    launch_gemv_q4(norm, w.lm_head, w.lm_head_s, d_logits, H, V, S);
+    mm(w.lm_head, norm, d_logits, H, V, S, use_q4);
     QK(cudaDeviceSynchronize());
 
     float *all[] = {x, norm, after, n2, qg, qbuf, gate, qn, kbuf, kn, vbuf, attn, obuf,
