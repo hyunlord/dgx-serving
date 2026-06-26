@@ -9,6 +9,9 @@
 //   dequant: (q-8)*scale.  (docs/01-stage1-blueprint.md)
 //   warp당 1 (s,o) 출력. lane이 IN을 32 stride로 누적. 1단계는 정확성 우선(m0 방식).
 // X: [S, IN], Y: [S, OUT]. IN은 QBLK 배수.
+// ch2 STEP1 시도/기각: uint4 contiguous-per-lane 벡터 로드는 weight를 coalesce하나 X를 uncoalesce
+//   (sectors/req 2→30, in-engine 176→104 회귀). weight wide-load과 X coalescing 양립불가 →
+//   X-shared 필요(별도 설계). docs/ch2-q4kernel-blueprint.md STEP1 결과 참고. 현 baseline 유지.
 static __global__ void gemv_q4_kernel(const float *X, const uint8_t *Wq, const float *sc,
                                float *Y, int IN, int OUT, int S) {
     long gw = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;

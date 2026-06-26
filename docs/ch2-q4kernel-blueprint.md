@@ -69,7 +69,47 @@ load 명령 多 → latency 노출. **unpack은 이미 fused(inline shift)이라
 - activation 양자화/DP4A(정확성 위반), q4 비트수·spec 알고리즘 변경, 배칭, vLLM, MoE.
 - microbench만 보고 채택(in-engine 필수). occupancy 붕괴 강행(ncu로 잡고 후퇴).
 
-## 8. 사용자 결정 필요
-1. STEP 1 = **uint4(128bit) 벡터화 로드 + inline unpack, fp32 MAC 유지**(DP4A 제외 — 정확성 위해) — 동의?
-2. 부동소수 합 순서 재배열로 golden 대비 ~1e-6 발생 가능(1e-2 기준 통과 예상). "오차0" 대신 "<1e-4 유지"로 판정 — OK?
-3. 레이아웃 불변(golden 재생성 불요)로 시작, 레이아웃 재packing은 STEP 2에서 필요시 — 동의?
+## 8. 사용자 결정 (합의됨)
+1. STEP 1 = uint4 벡터 로드 + inline unpack, fp32 MAC(DP4A 제외) — 동의.
+2. 판정 = 수치 <1e-4 AND 토큰열 글자단위 일치(argmax 안 뒤집힘) + spec on==off. 토큰 바뀌면 멈추고 보고 — 동의.
+3. 레이아웃 불변 시작, 재packing은 STEP 2 — 동의.
+
+---
+
+## STEP 1 결과 — uint4 벡터 로드 시도 → **기각(in-engine 회귀)** [완료]
+
+### 정확성: 통과
+uint4 contiguous-per-lane 로드 구현(레이아웃 불변). golden_q4 오차 logits 6.68e-6(<1e-4),
+argmax ALL match, **토큰열 STEP0 baseline과 글자단위 동일**, spec mismatch 0, make test 12/12 PASS.
+→ 수치는 완벽히 보존. 그러나:
+
+### in-engine t/s: **회귀 −40%** (176→104 plain, 192→91 spec). 다회 안정적 회귀.
+
+### ncu 원인 규명 (추측 아님)
+| 지표 | baseline | uint4 시도 | 판정 |
+|---|---|---|---|
+| **sectors/req (global ld)** | 2 | **30.7** | X가 uncoalesce (정반대 악화) |
+| L1 throughput | ~55% | 50~99%(saturate) | L1이 병목으로 |
+| memory throughput | 작은 15~27% | 50~73% | weight는 나아졌으나 X가 망침 |
+
+**원인**: contiguous-per-lane 파티션이 weight는 coalesce했지만 **X[s]를 uncoalesce**.
+lane L이 x[L·32 … L·32+31]을 읽어 warp 내 lane간 X stride = 32 float = 128 byte → 요청당 ~30 sector,
+L1 saturate. baseline은 lane이 x[lane],x[lane+32]…로 X 완전 coalesce(L1 89% hit)였음.
+
+### 구조적 결론 (중요)
+**weight wide-load(contiguous-per-lane) ⊥ X-coalescing(strided-per-lane)** — 양립 불가.
+둘 다 만족하려면 **X를 shared로 1회 cooperative coalesced 로드** 후 per-lane이 shared에서 읽어야 함.
+(블록 8 warp가 같은 s면 X 동일 → 블록당 1회 로드로 8 warp 재사용 = 큰 이득 가능.)
+단 이는 **2d의 X-shared occupancy 함정 영역** + s-boundary(prefill S>1 시 블록이 s 경계 straddle) 처리 필요 = 큰 변경.
+
+### 추가 전략 인식 (err-0 제약의 천장)
+llama.cpp q4 우위의 일부는 **int8(q8_1) activation 경로**: 그들 X는 1 byte(우리 fp32 4byte의 1/4 트래픽)+
+coalesced + DP4A. 우리는 err-0 위해 이 경로 제외. ⇒ **fp32 X + err-0 유지 시 X 트래픽이 구조적으로 4× 큼** —
+메모리측 천장이 llama.cpp보다 낮음. err-0-safe 레버는 X-shared(재사용으로 X 트래픽↓)뿐.
+
+### 다음 선택지 (게이트 — 사용자 방향 필요)
+- **(A) X-shared**: X를 블록당 1회 coalesced 로드 → 8 warp 재사용 + contiguous-per-lane wide weight load.
+  측정된 원인(X uncoalesce) 직격. 리스크: 2d occupancy 함정 + s-boundary 정확성. 큰 변경, ncu로 occupancy 감시하며.
+- **(B) baseline 유지 + 전략 전환**: err-0 천장 인정. 진짜 레버(int8 activation=llama.cpp 경로)는
+  별도 "q8 activation + 새 golden" 트랙(err-0을 q8 golden으로 재정의)으로 분리. 챕터2는 여기서 정리.
+- **(C) 소폭 tweak**: lane이 1 byte로 2 nibble 처리(2-lane 로드 중복 제거). X 약간 declustering, 이득 불확실·작음.
