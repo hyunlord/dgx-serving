@@ -21,14 +21,28 @@ DecodeState alloc_decode_state(const ModelConfig &c, int max_len);
 void free_decode_state(DecodeState &s);
 void reset_decode_state(const ModelConfig &c, DecodeState &s);  // n_past=0, S/convctx=0
 
+// verify(commit=0)가 임시승격용으로 노출하는 산출물. alloc/free 헬퍼로 관리.
+//   gdn_snap : [Sq, n_linear, NH*D*D] — 각 토큰 처리 후 GDN state 스냅샷.
+//   conv_mixed: [Sq, n_linear, conv_dim] — conv 입력(in_proj_qkv 출력) per 토큰 (conv ctx 승격용).
+struct VerifyArtifacts {
+    int    Sq, n_linear, state_sz, conv_dim;
+    float *gdn_snap;
+    float *conv_mixed;
+};
+VerifyArtifacts alloc_verify_artifacts(const ModelConfig &c, int max_Sq);
+void free_verify_artifacts(VerifyArtifacts &v);
+
 // 본체 incremental decode/verify. Sq 토큰(d_tokens, pos n_past..n_past+Sq-1) 처리.
 //   d_logits: [Sq, V] 출력. d_prenorm: nullable [Sq, H] (final-norm 전 = MTP 입력).
-//   commit=1: KV append 확정 + S/convctx/n_past 갱신 (일반 decode).
-//   commit=0: KV는 임시 슬롯에 append하나 n_past 미전진, S/convctx committed 불변 (verify, STEP2).
-//             대신 S_snap(nullable, [Sq, n_linear, NH, D, D])에 스텝별 GDN state 스냅샷 기록.
+//   commit=1: KV append 확정 + S/convctx/n_past 갱신 (일반 decode). va 무시.
+//   commit=0: committed S/convctx/n_past 불변 (verify). va!=NULL이면 스텝별 GDN snapshot + conv mixed 기록.
 //   d_cos/d_sin: [max_len, rot] rope 테이블 (위치 p → row p). use_q4: fp32(0) 기준선.
 void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                    const int *d_tokens, int Sq, const float *d_cos, const float *d_sin,
-                   float *d_logits, float *d_prenorm, int commit, float *S_snap, int use_q4);
+                   float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4);
+
+// verify 후 앞 m 토큰을 committed 로 승격 (임시승격: GDN snap[m-1] 복사 + conv ctx 갱신 + n_past+=m).
+//   KV/cache 의 [n_past..n_past+m-1] 은 verify 중 이미 기록됨 → 길이 포인터만 전진.
+void promote_prefix(const ModelConfig &c, DecodeState &st, const VerifyArtifacts &va, int m);
 
 #endif // DGX_DECODE_STATE_H

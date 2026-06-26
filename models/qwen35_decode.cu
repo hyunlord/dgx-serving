@@ -50,9 +50,20 @@ void free_decode_state(DecodeState &s) {
     s.Kc=s.Vc=s.S=s.convctx=nullptr;
 }
 
+VerifyArtifacts alloc_verify_artifacts(const ModelConfig &c, int max_Sq) {
+    VerifyArtifacts v{}; v.Sq = max_Sq;
+    int nl = 0; for (int l=0;l<c.num_layers;l++) if(!c.layer_is_full[l]) nl++;
+    v.n_linear = nl; v.state_sz = c.gdn_num_v_heads * c.gdn_head_v_dim * c.gdn_head_v_dim;
+    v.conv_dim = cfg_gdn_conv_dim(&c);
+    v.gdn_snap = dm((size_t)max_Sq * nl * v.state_sz);
+    v.conv_mixed = dm((size_t)max_Sq * nl * v.conv_dim);
+    return v;
+}
+void free_verify_artifacts(VerifyArtifacts &v) { if(v.gdn_snap)cudaFree(v.gdn_snap); if(v.conv_mixed)cudaFree(v.conv_mixed); v.gdn_snap=v.conv_mixed=nullptr; }
+
 void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                    const int *d_tokens, int Sq, const float *d_cos, const float *d_sin,
-                   float *d_logits, float *d_prenorm, int commit, float *S_snap, int use_q4) {
+                   float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4) {
     const int H=c.hidden_size, FFN=c.intermediate_size, HD=c.head_dim, V=c.vocab_size;
     const int NQ=c.num_q_heads, NKV=c.num_kv_heads, rot=c.rotary_dim;
     const float eps=c.rms_norm_eps;
@@ -107,8 +118,14 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             launch_gdn_decay_beta(ab,bb,L.A_log,L.dt_bias,gg,beta,Sq,nvh);
             // gdn_step from committed S, Sq steps, snapshot
             launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv);
-            if (S_snap) {  // verify: per-step snapshots → caller buffer [Sq, n_linear, NH, D, D]
-                // (STEP2에서 사용) 여기선 단순 복사 생략 가능 — STEP2 구현시 채움
+            if (!commit && va) {  // verify: per-step GDN snapshot + conv mixed → va (승격용)
+                size_t ssz=(size_t)nvh*hv*hv;
+                for(int t=0;t<Sq;t++)
+                    DK(cudaMemcpy(va->gdn_snap + ((size_t)t*va->n_linear + lin)*ssz,
+                                  snap + (size_t)t*ssz, ssz*4, cudaMemcpyDeviceToDevice));
+                for(int t=0;t<Sq;t++)
+                    DK(cudaMemcpy(va->conv_mixed + ((size_t)t*va->n_linear + lin)*convd,
+                                  mixed + (size_t)t*convd, (size_t)convd*4, cudaMemcpyDeviceToDevice));
             }
             if (commit) {
                 // 최종 state = snap[Sq-1]
@@ -138,4 +155,27 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     float* all[]={x,norm,after,n2,qg,qb,gate,qn,kb,kn,vb,attn,ob,mixed,mconv,qg2,kg2,vg2,zb,ab,bb,gg,beta,core,normed,gout,gm,um,act,dbuf,fn,snap,convfull};
     for(float*p:all) cudaFree(p);
     (void)lin;
+}
+
+// verify 후 앞 m 토큰 승격. KV는 verify 중 cache[n_past..] 에 이미 기록됨 → n_past 전진만.
+//   GDN: S[l] = snapshot[m-1]. conv ctx: [old_ctx(K-1) ++ conv_mixed[0..m-1]] 의 마지막 K-1.
+void promote_prefix(const ModelConfig &c, DecodeState &st, const VerifyArtifacts &va, int m) {
+    const int nvh=c.gdn_num_v_heads, hv=c.gdn_head_v_dim, convd=cfg_gdn_conv_dim(&c), Kk=c.gdn_conv_kernel;
+    const size_t ssz=(size_t)nvh*hv*hv;
+    float *cf=dm((size_t)(Kk-1+m)*convd);   // [old K-1 ; m] 임시
+    int j=0;
+    for(int l=0;l<c.num_layers;l++){
+        if(c.layer_is_full[l]) continue;
+        // GDN state 승격
+        DK(cudaMemcpy(st.S[l], va.gdn_snap + ((size_t)(m-1)*va.n_linear + j)*ssz, ssz*4, cudaMemcpyDeviceToDevice));
+        // conv ctx 승격: old(K-1) ++ mixed[0..m-1][j]
+        DK(cudaMemcpy(cf, st.convctx[l], (size_t)(Kk-1)*convd*4, cudaMemcpyDeviceToDevice));
+        for(int t=0;t<m;t++)
+            DK(cudaMemcpy(cf+(size_t)(Kk-1+t)*convd, va.conv_mixed + ((size_t)t*va.n_linear + j)*convd,
+                          (size_t)convd*4, cudaMemcpyDeviceToDevice));
+        DK(cudaMemcpy(st.convctx[l], cf+(size_t)m*convd, (size_t)(Kk-1)*convd*4, cudaMemcpyDeviceToDevice));
+        j++;
+    }
+    st.n_past += m;
+    cudaFree(cf);
 }
