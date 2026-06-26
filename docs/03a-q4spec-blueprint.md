@@ -140,3 +140,72 @@ lm_head-only draft q4가 **draft-q4 Pareto 최적 후보**: 지배비용(94%) �
 미측정: **MTP 본체 gemv(fc/Wq/Wk/Wv/Wo/Wg/Wu/Wd) q4**는 아직 fp32. 이들은 작은 latency-bound gemv(각 2~4M,
 합 ~15M ≪ lm_head 254M)라 속도 이득은 작을 것이나, draft hidden을 바꿔 **accept를 실제로 떨어뜨릴 수 있음**
 (work order의 "draft 품질 손실→accept↓" 측정 대상). 이건 mtp.* q4 추출+golden(2a 방식)이 필요 → STEP 2b 후보.
+
+> **STEP 2b 스킵 결정 (사용자).** MTP 본체 q4 = 이득(속도 +2~3% 추정)<리스크(accept↓). lm_head-only
+> draft q4가 이미 draft-q4 파레토 최적(191 t/s, accept 0, 리스크 0). 추후 지도 완성도 필요시 측정.
+
+---
+
+## STEP 3a 결과 — 유효 대역폭 / 토큰당 바이트 (지도 정량화) [완료]
+
+weight 바이트(disk 실측): big-weight fp32 `_f32` 합 = **3.005 GB**(lm_head 1.017GB 포함), q4 = packed 375.6MB
++ scale 93.9MB = **469.6MB** (6.4×; scale가 8×를 6.4×로). small fp32-only(norm/conv/in_a·b/A_log/dt) 4.35MB.
+embedding(1.017GB)은 decode서 row-gather(1토큰=1024 float)라 per-token read 제외.
+
+토큰당 weight 바이트 모델: body 1회 read B_body(fp32 3009MB / q4 473.9MB), MTP draft 1스텝 M_draft
+(lm_head 포함: fp32 1101MB / q4 242.8MB), catch-up 1스텝 M_catch(lm_head 없음, MTP본체 fp32 83.9MB).
+spec/cycle = K·M_draft + B_body + (a+1)·M_catch, tokens/cycle = a+1(=4.80, K=4 accept 3.80).
+
+| 조합 | 측정 t/s(plain·spec) | 바이트/토큰(plain·spec) | vs fp32-plain | 유효 fp32환산 BW(spec) | 실 BW(spec) |
+|---|---|---|---|---|---|
+| (a) fp32/fp32 | 65.5 · 80.9 | 3009 · 1628 MB | 1.0× · 1.8× | 80.9×3009=**243 GB/s** | 132 GB/s |
+| (b) q4/fp32 | 176.0 · 124.5 | 473.9 · 1100 MB | 6.3× · 2.7× | 124.5×3009=375 GB/s | 137 GB/s |
+| (c) **q4/q4** | 176.4 · **191** | 473.9 · **385 MB** | 6.3× · **7.8×** | 191×3009=**575 GB/s** | 73.5 GB/s |
+| (d) fp32/q4 | 65.7 · 102.0 | 3009 · 913 MB | 1.0× · 3.3× | 102×3009=307 GB/s | 93 GB/s |
+
+- **대역돌파 헤드라인**: (c) both-q4 spec는 토큰당 fp32-plain의 **7.8× 적은 바이트**(385MB). fp32-환산 유효
+  대역폭 **575 GB/s = 물리 273의 2.1×** — "유효 대역폭이 물리 한계를 넘은 것처럼"을 정량 실증.
+- **정직한 한계(실 BW)**: (c)의 *실제* BW 이용률은 73.5 GB/s = 물리의 **27%**뿐. 즉 토큰당 바이트는 7.8×
+  줄였지만 t/s는 2.9×만 실현 — 나머지(7.8→2.9)는 **naive q4 gemv가 BW-bound가 아니라 unpack/latency-bound**라
+  못 살림. (a) fp32-plain 실 BW 197 GB/s(72%) vs (c) q4 27% → **q4 경로가 대역폭을 못 쓰고 있다**(개선 여지).
+- ncu 교차검증: STEP1서 fp32 lm_head 1.017GB/3.92ms = 259 GB/s(이론=실측 일치) → 바이트 모델 커널 단위 검증.
+
+## STEP 3b 결과 — llama.cpp 공정 비교 [완료]
+
+llama.cpp-mtp(`~/repos/llama.cpp-mtp`, build 84de01a)가 **`qwen3_5`(GDN+MTP) 아키텍처를 런타임 지원**.
+같은 모델(Qwen3.5-0.8B)을 GGUF 변환(convert_hf_to_gguf `_Qwen35MtpMixin`) → f16 + Q4_K_M(541.9MB,
+우리 q4 469.6MB와 근사). **같은 기기·같은 세션·클럭 해제 상태·동일 N=96**에서 나란히 측정.
+llama.cpp MTP는 `--spec-type draft-mtp --spec-draft-n-max 4`(GGUF 내장 nextn head = 우리와 동일 self-spec 기법).
+
+| 엔진 | 정밀도 | plain t/s | spec t/s | spec 기법 |
+|---|---|---|---|---|
+| **ours** | fp32 | 65.5 | 80.9 (1.24×) | MTP(우리 구현) |
+| **ours** | q4(sym int4/blk32) | 176 | **191 (1.08×)** | MTP(우리 구현) |
+| **llama.cpp** | F16 | 141.5 | 182.5 (1.29×) | draft-mtp |
+| **llama.cpp** | Q4_K_M | 266 | **314 (1.18×)** | draft-mtp |
+
+### 정직한 해석 — 우리는 어디 있나
+1. **q4에서 1.5~1.6× 뒤짐.** q4 plain 176 vs 266(1.51×), q4 spec 191 vs 314(1.64×). 같은 모델·근사 비트.
+   격차의 정체 = **성숙한 K-quant gemv 커널 vs 우리 naive 1-warp/output gemv_q4.** 3a의 "q4 실 BW 27%"가
+   원인을 못박음: 우리 q4 커널이 대역폭을 못 쓴다(fused dequant·메모리레이아웃 미최적).
+2. **fp32/f16 경로는 거의 대등.** 우리 fp32-plain 실 BW 197 GB/s vs llama.cpp F16-plain 224 GB/s(141.5×1546MB)
+   = **88%**. dense gemv는 이미 성숙 커널의 ~90% 효율 — **격차는 fp32-vs-f16 정밀도(바이트 2×)지 커널 품질 아님.**
+   즉 따라잡을 대상은 **q4 커널**에 집중돼 있음(fp32는 거의 다 왔음).
+3. **두 엔진 다 MTP self-spec, spec 이득도 우리가 작음**(1.08× vs 1.18×). 우리 spec가 verify(body batch)
+   재지배(phase 60%)로 덜 amortize. llama.cpp는 verify/batch가 더 효율적.
+4. **품질**: 둘 다 lossless-speculative(greedy verify=정확). 우리 spec==plain mismatch 0, q4 토큰==fp32 96/96.
+   교차 엔진 토큰 동일성은 quant scheme(int4/blk32 vs K-quant)+chat template 차이로 비교 무의미(기록).
+
+### 공정성 caveat (기록)
+- 우리 q4 = symmetric int4 per-32블록; Q4_K_M = K-quant(super-block, 혼합 4/6bit). 비트예산 근사(우리 0.625B/w
+  incl scale vs Q4_K_M ~0.56B/w)이나 방식 다름. fp32(ours)↔f16(llama)도 정밀도 다름(우리 f16 경로 없음).
+- 우리 t/s는 매 토큰 logits D2H copy + host argmax 포함(llama.cpp는 on-GPU 샘플링) — 우리 정직한 엔진 비용이자
+  알려진 최적화 타깃. llama.cpp는 chat template 사용(tg t/s는 순수 생성이라 decode 비교엔 공정).
+
+### STEP 3 결론 — 대역폭 돌파 챕터1 마무리
+- **내부 지도**: q4×spec 곱으로 토큰당 바이트 7.8×↓, fp32-환산 유효대역 2.1× 돌파(575 GB/s 상당). 단 실 BW
+  27%로 **naive q4 커널이 천장** — 돌파 잠재력의 ~1/3만 실현 중.
+- **외부 좌표**: 같은 모델서 llama.cpp Q4_K_M가 plain 266/spec 314로 우리(176/191)보다 1.5~1.6× 앞섬.
+  **격차는 전적으로 q4 gemv 커널 성숙도**(fp32는 88% 대등). = 다음 챕터의 명확한 타깃: **q4 gemv 커널 최적화**
+  (fused dequant, 메모리 레이아웃, on-GPU 샘플링). 여기를 따라잡으면 spec까지 곱해 llama.cpp 추월 여지.
+- vLLM 비교는 STEP 3.5(별도, sm_121 미지원 빌드 셋업).

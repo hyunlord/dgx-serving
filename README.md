@@ -53,6 +53,13 @@ fp32 기준선에서 **1.17× t/s 가속** (K=4, avg accept 3.76/4=94%) — 대�
 배칭이 레버 / 큰 weight=read 지배→q4가 레버). 정확성 100% 불변. 다음 레버(q4 / 배칭)는 별도.
 [`docs/02d-perf-blueprint.md`](./docs/02d-perf-blueprint.md).
 
+**3a 완료 (대역폭 돌파 챕터1 — q4×spec 지도).** 본체 q4(2.63× plain) + draft lm_head q4(tied 재사용) →
+both-q4 spec **191 t/s = fp32 plain의 2.9×**, q4-spec net-POSITIVE 회복. accept 대가 0(lm_head q4가 argmax 견딤),
+구현 오차0·mismatch0 유지. 토큰당 바이트 7.8×↓, fp32-환산 유효대역 575 GB/s(물리 273의 2.1×). 단 실 BW 27%
+= naive q4 커널이 천장. **llama.cpp 공정 비교**(같은 모델/세션, GDN 런타임 지원 확인): q4 plain 176 vs 266,
+q4 spec 191 vs 314 — **1.5~1.6× 뒤짐, 격차는 전적으로 q4 gemv 커널 성숙도**(fp32 경로는 88% 대등).
+다음 타깃 = q4 gemv 커널 최적화. [`docs/03a-q4spec-blueprint.md`](./docs/03a-q4spec-blueprint.md).
+
 검증 재현:
 ```bash
 # (레퍼런스 venv 사용) 가중치/골든 생성 — 1회
