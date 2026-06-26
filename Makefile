@@ -29,6 +29,9 @@ tests/test_qwen35: tests/test_qwen35.cu models/qwen35.cu runtime/weights_qwen.cu
 tests/test_decode: tests/test_decode.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_decode.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu -o $@
 
+tests/test_verify: tests/test_verify.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_verify.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu -o $@
+
 # 단일 TU 테스트 (header-only 커널만 사용).
 tests/%: tests/%.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@
