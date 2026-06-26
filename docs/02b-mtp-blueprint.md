@@ -125,6 +125,23 @@ CUDA MTP head (fp32 경로, eh_proj + 2a full-attn 커널 재사용 + ffn + head
 남은 것(STEP 4 speculative 루프)은 **autoregressive decode + KV 캐시 인프라** 필요(2a에서 stage2+로 미룸).
 2b 핵심 목표(0% 돌파 + 의미있는 accept)는 **달성**. 생성 루프는 decode 인프라 단계에서.
 
+## 0. 2b 완료 — 설계대화 인계 요약 (TL;DR)
+
+**과거 Python 4회(v1~v5) 0% accept를 돌파.** torch 레퍼런스 78.6% → CUDA가 부품별 <1e-4 재현, 동일 78.6%.
+
+| 진범 | 과거(틀림) | 이번(맞음) | 출처 |
+|---|---|---|---|
+| attn | self-only(out=V) | **prefix causal attend** | llama.cpp build_attn_inp_kv |
+| rope | 손수짠 `/half` 버그 | **검증된 partial rope** (2a, util 차용) | — |
+| 페어링 e | argmax/token[P] | **e=embed(token[P+1])** | speculative.cpp |
+| **h 시점** | **pre-norm** | **post-norm(h_nextn)** ← 4번째 진범 | qwen35.cpp:209-212, 실측 78.6 vs 57.1 |
+
+- KV: MTP **자체 캐시 + catch-up**(본체 공유 아님). pos: 본체 동일. eh_proj concat=e먼저. embed/lm_head tie.
+- 검증: HF 무모듈 → torch 레퍼런스가 골든. accept=fp32 본체 기준선(q4 안 섞음).
+- 산출물: `tools/mtp_reference.py`(골든+가중치 덤프), `tests/test_mtp.cu`(CUDA 검증). 신규 커널 0 — 2a 재사용.
+- **미완(별도 의뢰서)**: speculative 생성 루프 — autoregressive decode + KV 3종(GDN state/full-attn/MTP catch-up)
+  + draft/verify/accept/rollback 인프라. 2a에서 stage2+로 미룬 부분. accept 78.6%로 MTP 정확성은 이미 입증.
+
 ## 5. (확정) STEP 0 결론 요약
 - KV: 자체+catch-up. pos: 본체 동일(IMRoPE=partial rope). concat: e먼저. eh_proj `{2H,H}`. enorm/hnorm RMS.
 - h 정의: **llama.cpp=post-norm(h_nextn)** 가 유일 권위 레퍼런스(HF 무모듈). 의뢰서=pre-norm. → **양쪽 실측**.
