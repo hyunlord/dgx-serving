@@ -32,4 +32,14 @@ make clean
 
 ## 상태
 
-1단계 진행 중: 공용 커널 라이브러리 + SmolLM3 graph, HF fp32 출력과 오차 < 1e-2 일치 목표.
+**1단계 완료 (PASS).** 공용 커널 라이브러리 + SmolLM3 graph. 5토큰 prefill에서 HF 골든과 레이어별 단계
+대조 통과 (최종 logits vs golden_q4 = 1.3e-4, next-token = HF fp32 일치). 자세한 결과는
+[`docs/01-stage1-blueprint.md`](./docs/01-stage1-blueprint.md).
+
+검증 재현:
+```bash
+# (레퍼런스 venv 사용) 가중치/골든 생성 — 1회
+PY=~/github/gb10-cuda-ht/07-engine/.venv/bin/python
+$PY tools/extract_weights.py --model HuggingFaceTB/SmolLM3-3B --out artifacts/smollm3-3b/weights
+$PY tools/make_reference.py  --model HuggingFaceTB/SmolLM3-3B --out artifacts/smollm3-3b/golden
+make test   # test_build / test_kernels / test_smollm3 모두 PASS

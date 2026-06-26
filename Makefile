@@ -7,15 +7,24 @@ INCLUDES  := -I.
 
 BUILD := build
 
+# 엔진 TU (커널은 header-only라 smollm3.cu 한 곳에서만 인스턴스화됨)
+ENGINE_SRCS := models/smollm3.cu runtime/weights.cu
+
 # 테스트 소스 -> 실행파일 (tests/test_xxx.cu -> tests/test_xxx)
 TEST_SRCS := $(wildcard tests/*.cu)
 TEST_BINS := $(TEST_SRCS:.cu=)
 
+HEADERS := $(wildcard kernels/*.cuh) $(wildcard runtime/*.h) $(wildcard models/*.h)
+
 .PHONY: all test clean
 all: $(TEST_BINS)
 
-# 각 테스트는 헤더 온리 커널(kernels/*.cuh)과 config(runtime/*.h)에 의존.
-tests/%: tests/%.cu $(wildcard kernels/*.cuh) $(wildcard runtime/*.h)
+# 통합 테스트: 엔진 graph + weight 로더와 함께 컴파일/링크 (단일 nvcc 호출, 1 TU per source).
+tests/test_smollm3: tests/test_smollm3.cu $(ENGINE_SRCS) $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_smollm3.cu $(ENGINE_SRCS) -o $@
+
+# 단일 TU 테스트 (header-only 커널만 사용).
+tests/%: tests/%.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@
 
 # 빌드 + 모든 테스트 실행

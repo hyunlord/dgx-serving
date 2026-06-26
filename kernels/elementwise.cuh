@@ -21,4 +21,11 @@ static inline void launch_add_inplace(float *y, const float *x, int n, cudaStrea
     add_inplace_kernel<<<grid, block, 0, s>>>(y, x, n);
 }
 
+// out = a + b
+static inline void launch_add(float *out, const float *a, const float *b, int n, cudaStream_t s = 0) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    add_kernel<<<grid, block, 0, s>>>(out, a, b, n);
+}
+
 #endif // DGX_ELEMENTWISE_CUH
