@@ -31,7 +31,22 @@ typedef struct ModelConfig {
     // SmolLM3 NoRoPE: 레이어별 RoPE 적용 여부. use_rope[i]==1 이면 RoPE 적용, 0이면 skip.
     // 길이 = num_layers. NULL이면 모든 레이어 RoPE 적용으로 간주.
     const int *use_rope;
+
+    // ---- Qwen3.5 확장 (SmolLM3는 사용 안 함) ----
+    int rotary_dim;          // partial RoPE 회전 차원 (Qwen 64). 0/head_dim 이면 full rope.
+    int attn_output_gate;    // 1이면 q_proj가 2*NQ*HD 출력 + attn_out *= sigmoid(gate)
+    // 레이어 타입: layer_is_full[i]==1 full attention, 0 linear/GDN. NULL이면 전부 full.
+    const int *layer_is_full;
+    // GDN(Gated Delta Net) dims
+    int gdn_num_k_heads, gdn_num_v_heads, gdn_head_k_dim, gdn_head_v_dim, gdn_conv_kernel;
 } ModelConfig;
+
+// GDN 파생값
+static inline int cfg_gdn_conv_dim(const ModelConfig *c) {
+    return c->gdn_num_k_heads * c->gdn_head_k_dim * 2 + c->gdn_num_v_heads * c->gdn_head_v_dim;
+}
+static inline int cfg_gdn_value_dim(const ModelConfig *c) { return c->gdn_num_v_heads * c->gdn_head_v_dim; }
+static inline int cfg_gdn_key_dim(const ModelConfig *c) { return c->gdn_num_k_heads * c->gdn_head_k_dim; }
 
 // 파생값 헬퍼 (graph/커널에서 사용)
 static inline int cfg_q_dim(const ModelConfig *c)  { return c->num_q_heads  * c->head_dim; } // = H (보통)

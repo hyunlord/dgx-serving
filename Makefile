@@ -20,8 +20,11 @@ HEADERS := $(wildcard kernels/*.cuh) $(wildcard runtime/*.h) $(wildcard models/*
 all: $(TEST_BINS)
 
 # 통합 테스트: 엔진 graph + weight 로더와 함께 컴파일/링크 (단일 nvcc 호출, 1 TU per source).
-tests/test_smollm3: tests/test_smollm3.cu $(ENGINE_SRCS) $(HEADERS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_smollm3.cu $(ENGINE_SRCS) -o $@
+tests/test_smollm3: tests/test_smollm3.cu models/smollm3.cu runtime/weights.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_smollm3.cu models/smollm3.cu runtime/weights.cu -o $@
+
+tests/test_qwen35: tests/test_qwen35.cu models/qwen35.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_qwen35.cu models/qwen35.cu runtime/weights_qwen.cu -o $@
 
 # 단일 TU 테스트 (header-only 커널만 사용).
 tests/%: tests/%.cu $(HEADERS)

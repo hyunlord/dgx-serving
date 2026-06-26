@@ -134,6 +134,31 @@ state S 첫 업데이트가 HF와 맞는지 확인 (수식 방향 오류를 가�
 ## 8. 사용자 결정 (합의 완료)
 - STEP 1 승인·완료. 큰 matmul만 q4 / gating파라미터(A_log,dt_bias,conv1d,in_proj_a,b) fp32. delta rule recurrent naive 우선.
 
+## 9. 2a 결과 (STEP 1–4 완료, PASS)
+
+프롬프트 "The capital of France is" (Qwen 토큰 5개), full 6 / GDN 18 레이어.
+
+| 검증 | 결과 |
+|---|---|
+| STEP1 커널 단위 | rmsnorm_zc/qk_norm/rope_partial/gate_sigmoid 전부 <1e-4 (rope 0) |
+| STEP2 GDN 격리 | conv1d 1.2e-7, delta_rule 1.7e-8 (head0 t=0,1,2 ~1e-11), gated_norm 2.4e-7 |
+| STEP4 레이어별 hidden (full+GDN) vs golden_q4 | hs[0..24] 전부 **< 1e-5** (worst 8e-5 @ final-norm) |
+| **pre-norm hidden (MTP 입력)** vs golden_q4 | **1.3e-5** ✓ |
+| 최종 logits vs golden_q4 | **6.7e-5** (graph 정확성) |
+| argmax vs golden_q4 | 전 위치 일치 [198,314,279,369,279] |
+
+→ 엔진이 Qwen3.5 본체(GDN 18 + full 6, partial RoPE, q/k_norm, output_gate, gated delta net)를
+  HF-q4와 단계별 <1e-5 로 정확히 구현. MTP가 받을 pre-norm hidden도 정확.
+
+### ⚠️ 미해결 보고 사항 — q4가 fp32 예측을 바꿈
+- golden_fp32 last-token = **11751** vs golden_q4 = **279** (DIFF). 엔진(q4) = golden_q4 = 279.
+- 즉 엔진은 "HF를 q4 가중치로 돌린 것"과 완전히 일치하나, **fp32 HF와는 top-1이 다름**.
+- 원인: 0.8B 소형 모델 + GDN 누적이 int4(mean rel-err 0.10)에 민감. (1단계 SmolLM3-3B는 q4가 예측 보존했음.)
+- chunk vs recurrent delta rule 동치 확인(7e-9)이라 GDN 구현 문제 아님 — 순수 양자화 손실.
+- **결정 필요**: (A) q4 본체 유지(프로젝트의 bandwidth 취지에 부합, golden_q4로 정확성 증명 완료) +
+  2b MTP도 q4 hidden 위에 구축, vs (B) 2a/MTP는 fp32 경로로 HF-fp32 일치 확인 후 q4는 별도 최적화.
+  → 설계 대화로 가져갈 항목.
+
 ### (원래) 결정 필요했던 포인트
 1. **GDN 양자화 범위**: in_proj_qkv[6144,1024]/out_proj/in_proj_z만 q4, 작은 것(A_log/dt_bias/conv/norm/in_proj_a,b)은 fp32 — 동의?
 2. **delta rule는 recurrent로 구현**(HF chunk와 동치, 검증 용이) — 동의? (성능은 2a 범위 밖)
