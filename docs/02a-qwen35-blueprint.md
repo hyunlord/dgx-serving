@@ -117,7 +117,24 @@ final: norm → lm_head(tied embed, q4). embed fp32.
 - `make_reference.py`: full+linear 레이어별 hidden, GDN 하위단계 골든, pre-norm hidden(hook),
   cos/sin[seq,64](HF rotary_emb), partial rope 반영.
 
-## 8. 사용자 결정 필요 (합의 포인트)
+## 7.5 GDN delta rule — 못박은 3개 (modeling_qwen3_5.py line 인용, 변종마다 달라 가장 틀리기 쉬움)
+
+`torch_recurrent_gated_delta_rule` (327-368) + `l2norm` (240-243) 기준. state `S[k_dim=128, v_dim=128]`.
+
+(a) **q/k L2norm + scale 순서·대상** (331-341): `l2norm(q)` **AND** `l2norm(k)` 둘 다 (dim=-1, eps=1e-6,
+    `x*rsqrt(Σx²+eps)`) → **그 다음** `q *= 1/sqrt(k_head_dim=128)` (q만; **k는 스케일 없음**).
+(b) **decay g** (356,359): `g[:,:,i]`는 head당 **스칼라**([B,H]). `g_t=exp(g[i])`; `S *= g_t` (k·v 양축 broadcast).
+    채널 벡터 아님. (g = `-exp(A_log)*softplus(a+dt_bias)`, line 518; per-head.)
+(c) **Δ / outer / contract 방향** (347,360-363): `kv[v]=Σ_k S[k,v]·k[k]`; `Δ[v]=(v[v]-kv[v])·β`(β=sigmoid(b), head 스칼라);
+    `S[k,v] += k[k]·Δ[v]` (k⊗Δ outer); `out[v]=Σ_k S[k,v]·q[k]`. (S 첫 축=k, 둘째 축=v.)
+
+검증 추가 요구(사용자): 전체 시퀀스 ~1e-4 대조 **전에**, 단일 head·t=0,1,2 몇 스텝만 작게 먼저 대조해
+state S 첫 업데이트가 HF와 맞는지 확인 (수식 방향 오류를 가장 먼저 잡기).
+
+## 8. 사용자 결정 (합의 완료)
+- STEP 1 승인·완료. 큰 matmul만 q4 / gating파라미터(A_log,dt_bias,conv1d,in_proj_a,b) fp32. delta rule recurrent naive 우선.
+
+### (원래) 결정 필요했던 포인트
 1. **GDN 양자화 범위**: in_proj_qkv[6144,1024]/out_proj/in_proj_z만 q4, 작은 것(A_log/dt_bias/conv/norm/in_proj_a,b)은 fp32 — 동의?
 2. **delta rule는 recurrent로 구현**(HF chunk와 동치, 검증 용이) — 동의? (성능은 2a 범위 밖)
 3. **rope는 HF cos/sin 덤프 재사용**(mrope 재구현 안 함, 1단계와 동일 방침) — 동의?
