@@ -63,6 +63,36 @@ gemv → batch gemm: **warp/block이 output(또는 output-tile)을 맡아 weight
 - speculative×batch / ragged(다른 길이) / continuous batching (STEP4+, 토대 먼저).
 - 정확성 변경. MoE.
 
+## STEP 1 결과 — isolated batch gemm (fp32): latency 벽 탈출 실증 [완료]
+
+`kernels/gemm_batch.cuh`(template<B> weight 1로드→B 누적기 재사용) + `tests/test_gemm_batch.cu`(==B gemv 오차0).
+
+### 정확성: 통과
+batch gemm == B개 독립 gemv, 시퀀스별 max err 2.3~7.3e-6 (B=1,2,4,8,16; lm_head/FFN 포함). 14/14 PASS.
+
+### thesis 측정 (ncu B 스윕, q_proj IN=1024 OUT=2048)
+| B | reg | occ% | long_sb stall | compute% | dur(us) | throughput(B/us) |
+|---|---|---|---|---|---|---|
+| 1 | 38 | 88 | **278** | 9.3 | 37.5 | 0.027 (1.0×) |
+| 2 | 40 | 86 | 157 | 9.5 | 54.9 | 0.036 (1.4×) |
+| 4 | 40 | 90 | 169 | 14 | 83.9 | 0.048 (1.8×) |
+| 8 | 40 | 83 | 98 | **28** | 69.6 | 0.115 (**4.3×**) |
+| 16 | **48** | — | 77 | 18 | 152 | 0.105 (3.9×) |
+
+### 핵심 — 4가지 thesis 질문 다 YES
+1. **weight bytes/token B×↓**: weight는 output당 1회 read(B 무관) = OUT·IN·4 고정 → per-token = OUT·IN·4/B. 구조적 B×↓. ✅
+2. **compute-bound 전환**: stall 278→77 급감, compute% 9→28%(peak B=8). **챕터2 latency 벽(stall 지배)을 탈출.** ✅
+   = 측정이 가리킨 길 확정: batch-1에서 폭·정밀도로 못 푼 걸 batch가 벽 자체를 벗어나 푼다.
+3. **occupancy 깨지는 B**: B≤8 reg 40·occ 83~90% 안정. **B=16서 reg 48**(2d MO=4 함정 reg 46과 동일 영역) → compute% 28→18% 하락.
+   → **최적 B≈8** (register pressure 천장). 사용자 예측("B 무작정 키우지 말고 occupancy 안 깨는 최적 B") 적중.
+4. **throughput**: B=8서 4.3× (per-output time amortize). weight 재사용 실현.
+
+### STEP 1 결론
+**batch가 latency 벽을 벗어난다 — 측정으로 첫 실증.** B=8 sweet spot(compute 28%, throughput 4.3×, occ 83%).
+= llama.cpp mmvq multiple-output과 같은 원리(weight 1로드당 compute↑)의 일반화. batch-1 천장(챕터2)과 batch 처리량을
+같은 커널이 푼다. 단 isolated 수치(ncu) — 실 처리량은 STEP2(batch decode 통합)에서 end-to-end 판정.
+다음 STEP 2: DecodeState×B + batch attention(per-row KV) + batch GDN(B병렬) 통합.
+
 ## 9. 사용자 결정 필요 (게이트)
 1. **범위 = multi-seq batch decode, plain, same-length 먼저** — 동의? (ragged/spec×batch/continuous는 후속.)
 2. **STEP 1 = isolated batch gemm(fp32)부터** (KV/GDN batch 전에 thesis 증명) — 동의? 아니면 STEP2 통합부터?
