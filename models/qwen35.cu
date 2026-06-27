@@ -6,6 +6,8 @@
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemv_q4.cuh"
 #include "../kernels/gemv_f32.cuh"
+#include "../kernels/quantize_x.cuh"
+#include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
@@ -17,10 +19,17 @@
 
 static float *dmalloc(size_t n) { float *p; QK(cudaMalloc(&p, n * 4)); return p; }
 
-// 행렬곱 dispatch: q4(int4 dequant) 또는 fp32 경로.
+// 행렬곱 dispatch: q4(int4 dequant) / fp32 / W4A8(int8 act × int4 weight) 경로.
+static int8_t *gf_xq=nullptr; static float *gf_xs=nullptr; static int32_t *gf_xsum=nullptr; static size_t gf_xqcap=0;
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4) {
-    if (use_q4) launch_gemv_q4(X, m.wq, m.sc, Y, IN, OUT, S);
-    else        launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
+    if (use_q4==2) {
+        size_t n=(size_t)S*IN;
+        if (gf_xqcap < n) { if(gf_xq)cudaFree(gf_xq); if(gf_xs)cudaFree(gf_xs); if(gf_xsum)cudaFree(gf_xsum);
+            QK(cudaMalloc(&gf_xq,n)); QK(cudaMalloc(&gf_xs,(n/QBLK)*4)); QK(cudaMalloc(&gf_xsum,(n/QBLK)*4)); gf_xqcap=n; }
+        launch_quantize_x_q8(X, gf_xq, gf_xs, gf_xsum, IN, S);
+        launch_gemv_w4a8(gf_xq, gf_xs, gf_xsum, m.wq, m.sc, Y, IN, OUT, S);
+    } else if (use_q4) launch_gemv_q4(X, m.wq, m.sc, Y, IN, OUT, S);
+    else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
 }
 
 // docs/02a-qwen35-blueprint.md 의 forward graph. config 로 dims/레이어타입 받음.

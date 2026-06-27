@@ -4,39 +4,39 @@
 #include "reduce.cuh"
 #include "../runtime/config.h"   // QBLK
 
-__inline__ __device__ int warp_reduce_sum_i(int v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
-    return v;
-}
-
-// W4A8 행렬-벡터곱: int8 activation(per-block scale+Σxq) × int4 weight(per-block scale, zero-point 8).
-//   Y[s,o] = Σ_blocks  xs[s,b]·sw[o,b] · ( Σ_i xq·wq − 8·Σxq )      (docs/ch2b-w4a8-blueprint.md)
-//   weight: gemv_q4와 동일 레이아웃 (Wq[o,IN/2] packed 2/byte, sc[o,IN/QBLK] fp32).
-//   activation: xq[s,IN] int8, xs[s,IN/QBLK], xsum[s,IN/QBLK] (quantize_x_q8 출력).
-//   STEP1 정확성 우선: 1 warp/output, 블록마다 warp_reduce(int dot) 후 scale. DP4A 최적화는 STEP2.
-// IN은 QBLK(=32) 배수. warp 폭(32)==QBLK 가정.
-static __global__ void gemv_w4a8_kernel(const int8_t *xq, const float *xs, const int32_t *xsum,
+// W4A8 행렬-벡터곱: int8 activation(per-block scale) × int4 weight(per-block scale, zero-point 8).
+//   Y[s,o] = Σ_blocks xs[s,b]·sw[o,b] · Σ_i xq_i·(wq_i − 8)     (docs/ch2b-w4a8-blueprint.md)
+//   weight를 (wq−8) signed로 unpack해 DP4A하면 −8·Σxq 보정항 불필요(xsum 불요).
+//   STEP2 최적화: DP4A int8 dot + lane-minor 파티션(int8 X·weight 둘 다 coalesced — STEP1 uint4 X-uncoalesce 해소).
+//   1 warp/output. lane이 연속 4원소(int32 1로드), iteration이 warp폭(128원소) stride. 블록(32)당 scale.
+//   per-lane 4원소는 한 블록 내(4|base, 4<32) → lane당 블록 scale 1개. 블록별 partial을 float로 누적 후 warp_reduce.
+// IN은 QBLK(=32) 배수(→ 4·8 정렬). xsum 인자는 호환 위해 받되 미사용.
+static __global__ void gemv_w4a8_kernel(const int8_t *xq, const float *xs, const int32_t * /*xsum*/,
                                         const uint8_t *Wq, const float *sw,
                                         float *Y, int IN, int OUT, int S) {
     long gw = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
     if (gw >= (long)S * OUT) return;
     int s = (int)(gw / OUT), o = (int)(gw % OUT);
-    const int8_t  *xqr  = xq   + (size_t)s * IN;
-    const float   *xsr  = xs   + (size_t)s * (IN / QBLK);
-    const int32_t *xsmr = xsum + (size_t)s * (IN / QBLK);
-    const uint8_t *w    = Wq   + (size_t)o * (IN / 2);
-    const float   *swr  = sw   + (size_t)o * (IN / QBLK);
-    int nb = IN / QBLK;
+    const int8_t  *xqr = xq + (size_t)s * IN;
+    const float   *xsr = xs + (size_t)s * (IN / QBLK);
+    const uint8_t *w   = Wq + (size_t)o * (IN / 2);
+    const float   *swr = sw + (size_t)o * (IN / QBLK);
     float acc = 0.f;
-    for (int b = 0; b < nb; b++) {
-        int n = b * QBLK + lane;                       // QBLK==32==warp width
-        uint8_t by = w[n >> 1];
-        int wqv = (n & 1) ? (by >> 4) : (by & 0x0F);   // raw nibble 0..15
-        int prod = (int)xqr[n] * wqv;                  // int8 × int4
-        int dot = warp_reduce_sum_i(prod);             // Σ_i xq·wq (블록)
-        if (lane == 0) acc += xsr[b] * swr[b] * ((float)dot - 8.0f * (float)xsmr[b]);
+    for (int base = lane * 4; base < IN; base += 32 * 4) {        // lane-minor: 연속 4원소, warp폭 128 stride
+        int xqi = *reinterpret_cast<const int*>(xqr + base);     // 4 int8 (coalesced across warp)
+        const uint8_t *wp = w + (base >> 1);                     // 2 byte = 4 nibble
+        int b0 = wp[0], b1 = wp[1];
+        // (wq − 8) signed int8 ×4 packed
+        int wpk = ((( b0       & 0xF) - 8) & 0xFF)
+                | ((((b0 >> 4)  & 0xF) - 8) & 0xFF) << 8
+                | ((( b1       & 0xF) - 8) & 0xFF) << 16
+                | ((((b1 >> 4)  & 0xF) - 8) & 0xFF) << 24;
+        int dot = __dp4a(xqi, wpk, 0);                           // Σ xq·(wq−8) (4원소)
+        int blk = base / QBLK;
+        acc += xsr[blk] * swr[blk] * (float)dot;
     }
+    acc = warp_reduce_sum(acc);
     if (lane == 0) Y[(size_t)s * OUT + o] = acc;
 }
 

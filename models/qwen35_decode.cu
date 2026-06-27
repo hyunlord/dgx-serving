@@ -6,6 +6,8 @@
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemv_q4.cuh"
 #include "../kernels/gemv_f32.cuh"
+#include "../kernels/quantize_x.cuh"
+#include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
@@ -26,9 +28,18 @@ static float *ws(int &idx, size_t n){
     if (g_wscap[idx] < n) { if (g_ws[idx]) cudaFree(g_ws[idx]); DK(cudaMalloc(&g_ws[idx], n*4)); g_wscap[idx]=n; }
     return g_ws[idx++];
 }
+// W4A8 per-call quantize 임시버퍼 (persistent, grow). STEP2b: 호출당 X 양자화(최악 호출수) — 측정용.
+//   STEP2c에서 shared-X(norm/n2)는 1회 양자화로 호출수↓ 예정.
+static int8_t *g_xq=nullptr; static float *g_xs=nullptr; static int32_t *g_xsum=nullptr; static size_t g_xqcap=0;
 static void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4) {
-    if (use_q4) launch_gemv_q4(X, m.wq, m.sc, Y, IN, OUT, S);
-    else        launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
+    if (use_q4==2) {                                   // W4A8: activation int8 per-block-32 + int4 weight
+        size_t n=(size_t)S*IN;
+        if (g_xqcap < n) { if(g_xq)cudaFree(g_xq); if(g_xs)cudaFree(g_xs); if(g_xsum)cudaFree(g_xsum);
+            DK(cudaMalloc(&g_xq,n)); DK(cudaMalloc(&g_xs,(n/QBLK)*4)); DK(cudaMalloc(&g_xsum,(n/QBLK)*4)); g_xqcap=n; }
+        launch_quantize_x_q8(X, g_xq, g_xs, g_xsum, IN, S);
+        launch_gemv_w4a8(g_xq, g_xs, g_xsum, m.wq, m.sc, Y, IN, OUT, S);
+    } else if (use_q4) launch_gemv_q4(X, m.wq, m.sc, Y, IN, OUT, S);
+    else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
 }
 
 // ---- state alloc/free ----

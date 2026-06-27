@@ -95,6 +95,38 @@ quantize_x_q8 duration ~**8.9~12.3us/call** (compute 0.3~0.5%, grid 작아 **lau
 quantize + W4A8 gemv 수치 정확(golden_w4a8 오차0), 품질델타 gemv 0.4%. DP4A는 아직 미사용(STEP2 최적화).
 다음 STEP 2: DP4A W4A8 gemv + in-engine 통합(X-shared 함정 회피 확인) + 양자화 호출수/비용 최적화 + in-engine t/s.
 
+## STEP 2 결과 — W4A8 in-engine 통합 + 전제 기각 (중요) [부분완료]
+
+DP4A gemv_w4a8(`kernels/gemv_w4a8.cuh`: lane-minor 파티션 + (wq−8) signed dp4a, xsum 보정 불요) +
+mm() use_q4==2 통합(qwen35.cu/qwen35_decode.cu, per-call quantize). golden_w4a8 err 2.8e-6, 13/13 PASS(q4/fp32 불변).
+
+### 통합 정확성: 토큰 레벨 OK
+- W4A8 spec==plain **mismatch 0**, 토큰열 == q4 (이 프롬프트). 커널 golden_w4a8 오차0.
+- 단 decode==prefill **logit err 0.28**(argmax ALL match): 양자화 round 경계가 decode/prefill 본질 fp미세차(q4서 5e-6)를
+  증폭. 버그 아님(argmax 견딤) — 단 "logit 오차0 자기일관성"은 양자화-activation 경로엔 부적용. 정합성은 golden_w4a8(커널)+토큰으로.
+
+### in-engine t/s: **W4A8 plain 180.6 vs q4 176 = +2.5%뿐.** per-call quantize가 그마저 갉음.
+
+### 전제 기각 (산술, 측정) — 핵심
+**batch-1 decode에서 X 트래픽이 weight 대비 negligible:**
+| gemv | weight(q4) | X(fp32) | X/weight | int8-X 절감 |
+|---|---|---|---|---|
+| q_proj | 1.05MB | 4.1KB | 0.39% | weight의 0.29% |
+| FFN_down | 1.84MB | 14.3KB | 0.78% | 0.59% |
+| lm_head | 127MB | 4.1KB | **0.002%** | 0.002% |
+
+→ **의뢰서 전제("int8-X로 X 트래픽 4×↓ → llama.cpp 추월")는 batch-1에서 기각.** decode gemv는 weight read가
+지배(OUT≫8이라 weight=OUT·IN·0.5 ≫ X=IN·4). int8-X는 트래픽을 거의 안 줄임. **llama.cpp q4 우위는 X 트래픽 아님.**
+
+### 재해석 — int8-X의 진짜 가치 = wide weight load 활성화
+- 챕터2 STEP1 교훈: 진짜 레버는 **wide weight load**인데 fp32-X에선 X-uncoalesce로 막혔음(176→104 회귀).
+- **int8-X(1byte)는 lane-minor로 coalesce되므로 wide weight load와 양립** → fp32서 불가능했던 최적화를 푼다.
+  즉 int8-X는 "트래픽 절감"이 아니라 "**wide weight load의 enabler**".
+- 현 gemv_w4a8는 weight를 2byte/lane으로 읽어 아직 wide-load 미실현 → +2.5%는 q4와 사실상 동일 메모리패턴 + quantize 오버헤드.
+- **다음 진짜 레버**: gemv_w4a8를 wide weight load(uint32/uint4, DP4A lane-minor)로 → weight 명령수↓·latency↓가 q4를 넘나.
+  + shared-X quantize로 호출수↓(오버헤드 제거). 둘 다 in-engine 판정.
+- 트래픽 관점 int8-X 이득은 **batch>1**에서 비로소(X가 batch로 커짐) — batch 챕터의 일.
+
 ## 7. 사용자 결정 필요 (게이트)
 1. **품질 판정**: per-block-32에서 3/4 프롬프트 동일, 코드류 1/4 조기 flip(22.7%, cascade 과장). 이 정도 품질대가를
    감수하고 W4A8 진행 — 동의? (아니면 일부 민감 Linear는 fp32 유지하는 혼합도 가능 — 그건 STEP에서.)
