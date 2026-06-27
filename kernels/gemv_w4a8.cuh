@@ -22,19 +22,23 @@ static __global__ void gemv_w4a8_kernel(const int8_t *xq, const float *xs, const
     const float   *xsr = xs + (size_t)s * (IN / QBLK);
     const uint8_t *w   = Wq + (size_t)o * (IN / 2);
     const float   *swr = sw + (size_t)o * (IN / QBLK);
+    // (wq−8) signed int8×4 packing: 2 byte(4 nibble) → int (dp4a 입력)
+    auto pk = [](int lo_byte, int hi_byte) -> int {
+        return ((( lo_byte       & 0xF) - 8) & 0xFF)
+             | ((((lo_byte >> 4)  & 0xF) - 8) & 0xFF) << 8
+             | ((( hi_byte       & 0xF) - 8) & 0xFF) << 16
+             | ((((hi_byte >> 4)  & 0xF) - 8) & 0xFF) << 24;
+    };
     float acc = 0.f;
-    for (int base = lane * 4; base < IN; base += 32 * 4) {        // lane-minor: 연속 4원소, warp폭 128 stride
-        int xqi = *reinterpret_cast<const int*>(xqr + base);     // 4 int8 (coalesced across warp)
-        const uint8_t *wp = w + (base >> 1);                     // 2 byte = 4 nibble
-        int b0 = wp[0], b1 = wp[1];
-        // (wq − 8) signed int8 ×4 packed
-        int wpk = ((( b0       & 0xF) - 8) & 0xFF)
-                | ((((b0 >> 4)  & 0xF) - 8) & 0xFF) << 8
-                | ((( b1       & 0xF) - 8) & 0xFF) << 16
-                | ((((b1 >> 4)  & 0xF) - 8) & 0xFF) << 24;
-        int dot = __dp4a(xqi, wpk, 0);                           // Σ xq·(wq−8) (4원소)
-        int blk = base / QBLK;
-        acc += xsr[blk] * swr[blk] * (float)dot;
+    for (int base = lane * 8; base < IN; base += 32 * 8) {        // lane-minor 8원소, warp폭 256 stride
+        int blk = base / QBLK;                                    // 8|base, 8<32 → chunk가 한 블록 내
+        float sc_b = xsr[blk] * swr[blk];
+        unsigned W = *reinterpret_cast<const unsigned*>(w + (base >> 1));  // 4 byte = 8 nibble, 1회 로드(coalesced)
+        int x0 = *reinterpret_cast<const int*>(xqr + base);      // xq[base..+3]
+        int x1 = *reinterpret_cast<const int*>(xqr + base + 4);  // xq[base+4..+7]
+        int dot = __dp4a(x0, pk( W & 0xFF, (W >> 8) & 0xFF), 0);          // weights base..+3
+        dot     = __dp4a(x1, pk((W >> 16) & 0xFF, (W >> 24) & 0xFF), dot);// weights base+4..+7
+        acc += sc_b * (float)dot;
     }
     acc = warp_reduce_sum(acc);
     if (lane == 0) Y[(size_t)s * OUT + o] = acc;

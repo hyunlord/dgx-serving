@@ -28,6 +28,13 @@ static float *ws(int &idx, size_t n){
     if (g_wscap[idx] < n) { if (g_ws[idx]) cudaFree(g_ws[idx]); DK(cudaMalloc(&g_ws[idx], n*4)); g_wscap[idx]=n; }
     return g_ws[idx++];
 }
+// int8 persistent ws (W4A8 shared-X quantize 버퍼용)
+static std::vector<int8_t*> g_wsb; static std::vector<size_t> g_wsbcap;
+static int8_t *wsi8(int &idx, size_t n){
+    if ((int)g_wsb.size() <= idx) { g_wsb.push_back(nullptr); g_wsbcap.push_back(0); }
+    if (g_wsbcap[idx] < n) { if (g_wsb[idx]) cudaFree(g_wsb[idx]); DK(cudaMalloc(&g_wsb[idx], n)); g_wsbcap[idx]=n; }
+    return g_wsb[idx++];
+}
 // W4A8 per-call quantize 임시버퍼 (persistent, grow). STEP2b: 호출당 X 양자화(최악 호출수) — 측정용.
 //   STEP2c에서 shared-X(norm/n2)는 1회 양자화로 호출수↓ 예정.
 static int8_t *g_xq=nullptr; static float *g_xs=nullptr; static int32_t *g_xsum=nullptr; static size_t g_xqcap=0;
@@ -107,18 +114,28 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     float *snap=ws(wi,(size_t)Sq*nvh*hv*hv);   // per-layer GDN snapshot scratch
     float *convfull=ws(wi,(size_t)(Kk-1+Sq)*convd);
 
+    // W4A8 shared-X quantize 버퍼: norm/n2(IN=H)를 1회 양자화해 q/k/v(또는 in_qkv/in_z)·gate/up 재사용.
+    int bi=0; int8_t *xqn=nullptr,*xq2=nullptr; float *xsn=nullptr,*xs2=nullptr,*xsmN=nullptr;
+    if (use_q4==2) { xqn=wsi8(bi,SH); xq2=wsi8(bi,SH); xsn=ws(wi,SH/QBLK); xs2=ws(wi,SH/QBLK); xsmN=ws(wi,SH/QBLK); }
+    // shared-X gemv: use_q4==2면 미리 양자화한 (xq,xs) 사용(재양자화 안 함), 아니면 mm() 경로.
+    auto MMs=[&](const QMat&m,const float*X,const int8_t*xqs,const float*xss,float*Y,int IN,int OUT){
+        if (use_q4==2) launch_gemv_w4a8(xqs,xss,nullptr,m.wq,m.sc,Y,IN,OUT,Sq);
+        else           mm(m,X,Y,IN,OUT,Sq,use_q4);
+    };
+
     launch_embedding(d_tokens, w.embed, x, Sq, H);
     int lin=0;  // linear-layer 카운터 (S_snap 인덱싱)
     for (int l=0;l<c.num_layers;l++){
         const QLayer &L=w.layers[l];
         launch_rmsnorm_zc(x, L.input_ln, norm, Sq, H, eps);
+        if (use_q4==2) launch_quantize_x_q8(norm, xqn, xsn, (int32_t*)xsmN, H, Sq);  // norm 1회 양자화 → q/k/v(또는 in_qkv/in_z) 공유
         if (L.is_full) {
-            mm(L.q,norm,qg,H,qdim2,Sq,use_q4);
+            MMs(L.q,norm,xqn,xsn,qg,H,qdim2);
             DK(cudaMemcpy2D(qb,HD*4,qg,2*HD*4,HD*4,(size_t)Sq*NQ,cudaMemcpyDeviceToDevice));
             DK(cudaMemcpy2D(gate,HD*4,qg+HD,2*HD*4,HD*4,(size_t)Sq*NQ,cudaMemcpyDeviceToDevice));
             launch_rmsnorm_zc(qb,L.q_norm,qn,Sq*NQ,HD,eps);
-            mm(L.k,norm,kb,H,kvdim,Sq,use_q4); launch_rmsnorm_zc(kb,L.k_norm,kn,Sq*NKV,HD,eps);
-            mm(L.v,norm,vb,H,kvdim,Sq,use_q4);
+            MMs(L.k,norm,xqn,xsn,kb,H,kvdim); launch_rmsnorm_zc(kb,L.k_norm,kn,Sq*NKV,HD,eps);
+            MMs(L.v,norm,xqn,xsn,vb,H,kvdim);
             // rope (위치 base..base+Sq-1) on q and on k (k는 저장 전 roped)
             launch_rope_partial(qn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,Sq,NQ,HD,rot);
             launch_rope_partial(kn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,Sq,NKV,HD,rot);
@@ -130,13 +147,13 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             mm(L.o,attn,ob,qdim,H,Sq,use_q4);
             launch_add(after,x,ob,(int)SH);
         } else {
-            mm(L.in_qkv,norm,mixed,H,convd,Sq,use_q4);
+            MMs(L.in_qkv,norm,xqn,xsn,mixed,H,convd);
             // conv: prev = convctx[l] (직전 K-1 토큰)
             launch_gdn_conv1d_silu_decode(mixed, st.convctx[l], L.conv1d, mconv, Sq, convd, Kk);
             DK(cudaMemcpy2D(qg2,kdim*4,mconv,convd*4,kdim*4,Sq,cudaMemcpyDeviceToDevice));
             DK(cudaMemcpy2D(kg2,kdim*4,mconv+kdim,convd*4,kdim*4,Sq,cudaMemcpyDeviceToDevice));
             DK(cudaMemcpy2D(vg2,vdim*4,mconv+2*kdim,convd*4,vdim*4,Sq,cudaMemcpyDeviceToDevice));
-            mm(L.in_z,norm,zb,H,vdim,Sq,use_q4);
+            MMs(L.in_z,norm,xqn,xsn,zb,H,vdim);
             launch_gemv_f32(norm,L.in_a,ab,H,nvh,Sq); launch_gemv_f32(norm,L.in_b,bb,H,nvh,Sq);
             launch_gdn_decay_beta(ab,bb,L.A_log,L.dt_bias,gg,beta,Sq,nvh);
             // gdn_step from committed S, Sq steps, snapshot
@@ -164,7 +181,8 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             lin++;
         }
         launch_rmsnorm_zc(after,L.post_ln,n2,Sq,H,eps);
-        mm(L.gate,n2,gm,H,FFN,Sq,use_q4); mm(L.up,n2,um,H,FFN,Sq,use_q4);
+        if (use_q4==2) launch_quantize_x_q8(n2, xq2, xs2, (int32_t*)xsmN, H, Sq);  // n2 1회 양자화 → gate/up 공유
+        MMs(L.gate,n2,xq2,xs2,gm,H,FFN); MMs(L.up,n2,xq2,xs2,um,H,FFN);
         launch_swiglu(gm,um,act,(size_t)Sq*FFN);
         mm(L.down,act,dbuf,FFN,H,Sq,use_q4);
         launch_add(x,after,dbuf,(int)SH);

@@ -127,6 +127,37 @@ mm() use_q4==2 통합(qwen35.cu/qwen35_decode.cu, per-call quantize). golden_w4a
   + shared-X quantize로 호출수↓(오버헤드 제거). 둘 다 in-engine 판정.
 - 트래픽 관점 int8-X 이득은 **batch>1**에서 비로소(X가 batch로 커짐) — batch 챕터의 일.
 
+## STEP 3 결과 — wide weight load + shared-X → q4 못 넘음, (C) 정리 [완료]
+
+(A) 재해석 트랙: int8-X enabler 위에 wide weight load + shared-X quantize 얹어 q4(176) 넘나 검증.
+
+### 구현
+- gemv_w4a8: 8원소 chunk(uint32 weight 1로드 → 2 dp4a), weight 로드 명령 4×↓. golden_w4a8 오차0 유지(2.7e-6).
+- shared-X quantize: norm 1회 → q/k/v(또는 in_qkv/in_z) 공유, n2 1회 → gate/up 공유 (qwen35_decode.cu).
+  호출수↓. spec==plain mismatch 0, 토큰==q4, 13/13 PASS(q4/fp32 불변).
+
+### in-engine t/s: **W4A8 180.5 vs q4 176 = +2.5%뿐.** wide-load+DP4A+shared-X 다 얹어도 q4 못 넘음.
+
+### ncu 규명 — 왜 안 넘나 (결정적)
+| 지표 | gemv_q4(byte) | gemv_w4a8(wide) |
+|---|---|---|
+| **sectors/req** | 2 | **4.40** ✅ wide load 실현 |
+| memory throughput | 15~61% | 4~10% |
+| **long_scoreboard stall** | 10~20 | **44~78** (오히려↑) |
+| occupancy | 32~100% | 34~86% |
+
+- **질문 ① YES**: int8-X가 X-coalesce 안 깨고 wide weight load 가능(sectors/req 2→4.4). STEP1 fp32 uint4 실패(30 파국)를 우회.
+- **그러나 여전히 latency-bound**: stall 44~78 지배, mem throughput 4~10%(compute도 아님). wide load는 sectors/req만 고치고
+  **memory-level parallelism(latency 숨김)은 못 고침**. 1-warp/output·작은 IN 구조라 in-flight 요청 부족 → DRAM latency 노출.
+- **= 2d fp32 gemv가 부딪힌 벽과 동일**(2d MO/occupancy +2% 헤드룸). wide-load/DP4A/int8-X가 다른 병목을 고친 셈.
+
+### 결론 — (C) 정리
+- **q4 격차(176 vs llama.cpp 266)의 본질 = gemv 구조(memory-level parallelism), weight-load 폭도 정밀도도 아님.**
+  llama.cpp mmvq는 multiple-output/warp 등으로 latency를 더 숨김(더 많은 in-flight). 우리 naive 1-warp/output이 한계.
+- W4A8 인프라(quantize_x, gemv_w4a8 DP4A wide, shared-X, golden_w4a8)는 **정확·검증 완료, use_q4==2로 격리 보존**.
+  batch-1 decode에선 q4 대비 이득 없음(+2.5%) — 단 **batch>1에서 X 트래픽·DP4A 밀도가 의미** → batch 챕터 자산.
+- 다음 진짜 레버 = **gemv 구조 재설계(multiple-output/warp, register pressure 관리)** 또는 **배칭**. 둘 다 별도 챕터.
+
 ## 7. 사용자 결정 필요 (게이트)
 1. **품질 판정**: per-block-32에서 3/4 프롬프트 동일, 코드류 1/4 조기 flip(22.7%, cascade 과장). 이 정도 품질대가를
    감수하고 W4A8 진행 — 동의? (아니면 일부 민감 Linear는 fp32 유지하는 혼합도 가능 — 그건 STEP에서.)
