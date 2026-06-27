@@ -56,4 +56,27 @@ static inline void launch_rope_partial(float *T, const float *cos, const float *
     rope_partial_kernel<<<grid, block, 0, st>>>(T, cos, sin, S, NH, HD, rot_dim);
 }
 
+// batch decode rope (챕터3): B 독립 시퀀스 모두 같은 position(same-length) → cos/sin은 그 position 행 1개 공유.
+//   cos/sin 포인터 = d_cos + base*rot (호출측 offset). s(=행=시퀀스)는 cos 인덱싱에 안 들어감.
+static __global__ void rope_partial_batch_kernel(float *T, const float *cos, const float *sin,
+                                    int B, int NH, int HD, int rot_dim) {
+    int half = rot_dim >> 1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * NH * half;
+    if (idx >= total) return;
+    int i = idx % half;
+    int h = (idx / half) % NH;
+    int s = idx / (half * NH);
+    float *base = T + ((size_t)s * NH + h) * HD;
+    float t1 = base[i], t2 = base[i + half];
+    float c = cos[i], sn = sin[i];                  // 모든 시퀀스 같은 position
+    base[i]        = t1 * c - t2 * sn;
+    base[i + half] = t2 * c + t1 * sn;
+}
+static inline void launch_rope_partial_batch(float *T, const float *cos, const float *sin,
+                                             int B, int NH, int HD, int rot_dim, cudaStream_t st = 0) {
+    int total = B * NH * (rot_dim >> 1); int block = 256; int grid = (total + block - 1) / block;
+    rope_partial_batch_kernel<<<grid, block, 0, st>>>(T, cos, sin, B, NH, HD, rot_dim);
+}
+
 #endif // DGX_ROPE_CUH

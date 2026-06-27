@@ -93,6 +93,39 @@ batch gemm == B개 독립 gemv, 시퀀스별 max err 2.3~7.3e-6 (B=1,2,4,8,16; l
 같은 커널이 푼다. 단 isolated 수치(ncu) — 실 처리량은 STEP2(batch decode 통합)에서 end-to-end 판정.
 다음 STEP 2: DecodeState×B + batch attention(per-row KV) + batch GDN(B병렬) 통합.
 
+## STEP 2 결과 — batch decode 통합: latency 벽 in-engine 탈출 [완료]
+
+### STEP 2a: batch 커널 (attn/gdn/conv) — bit-identical
+attn_decode_batch(grid(B,NQ), per-row KV), gdn_step_batch(grid(NH,B), B 병렬 1스텝, in-place state),
+gdn_conv1d_silu_decode_batch(per-row convctx). isolated 검증: 각 == B single 호출 **err 0.000e+00**.
+
+### STEP 2b: 통합 (qwen35_batch.cu + BatchDecodeState×B + rope_partial_batch)
+- 정확성: **batch decode == B개 single decode, max err 2.24e-05**(fp32 reduction noise), **argmax ALL match**
+  (4 시퀀스 × 8 스텝, 서로 다른 토큰열 → position/KV/state/conv 배선 시퀀스별 검증). 16/16 PASS, 단일경로 무손상.
+
+### in-engine 처리량 (fp32, B 스윕) — thesis 실현
+| B | total tok/s | vs B=1 | per-seq tok/s |
+|---|---|---|---|
+| 1 | 70.5 | 1.0× | 70.5 |
+| 2 | 136.1 | 1.93× | 68.1 |
+| 4 | 254.5 | 3.61× | 63.6 |
+| 8 | **462.1** | **6.55×** | 57.8 |
+| 16 | 646.8 | 9.17× | 40.4 |
+
+- **batch가 latency 벽을 in-engine서 탈출**: B=8 총 처리량 **6.55×**, per-seq는 **−18%만**(70→58) — 8 시퀀스가
+  각자 거의 batch-1 속도로. isolated gemm 4.3×(STEP1)가 in-engine 전체선 6.5×로 **더 큼**(forward 전체 amortize).
+- B=16: 9.17× total이나 per-seq −43%(40.4) — gemm B=16 register pressure(reg48) + saturation. 처리량/latency 균형은 B≈8.
+
+### ncu — gemm 외(attention/GDN)가 병목 되나? (isolated≠in-engine 검증)
+B=8 per-kernel: **gemm_batch 60.5% 지배**, gdn_step_batch 9%, attn_batch 0.9%, conv_batch 0.4%.
+→ **attention/GDN은 batch서 병목 안 됨**(per-seq work라 B로 선형 증가하나 절대량 작음). 6.5× 처리량 scaling이
+gemm 외 부분에 안 발목 잡힘을 확증. (작은 in_a/in_b는 아직 gemv_f32 — tiny, 비병목.)
+
+### STEP 2 결론
+**측정이 가리킨 길(batch) 끝까지 실현** — chapter2 latency 벽(batch-1 +2% 천장)을 batch가 벗어나 **6.5× 처리량**.
+정확성 시퀀스별 오차0(배선 무결), 단일경로 무손상. 다음 STEP 3: q4/W4A8 × batch (W4A8이 batch서 비로소 의미 —
+X가 B행이라 int8 트래픽 절감 실현 + 언팩/DP4A amortize) + llama.cpp batch 재비교.
+
 ## 9. 사용자 결정 필요 (게이트)
 1. **범위 = multi-seq batch decode, plain, same-length 먼저** — 동의? (ragged/spec×batch/continuous는 후속.)
 2. **STEP 1 = isolated batch gemm(fp32)부터** (KV/GDN batch 전에 thesis 증명) — 동의? 아니면 STEP2 통합부터?
