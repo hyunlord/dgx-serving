@@ -13,17 +13,19 @@
 
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 static std::string GD="artifacts/qwen35-27b/golden/";
-static std::vector<float> rd(const std::string&p_,size_t n){std::string p=GD+p_+".bin";FILE*f=fopen(p.c_str(),"rb");if(!f){fprintf(stderr,"못엶 %s\n",p.c_str());exit(1);}std::vector<float>v(n);if(fread(v.data(),4,n,f)!=n){fprintf(stderr,"크기 %s\n",p.c_str());exit(1);}fclose(f);return v;}
+static std::string PFX="fp32_";  // fp32_ or q4_ (q4 경로 GDN 격리용)
+static std::vector<float> rd(const std::string&p_,size_t n){std::string p=GD+PFX+p_+".bin";FILE*f=fopen(p.c_str(),"rb");if(!f){fprintf(stderr,"못엶 %s\n",p.c_str());exit(1);}std::vector<float>v(n);if(fread(v.data(),4,n,f)!=n){fprintf(stderr,"크기 %s\n",p.c_str());exit(1);}fclose(f);return v;}
 static float* up(const std::vector<float>&h){float*d;CK(cudaMalloc(&d,h.size()*4));CK(cudaMemcpy(d,h.data(),h.size()*4,cudaMemcpyHostToDevice));return d;}
 static double maxabs(const std::vector<float>&a,const std::vector<float>&b){double e=0;for(size_t i=0;i<a.size();i++)e=fmax(e,fabs((double)a[i]-b[i]));return e;}
 
-int main(){
+int main(int argc,char**argv){
+    if(argc>1) PFX=std::string(argv[1])+"_";   // "fp32" or "q4"
     const int S=5, NV=48, NK=16, D=128;   // 27B GDN: k-head 16, v-head 48 (GQA 3:1)
-    printf("[gdn_27b] S=%d NV=%d NK=%d D=%d (layer 0, fp32 golden, GQA 일반화 커널)\n",S,NV,NK,D);
+    printf("[gdn_27b] S=%d NV=%d NK=%d D=%d (layer 0, %s골든, GQA 일반화 커널)\n",S,NV,NK,D,PFX.c_str());
     // 골든: q/k/v 모두 v-head 레이아웃(6144=48*128)으로 확장 저장. g/beta = per v-head(48).
-    auto q=rd("fp32_gdn_dr_q",(size_t)S*NV*D), k=rd("fp32_gdn_dr_k",(size_t)S*NV*D), v=rd("fp32_gdn_dr_v",(size_t)S*NV*D);
-    auto g=rd("fp32_gdn_dr_g",(size_t)S*NV), bt=rd("fp32_gdn_dr_beta",(size_t)S*NV);
-    auto gold=rd("fp32_gdn_dr_recurrent_out",(size_t)S*NV*D);
+    auto q=rd("gdn_dr_q",(size_t)S*NV*D), k=rd("gdn_dr_k",(size_t)S*NV*D), v=rd("gdn_dr_v",(size_t)S*NV*D);
+    auto g=rd("gdn_dr_g",(size_t)S*NV), bt=rd("gdn_dr_beta",(size_t)S*NV);
+    auto gold=rd("gdn_dr_recurrent_out",(size_t)S*NV*D);
 
     // de-expand q,k → k-head 레이아웃 [S, NK*D]: repeat_interleave 역연산 = head 3*kh 취함.
     std::vector<float> qc((size_t)S*NK*D), kc((size_t)S*NK*D);
@@ -50,9 +52,9 @@ int main(){
 
     // ===== conv1d+silu (27B conv_dim=10240) =====
     const int C=2*NK*D + NV*D;  // 2*kdim + vdim = 4096+6144 = 10240
-    auto cin=rd("fp32_gdn_in_proj_qkv",(size_t)S*C);
+    auto cin=rd("gdn_in_proj_qkv",(size_t)S*C);
     std::vector<float> cw((size_t)C*4); { FILE*f=fopen("artifacts/qwen35-27b/weights/L0_linear_attn.conv1d.bin","rb"); if(!f){printf("conv1d weight 없음\n");return 1;} if(fread(cw.data(),4,cw.size(),f)!=cw.size()){printf("conv1d 크기\n");return 1;} fclose(f); }
-    auto cgold=rd("fp32_gdn_post_conv",(size_t)S*C);
+    auto cgold=rd("gdn_post_conv",(size_t)S*C);
     float*dci=up(cin),*dcw=up(cw),*dco; CK(cudaMalloc(&dco,(size_t)S*C*4));
     launch_gdn_conv1d_silu(dci,dcw,dco,S,C,4); CK(cudaDeviceSynchronize());
     std::vector<float> co((size_t)S*C); CK(cudaMemcpy(co.data(),dco,co.size()*4,cudaMemcpyDeviceToHost));
@@ -61,10 +63,10 @@ int main(){
 
     // ===== gated RMSNorm (z gate), R=S*NV v-head, D =====
     const int R=S*NV;
-    auto core=rd("fp32_gdn_dr_chunk_out",(size_t)R*D);
-    auto z=rd("fp32_gdn_z",(size_t)R*D);
+    auto core=rd("gdn_dr_chunk_out",(size_t)R*D);
+    auto z=rd("gdn_z",(size_t)R*D);
     std::vector<float> nw((size_t)D); { FILE*f=fopen("artifacts/qwen35-27b/weights/L0_linear_attn.norm.bin","rb"); if(!f){printf("norm weight 없음\n");return 1;} if(fread(nw.data(),4,nw.size(),f)!=nw.size()){printf("norm 크기\n");return 1;} fclose(f); }
-    auto ngold=rd("fp32_gdn_norm_out",(size_t)R*D);
+    auto ngold=rd("gdn_norm_out",(size_t)R*D);
     float*dnc=up(core),*dnz=up(z),*dnw=up(nw),*dno; CK(cudaMalloc(&dno,(size_t)R*D*4));
     launch_rms_norm_gated(dnc,dnz,dnw,dno,R,D,1e-6f); CK(cudaDeviceSynchronize());
     std::vector<float> no((size_t)R*D); CK(cudaMemcpy(no.data(),dno,no.size()*4,cudaMemcpyDeviceToHost));

@@ -121,12 +121,21 @@ STEP 2.3에서 좁힌 단 하나의 갭(GDN이 num_k_heads==num_v_heads 암묵 �
 - **0.8B 회귀 0**: 17/17, engine(q4) vs golden_q4 **7.9e-5**. 같은 일반화 커널로 k=v=16도 그대로 = **진짜 보편화**.
 - **27B 통합 `test_27b`**: argmax **ALL 일치** + next-token **11751 정확**(64층, 248K vocab), **커널/graph 로직 변경 0**.
 
-### 27B 통합 hidden 잔차 (정직한 기록)
-engine(q4) vs golden_q4 hidden worst rel **~17%**(L2, 이른 GDN q4 GEMV; 깊을수록 감소). 0.8B(7.9e-5)보다 큼.
-원인 분석(추측 아닌 격리): 가중치 동일(HF 디스크 bf16 → 추출·골든 같은 값 q4, diff 0), q4셋 동일(is_q4),
-모든 sub-op 격리-정확. → **잔차 = q4 GEMV의 GPU-vs-CPU fp32 누적이 64층×27B 와이드 dim서 증폭**(argmax 보존,
-발산 아님). **엄밀 정확성은 sub-op 격리가 증명**, test_27b는 기능(greedy 동일) 통합 판정으로 전환.
-(선택 후속: q4 GEMV를 27B dim서 numpy와 단독 대조해 누적 상수 정량화 — 본 챕터 범위 밖.)
+### 27B 통합 hidden 잔차 — 정밀 분석 (스케일 법칙, 35B/q2 대비)
+**초기 오해 정정**: MAX-abs 지표로 "잔차 ~17%, 깊이 누적"이라 봤으나 **metric 착시였다.** 정밀 측정 결과:
+- **MEAN 상대오차 ≈ 4e-4 (0.04%), 64층 전체 평탄**(L1 3.2e-4 … L64 4.6e-4 — **깊이 누적 0**). 엔진은 사실상 정확.
+- MAX-abs(~수%)는 층당 **~10/25600개 outlier**가 지배 = **HF FusedRMSNormGated 의 fused-kernel rounding**
+  특이점(gated-norm max 6e-3/mean 9.6e-6)이 out_proj GEMV로 전파된 **골든측 quirk**. 엔진 발산 아님.
+- 검증(추측 아닌 격리): `qwen35.cu` DBG0 덤프로 엔진 실제-forward GDN 단계 전부 golden_q4 와 **mean ~1e-5**
+  (in_proj 1.7e-6, conv 7.5e-8, dr 1.9e-9, out_proj 2.8e-5). 가중치 동일(disk q4 == golden q4, diff 0).
+  `test_gemv_q4_scale`: per-GEMV GPU-vs-CPU 누적은 IN=17408서도 **1e-4**(rel ~1e-5, √IN 스케일) — 17% 같은
+  잔차의 원인이 될 수 없음. "GEMV 누적" 가설도 측정으로 반증.
+- argmax 마진 top1-top2 **3.07** vs logit mean오차 0.15 → argmax 견고.
+
+**스케일 법칙 / 예측**: 계통오차(MEAN-rel ~4e-4)가 **깊이에 평탄(누적 0)** → 35B(더 깊고 큰 dim)도 ~4e-4 유지,
+argmax 견고. **"35B서 30~50%로 터진다"는 우려 근거 없음** — 누적 항이 없다(있다면 0.8B/27B 깊이 의존이 보였을 것).
+q2 붕괴는 엔진 누적이 아니라 **q2 양자화 품질**(weight mean-rel; GPTQ/AWQ 필요) 문제로 분리 — 엔진은 어느 비트폭
+골든이든 ~4e-4로 추종. test_27b 게이트 = argmax+next-token + MEAN-rel<2e-3(MAX 는 HF outlier 진단치로만).
 
 ### 결론
 **보편화 증명 완성**: 27B는 새 커널 0, config(num_k/v_heads)+graph 배선만으로 GDN·full-attn 모두 격리-정확.

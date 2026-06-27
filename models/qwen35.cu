@@ -1,6 +1,7 @@
 #include "qwen35.h"
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 #include <cuda_runtime.h>
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
@@ -18,6 +19,14 @@
     fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 
 static float *dmalloc(size_t n) { float *p; QK(cudaMalloc(&p, n * 4)); return p; }
+
+// 디버그: device 버퍼를 $DBG0/<name>.bin 으로 (env DBG0 설정 시, layer 0 GDN 단계 격리용)
+static void dbg_dump(const char *name, const float *d, size_t n) {
+    const char *od = getenv("DBG0"); if (!od) return;
+    std::vector<float> h(n); QK(cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost));
+    char path[512]; snprintf(path, sizeof(path), "%s/%s.bin", od, name);
+    FILE *f = fopen(path, "wb"); if (f) { fwrite(h.data(), 4, n, f); fclose(f); }
+}
 
 // 행렬곱 dispatch: q4(int4 dequant) / fp32 / W4A8(int8 act × int4 weight) 경로.
 static int8_t *gf_xq=nullptr; static float *gf_xs=nullptr; static int32_t *gf_xsum=nullptr; static size_t gf_xqcap=0;
@@ -84,7 +93,9 @@ void qwen35_forward(const ModelConfig &c, const QwenWeights &w,
         } else {
             // GDN
             mm(L.in_qkv, norm, mixed, H, conv_dim, S, use_q4);
+            if (l == 0) dbg_dump("eng_in_proj_qkv", mixed, (size_t)S * conv_dim);
             launch_gdn_conv1d_silu(mixed, L.conv1d, mconv, S, conv_dim, c.gdn_conv_kernel);
+            if (l == 0) dbg_dump("eng_post_conv", mconv, (size_t)S * conv_dim);
             QK(cudaMemcpy2D(qg2, kdim * 4, mconv,             conv_dim * 4, kdim * 4, S, cudaMemcpyDeviceToDevice));
             QK(cudaMemcpy2D(kg2, kdim * 4, mconv + kdim,      conv_dim * 4, kdim * 4, S, cudaMemcpyDeviceToDevice));
             QK(cudaMemcpy2D(vg2, vdim * 4, mconv + 2 * kdim,  conv_dim * 4, vdim * 4, S, cudaMemcpyDeviceToDevice));
@@ -93,8 +104,11 @@ void qwen35_forward(const ModelConfig &c, const QwenWeights &w,
             launch_gemv_f32(norm, L.in_b, bbuf, H, nvh, S);
             launch_gdn_decay_beta(abuf, bbuf, L.A_log, L.dt_bias, gg, beta, S, nvh);
             launch_gdn_delta_rule(qg2, kg2, vg2, gg, beta, core, S, nvh, hv, c.gdn_num_k_heads);
+            if (l == 0) { dbg_dump("eng_dr_core", core, (size_t)S * vdim); dbg_dump("eng_gg", gg, (size_t)S * nvh); dbg_dump("eng_beta", beta, (size_t)S * nvh); }
             launch_rms_norm_gated(core, zbuf, L.gdn_norm, normed, S * nvh, hv, eps);
+            if (l == 0) dbg_dump("eng_norm_out", normed, (size_t)S * vdim);
             mm(L.out_p, normed, gdnout, vdim, H, S, use_q4);
+            if (l == 0) dbg_dump("eng_out_proj", gdnout, (size_t)S * H);
             launch_add(after, x, gdnout, (int)SH);
         }
 
