@@ -7,6 +7,7 @@
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemm_batch.cuh"
 #include "../kernels/gemv_f32.cuh"
+#include "../kernels/quantize_x.cuh"
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
@@ -48,7 +49,7 @@ static float *bws(int &idx, size_t n){
 }
 
 void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecodeState &st,
-                         const int *d_tokens, const float *d_cos, const float *d_sin, float *d_logits){
+                         const int *d_tokens, const float *d_cos, const float *d_sin, float *d_logits, int use_q4){
     const int H=c.hidden_size,FFN=c.intermediate_size,HD=c.head_dim,V=c.vocab_size;
     const int NQ=c.num_q_heads,NKV=c.num_kv_heads,rot=c.rotary_dim; const float eps=c.rms_norm_eps;
     const int qdim2=NQ*HD*(c.attn_output_gate?2:1), qdim=NQ*HD, kvdim=NKV*HD;
@@ -68,8 +69,19 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
     float *core=bws(wi,(size_t)B*vdim),*normed=bws(wi,(size_t)B*vdim),*gout=bws(wi,BH);
     float *gm=bws(wi,(size_t)B*FFN),*um=bws(wi,(size_t)B*FFN),*act=bws(wi,(size_t)B*FFN),*dbuf=bws(wi,BH),*fn=bws(wi,BH);
     float *convfull=bws(wi,(size_t)B*Kk*convd);
+    // W4A8 batch quantize scratch (persistent, grow): xq[B*IN] int8 + xs/xsum[B*IN/QBLK]
+    static int8_t *g_bxq=nullptr; static float *g_bxs=nullptr; static int32_t *g_bxsum=nullptr; static size_t g_bxcap=0;
 
-    auto mmb=[&](const QMat&m,const float*X,float*Y,int IN,int OUT){ launch_gemm_batch_f32(X,m.wf,Y,IN,OUT,B); };
+    auto mmb=[&](const QMat&m,const float*X,float*Y,int IN,int OUT){
+        if(use_q4==2){
+            size_t n=(size_t)B*IN;
+            if(g_bxcap<n){ if(g_bxq)cudaFree(g_bxq);if(g_bxs)cudaFree(g_bxs);if(g_bxsum)cudaFree(g_bxsum);
+                BK(cudaMalloc(&g_bxq,n)); BK(cudaMalloc(&g_bxs,(n/QBLK)*4)); BK(cudaMalloc(&g_bxsum,(n/QBLK)*4)); g_bxcap=n; }
+            launch_quantize_x_q8(X,g_bxq,g_bxs,g_bxsum,IN,B);          // B행 X 양자화(1 launch)
+            launch_gemm_batch_w4a8(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B);
+        } else if(use_q4) launch_gemm_batch_q4(X,m.wq,m.sc,Y,IN,OUT,B);
+        else              launch_gemm_batch_f32(X,m.wf,Y,IN,OUT,B);
+    };
 
     launch_embedding(d_tokens, w.embed, x, B, H);
     for(int l=0;l<c.num_layers;l++){

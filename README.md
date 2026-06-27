@@ -69,6 +69,14 @@ parallelism)지 폭·정밀도 아님 = 2d "single-token=latency-bound, 배칭�
 gemv_w4a8 DP4A-wide/shared-X/golden_w4a8)는 정확·격리(use_q4==2) 보존 — batch>1 자산. 다음 = 배칭 챕터.
 [`docs/ch2b-w4a8-blueprint.md`](./docs/ch2b-w4a8-blueprint.md), [`docs/ch2-q4kernel-blueprint.md`](./docs/ch2-q4kernel-blueprint.md).
 
+**챕터3 완료 (batching — latency 벽 탈출 + llama.cpp 추월).** 챕터2가 확정한 진짜 병목(batch-1 gemv
+latency-bound)을 batch로 탈출. gemm_batch(weight 1로드→B행 재사용 = mmvq multiple-output 일반화) +
+batch attn/gdn/conv(== B single bit-identical) + batch decode(== B single 시퀀스별 오차0). isolated gemm
+thesis(stall 278→77, B=8 4.3×)가 in-engine 전체선 **6.5× 처리량**(forward amortize, isolated≠in-engine 함정 첫 극복).
+**q4/W4A8 × batch가 클라이맥스**: 챕터2b서 batch-1 무의미(+2.5%)했던 W4A8이 batch서 부활(int8-X가 B행→트래픽
+절감 실현 + DP4A + unpack amortize) — W4A8 vs q4 +55%@B=8. **W4A8 B=8 = 980 tok/s로 llama.cpp Q4_K_M(912) 추월**
+(B=1은 여전히 뒤짐=single 커널, B=16+는 그들이 더 scale). [`docs/ch3-batch-blueprint.md`](./docs/ch3-batch-blueprint.md).
+
 검증 재현:
 ```bash
 # (레퍼런스 venv 사용) 가중치/골든 생성 — 1회

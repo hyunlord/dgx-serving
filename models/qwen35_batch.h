@@ -15,7 +15,8 @@ void free_batch_decode_state(BatchDecodeState &s);
 void reset_batch_decode_state(const ModelConfig &c, BatchDecodeState &s);
 
 // d_tokens: [B] (각 시퀀스의 현재 토큰, 위치 n_past). d_logits: [B, V]. commit(KV append + state + n_past++).
+//   use_q4: 0=fp32, 1=q4, 2=W4A8 (matmul 경로; gemm_batch fp32/q4/w4a8).
 void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecodeState &st,
-                         const int *d_tokens, const float *d_cos, const float *d_sin, float *d_logits);
+                         const int *d_tokens, const float *d_cos, const float *d_sin, float *d_logits, int use_q4 = 0);
 
 #endif // DGX_QWEN35_BATCH_H

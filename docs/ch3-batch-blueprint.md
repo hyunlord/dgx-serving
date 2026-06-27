@@ -126,6 +126,44 @@ gemm 외 부분에 안 발목 잡힘을 확증. (작은 in_a/in_b는 아직 gemv
 정확성 시퀀스별 오차0(배선 무결), 단일경로 무손상. 다음 STEP 3: q4/W4A8 × batch (W4A8이 batch서 비로소 의미 —
 X가 B행이라 int8 트래픽 절감 실현 + 언팩/DP4A amortize) + llama.cpp batch 재비교.
 
+## STEP 3 결과 — q4/W4A8 × batch: W4A8 부활 + llama.cpp 추월 (클라이맥스) [완료]
+
+gemm_batch q4(weight unpack 1회→B행 재사용) + w4a8(int8 X B행 × int4 weight, DP4A, weight unpack amortize)
++ qwen35_decode_batch use_q4 배선(W4A8은 batch X 1 launch 양자화).
+
+### 정확성 (구현)
+batch q4 == B single q4 **err 0.000e+00**, batch W4A8 == B single W4A8 **err 0.000e+00** (bit-identical), argmax 전부 match. 16/16 PASS.
+
+### 처리량 (total tok/s) — 정밀도 × B
+| | B=1 | B=8 | B=16 |
+|---|---|---|---|
+| fp32 | 70.5 | 454 | 650 |
+| q4 | 193.9 | 633 | 772 |
+| **W4A8** | 215 | **980** | 1016 |
+
+- **W4A8가 batch서 부활**: W4A8 vs q4 우위 +11%(B=1) → **+55%(B=8)** → +32%(B=16).
+  챕터2b batch-1선 +2.5%(X=weight의 0.002~0.78%라 무의미)였던 "죽은 레버"가, batch서 X가 B행이 되며
+  **int8-X 트래픽 절감 실현 + DP4A(4 int8 MAC/instr) + weight unpack amortize** → +55%. **챕터2b 약속의 검증.**
+- W4A8 B=8 = 980 tok/s(fp32 batch 454의 2.16×, fp32 batch-1 70의 13.9×).
+
+### llama.cpp batched 재비교 (llama-batched-bench, Q4_K_M, S_TG = 생성 처리량)
+| B | 우리 W4A8 | llama.cpp Q4_K_M | |
+|---|---|---|---|
+| 1 | 215 | 277 | llama.cpp 앞 (single-stream 커널 성숙 — 챕터2 진단대로) |
+| **8** | **980** | **912** | **우리 추월 (+7.5%)** |
+| 16 | 1016 | 1266 | llama.cpp 앞 (대형 batch scaling — 우리 B=16 register pressure 천장) |
+
+- **B=8 처리량 sweet spot서 llama.cpp 추월** — 세션 여정(q4→W4A8→batch)의 결실. per-seq도 우리 122 vs 그들 114.
+- B=1은 여전히 뒤짐(single-stream 커널 성숙 = 챕터2 미해결 영역). B=16은 그들이 더 잘 scale(우리 reg48 천장).
+- 공정성: 우리 W4A8(int4 sym/blk32 + int8 act) vs Q4_K_M(K-quant + q8_1) — 근사 비트, 방식 다름(기록). 품질은
+  양쪽 int8 본질 한계(코드 flip) 공유(챕터2b). 둘 다 greedy plain 생성.
+
+### STEP 3 결론 — 챕터3 완결
+**측정-우선 여정의 결실**: 챕터2b에서 batch-1 무의미했던 W4A8이 batch서 +55%로 부활(약속 검증) →
+B=8 처리량 980 tok/s로 **llama.cpp(912) 추월**. 진짜 서빙(batch>1)에서 우리 엔진이 경쟁력. 남은 격차:
+B=1(single 커널), B=16+(대형 batch scaling, register pressure). 다음 후보: STEP4(spec×batch / ragged /
+continuous) 또는 B=1·B=16 커널 다듬기(mmvq multiple-output 정독 — 챕터3 STEP1서 보류한 것).
+
 ## 9. 사용자 결정 필요 (게이트)
 1. **범위 = multi-seq batch decode, plain, same-length 먼저** — 동의? (ragged/spec×batch/continuous는 후속.)
 2. **STEP 1 = isolated batch gemm(fp32)부터** (KV/GDN batch 전에 thesis 증명) — 동의? 아니면 STEP2 통합부터?

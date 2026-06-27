@@ -1,6 +1,8 @@
 #ifndef DGX_GEMM_BATCH_CUH
 #define DGX_GEMM_BATCH_CUH
+#include <cstdint>
 #include "reduce.cuh"
+#include "../runtime/config.h"   // QBLK
 
 // batch gemm (fp32): Y[B,OUT] = X[B,IN] · Wᵀ, W[OUT,IN] row-major.
 //   챕터3 STEP1 thesis: weight row를 1회 로드 → B행에 재사용(누적기 B개) = weight read OUT×IN(현 gemv는 OUT×B×IN).
@@ -43,6 +45,93 @@ static inline void launch_gemm_batch_f32(const float *X, const float *W, float *
         case 8:  launch_gemm_batch_f32_B<8>(X, W, Y, IN, OUT, st); break;
         case 16: launch_gemm_batch_f32_B<16>(X, W, Y, IN, OUT, st); break;
         default: { for (int b = 0; b < B; b++) launch_gemm_batch_f32_B<1>(X + (size_t)b*IN, W, Y + (size_t)b*OUT, IN, OUT, st); }
+    }
+}
+
+// ---- q4 batch gemm: weight row 1회 로드 + unpack 1회 → B행 재사용(unpack도 amortize, 챕터2b 통찰) ----
+template<int B>
+static __global__ void gemm_batch_q4_kernel(const float *X, const uint8_t *Wq, const float *sc, float *Y, int IN, int OUT) {
+    long o = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (o >= OUT) return;
+    const uint8_t *w = Wq + (size_t)o * (IN / 2);
+    const float *sca = sc + (size_t)o * (IN / QBLK);
+    float acc[B];
+    #pragma unroll
+    for (int b = 0; b < B; b++) acc[b] = 0.f;
+    for (int i = lane; i < IN; i += 32) {
+        uint8_t by = w[i >> 1];
+        int q = (i & 1) ? (by >> 4) : (by & 0x0F);
+        float wv = ((float)q - 8.0f) * sca[i / QBLK];     // unpack 1회 → B행 공유
+        #pragma unroll
+        for (int b = 0; b < B; b++) acc[b] += X[(size_t)b * IN + i] * wv;
+    }
+    #pragma unroll
+    for (int b = 0; b < B; b++) { float r = warp_reduce_sum(acc[b]); if (lane == 0) Y[(size_t)b * OUT + o] = r; }
+}
+template<int B>
+static inline void launch_gemm_batch_q4_B(const float *X, const uint8_t *Wq, const float *sc, float *Y, int IN, int OUT, cudaStream_t st) {
+    int block = 256; long grid = ((long)OUT * 32 + block - 1) / block;
+    gemm_batch_q4_kernel<B><<<(unsigned)grid, block, 0, st>>>(X, Wq, sc, Y, IN, OUT);
+}
+static inline void launch_gemm_batch_q4(const float *X, const uint8_t *Wq, const float *sc, float *Y, int IN, int OUT, int B, cudaStream_t st = 0) {
+    switch (B) {
+        case 1:  launch_gemm_batch_q4_B<1>(X, Wq, sc, Y, IN, OUT, st); break;
+        case 2:  launch_gemm_batch_q4_B<2>(X, Wq, sc, Y, IN, OUT, st); break;
+        case 4:  launch_gemm_batch_q4_B<4>(X, Wq, sc, Y, IN, OUT, st); break;
+        case 8:  launch_gemm_batch_q4_B<8>(X, Wq, sc, Y, IN, OUT, st); break;
+        case 16: launch_gemm_batch_q4_B<16>(X, Wq, sc, Y, IN, OUT, st); break;
+        default: { for (int b = 0; b < B; b++) launch_gemm_batch_q4_B<1>(X + (size_t)b*IN, Wq, sc, Y + (size_t)b*OUT, IN, OUT, st); }
+    }
+}
+
+// ---- W4A8 batch gemm: int8 X(B행) × int4 weight. weight uint32 1로드+unpack → B행 재사용, DP4A ----
+//   xq:[B,IN], xs:[B,IN/QBLK]. weight (wq−8) signed dp4a. lane-minor 8원소 chunk.
+__device__ __forceinline__ int gb_pk(int lo_byte, int hi_byte) {
+    return ((( lo_byte       & 0xF) - 8) & 0xFF)
+         | ((((lo_byte >> 4)  & 0xF) - 8) & 0xFF) << 8
+         | ((( hi_byte       & 0xF) - 8) & 0xFF) << 16
+         | ((((hi_byte >> 4)  & 0xF) - 8) & 0xFF) << 24;
+}
+template<int B>
+static __global__ void gemm_batch_w4a8_kernel(const int8_t *xq, const float *xs, const uint8_t *Wq, const float *sw, float *Y, int IN, int OUT) {
+    long o = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (o >= OUT) return;
+    const uint8_t *w = Wq + (size_t)o * (IN / 2);
+    const float *swr = sw + (size_t)o * (IN / QBLK);
+    int nb = IN / QBLK;
+    float acc[B];
+    #pragma unroll
+    for (int b = 0; b < B; b++) acc[b] = 0.f;
+    for (int base = lane * 8; base < IN; base += 32 * 8) {
+        int blk = base / QBLK; float swb = swr[blk];
+        unsigned W = *reinterpret_cast<const unsigned*>(w + (base >> 1));   // weight 1로드+unpack → B행 공유
+        int wA = gb_pk(W & 0xFF, (W >> 8) & 0xFF), wB = gb_pk((W >> 16) & 0xFF, (W >> 24) & 0xFF);
+        #pragma unroll
+        for (int b = 0; b < B; b++) {
+            const int8_t *xqb = xq + (size_t)b * IN;
+            int x0 = *reinterpret_cast<const int*>(xqb + base), x1 = *reinterpret_cast<const int*>(xqb + base + 4);
+            int dot = __dp4a(x0, wA, 0); dot = __dp4a(x1, wB, dot);
+            acc[b] += xs[(size_t)b * nb + blk] * swb * (float)dot;
+        }
+    }
+    #pragma unroll
+    for (int b = 0; b < B; b++) { float r = warp_reduce_sum(acc[b]); if (lane == 0) Y[(size_t)b * OUT + o] = r; }
+}
+template<int B>
+static inline void launch_gemm_batch_w4a8_B(const int8_t *xq, const float *xs, const uint8_t *Wq, const float *sw, float *Y, int IN, int OUT, cudaStream_t st) {
+    int block = 256; long grid = ((long)OUT * 32 + block - 1) / block;
+    gemm_batch_w4a8_kernel<B><<<(unsigned)grid, block, 0, st>>>(xq, xs, Wq, sw, Y, IN, OUT);
+}
+static inline void launch_gemm_batch_w4a8(const int8_t *xq, const float *xs, const uint8_t *Wq, const float *sw, float *Y, int IN, int OUT, int B, cudaStream_t st = 0) {
+    switch (B) {
+        case 1:  launch_gemm_batch_w4a8_B<1>(xq, xs, Wq, sw, Y, IN, OUT, st); break;
+        case 2:  launch_gemm_batch_w4a8_B<2>(xq, xs, Wq, sw, Y, IN, OUT, st); break;
+        case 4:  launch_gemm_batch_w4a8_B<4>(xq, xs, Wq, sw, Y, IN, OUT, st); break;
+        case 8:  launch_gemm_batch_w4a8_B<8>(xq, xs, Wq, sw, Y, IN, OUT, st); break;
+        case 16: launch_gemm_batch_w4a8_B<16>(xq, xs, Wq, sw, Y, IN, OUT, st); break;
+        default: { for (int b = 0; b < B; b++) launch_gemm_batch_w4a8_B<1>(xq + (size_t)b*IN, xs + (size_t)b*(IN/QBLK), Wq, sw, Y + (size_t)b*OUT, IN, OUT, st); }
     }
 }
 

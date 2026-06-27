@@ -25,6 +25,7 @@ int main(int argc,char**argv){
     ModelConfig c=load_config_qwen((WD+"/manifest.json").c_str());
     const int H=c.hidden_size,V=c.vocab_size,rot=c.rotary_dim;
     const int B=4, N=8, maxlen=N+4;
+    int uq=argc>5?atoi(argv[5]):0;   // 0=fp32 1=q4 2=W4A8
     std::vector<int> toks=ri("token_ids.bin"); int P=toks.size();
     // 시퀀스별 토큰열 (서로 다르게): seq b, step t → toks[(b*3+t) % P]
     std::vector<std::vector<int>> seq(B, std::vector<int>(N));
@@ -32,7 +33,7 @@ int main(int argc,char**argv){
     std::vector<float> cl=rf("rope_cos_long.bin",(size_t)128*rot), sl=rf("rope_sin_long.bin",(size_t)128*rot);
     float *d_cos,*d_sin; CK(cudaMalloc(&d_cos,cl.size()*4));CK(cudaMalloc(&d_sin,sl.size()*4));
     CK(cudaMemcpy(d_cos,cl.data(),cl.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(d_sin,sl.data(),sl.size()*4,cudaMemcpyHostToDevice));
-    QwenWeights w=load_weights_qwen(WD.c_str(),c,0,1);
+    QwenWeights w=load_weights_qwen(WD.c_str(),c,1,1);
 
     // ---- batch decode ----
     BatchDecodeState bst=alloc_batch_decode_state(c,B,maxlen);
@@ -41,7 +42,7 @@ int main(int argc,char**argv){
     std::vector<std::vector<float>> blog(N, std::vector<float>((size_t)B*V));
     for(int t=0;t<N;t++){ std::vector<int> tt(B); for(int b=0;b<B;b++)tt[b]=seq[b][t];
         CK(cudaMemcpy(d_tokB,tt.data(),B*4,cudaMemcpyHostToDevice));
-        qwen35_decode_batch(c,w,bst,d_tokB,d_cos,d_sin,d_logB);
+        qwen35_decode_batch(c,w,bst,d_tokB,d_cos,d_sin,d_logB,uq);
         CK(cudaMemcpy(blog[t].data(),d_logB,(size_t)B*V*4,cudaMemcpyDeviceToHost));
     }
 
@@ -51,7 +52,7 @@ int main(int argc,char**argv){
         DecodeState s1=alloc_decode_state(c,maxlen);
         int *d_tok1; CK(cudaMalloc(&d_tok1,4)); float *d_log1; CK(cudaMalloc(&d_log1,(size_t)V*4));
         for(int t=0;t<N;t++){ CK(cudaMemcpy(d_tok1,&seq[b][t],4,cudaMemcpyHostToDevice));
-            qwen35_decode(c,w,s1,d_tok1,1,d_cos,d_sin,d_log1,nullptr,1,nullptr,0,nullptr);
+            qwen35_decode(c,w,s1,d_tok1,1,d_cos,d_sin,d_log1,nullptr,1,nullptr,uq,nullptr);
             CK(cudaMemcpy(slog[t].data()+(size_t)b*V,d_log1,(size_t)V*4,cudaMemcpyDeviceToHost));
         }
         free_decode_state(s1); cudaFree(d_tok1); cudaFree(d_log1);
@@ -78,10 +79,10 @@ int main(int argc,char**argv){
         int *dtk; CK(cudaMalloc(&dtk,Bt*4)); float *dlg; CK(cudaMalloc(&dlg,(size_t)Bt*V*4));
         std::vector<int> tt(Bt); for(int b=0;b<Bt;b++)tt[b]=toks[b%P];
         CK(cudaMemcpy(dtk,tt.data(),Bt*4,cudaMemcpyHostToDevice));
-        for(int t=0;t<3;t++) qwen35_decode_batch(c,w,ts,dtk,d_cos,d_sin,dlg);  // warmup
+        for(int t=0;t<3;t++) qwen35_decode_batch(c,w,ts,dtk,d_cos,d_sin,dlg,uq);  // warmup
         CK(cudaDeviceSynchronize());
         clock_t t0=clock();
-        for(int t=0;t<Nt;t++) qwen35_decode_batch(c,w,ts,dtk,d_cos,d_sin,dlg);
+        for(int t=0;t<Nt;t++) qwen35_decode_batch(c,w,ts,dtk,d_cos,d_sin,dlg,uq);
         CK(cudaDeviceSynchronize());
         double sec=(double)(clock()-t0)/CLOCKS_PER_SEC;
         printf("[throughput] B=%d N=%d: %.3fs  total=%.1f tok/s  per-seq=%.1f tok/s\n",
