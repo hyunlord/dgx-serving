@@ -10,12 +10,17 @@ struct QMat { uint8_t *wq = nullptr; float *sc = nullptr; float *wf = nullptr; }
 struct QLayer {
     int      is_full;
     float   *input_ln, *post_ln;
-    QMat     gate, up, down;                  // MLP (both types)
+    QMat     gate, up, down;                  // dense MLP (num_experts==0)
     // full attention
     QMat     q, k, v, o;  float *q_norm, *k_norm;
     // GDN
     QMat     in_qkv, in_z, out_p;
     float   *in_a, *in_b, *conv1d, *A_log, *dt_bias, *gdn_norm;
+    // MoE (num_experts>0): batched expert q4 [E,2*inter,H]/[E,H,inter] + router/shared
+    QMat     experts_gate_up, experts_down;  // expert e = offset e*(out*in) 인덱싱
+    float   *router;                          // fp32 [E, H]
+    QMat     shared_gate, shared_up, shared_down;
+    float   *shared_gate_w;                   // fp32 [1, H] (sigmoid 게이트)
 };
 
 struct QwenWeights {

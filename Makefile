@@ -11,8 +11,9 @@ BUILD := build
 ENGINE_SRCS := models/smollm3.cu runtime/weights.cu
 
 # 테스트 소스 -> 실행파일 (tests/test_xxx.cu -> tests/test_xxx)
-# *_27b 테스트는 대형모델(27B artifacts 필요), test_gemv_q4_scale 는 측정 도구 → 기본 스위트 제외(수동 실행).
-TEST_SRCS := $(filter-out tests/test_27b.cu tests/test_gdn_27b.cu tests/test_attn_27b.cu tests/test_gemv_q4_scale.cu, $(wildcard tests/*.cu))
+# *_27b/*_35b/moe 테스트는 대형모델 artifacts 필요, test_gemv_q4_scale 는 측정 도구 → 기본 스위트 제외(수동).
+TEST_SRCS := $(filter-out tests/test_27b.cu tests/test_gdn_27b.cu tests/test_attn_27b.cu tests/test_gemv_q4_scale.cu \
+             tests/test_35b.cu tests/test_gdn_35b.cu tests/test_moe_expert.cu, $(wildcard tests/*.cu))
 TEST_BINS := $(TEST_SRCS:.cu=)
 
 HEADERS := $(wildcard kernels/*.cuh) $(wildcard runtime/*.h) $(wildcard models/*.h)
@@ -59,3 +60,6 @@ clean:
 
 tests/test_27b: tests/test_27b.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_27b.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
+
+tests/test_35b: tests/test_35b.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_35b.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@

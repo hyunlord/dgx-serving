@@ -14,6 +14,7 @@
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
 #include "../kernels/gdn.cuh"
+#include "../kernels/router_topk.cuh"
 
 #define QK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
     fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
@@ -39,6 +40,43 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
         launch_gemv_w4a8(gf_xq, gf_xs, gf_xsum, m.wq, m.sc, Y, IN, OUT, S);
     } else if (use_q4) launch_gemv_q4(X, m.wq, m.sc, Y, IN, OUT, S);
     else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
+}
+
+// MoE MLP 블록 (num_experts>0): router top-k → 선택 expert SwiGLU 가중합 + shared(sigmoid 게이트).
+//   백본/MLP 커널 전부 재사용 — 신규는 graph 배선 + router_topk 커널 1개. 정확성-우선 naive(토큰×expert 루프).
+//   normed n2[S,H] → out[S,H]. expert weight = 배치 q4에서 offset 인덱싱.
+static void moe_mlp(const ModelConfig &c, const QLayer &L, const float *n2, float *out, int S) {
+    const int H=c.hidden_size, E=c.num_experts, K=c.num_experts_per_tok;
+    const int MI=c.moe_intermediate_size, SI=c.shared_expert_intermediate_size;
+    const size_t gu_w=(size_t)2*MI*H, dn_w=(size_t)H*MI;   // expert당 weight 수
+    float *rlog=dmalloc((size_t)S*E), *dw=dmalloc((size_t)S*K);
+    int *didx; QK(cudaMalloc(&didx,(size_t)S*K*4));
+    float *gu=dmalloc(2*MI), *hh=dmalloc(MI), *eo=dmalloc(H);
+    // router: gemv_f32 (fp32 weight) → top-k
+    launch_gemv_f32(n2, L.router, rlog, H, E, S);
+    launch_router_topk(rlog, didx, dw, S, E, K);
+    std::vector<int> hidx((size_t)S*K); std::vector<float> hw((size_t)S*K);
+    QK(cudaMemcpy(hidx.data(),didx,(size_t)S*K*4,cudaMemcpyDeviceToHost));
+    QK(cudaMemcpy(hw.data(),dw,(size_t)S*K*4,cudaMemcpyDeviceToHost));
+    QK(cudaMemset(out,0,(size_t)S*H*4));
+    for (int s=0;s<S;s++) for (int k=0;k<K;k++) {                  // naive 토큰×expert
+        int e=hidx[(size_t)s*K+k]; float wk=hw[(size_t)s*K+k];
+        launch_gemv_q4(n2+(size_t)s*H, L.experts_gate_up.wq+e*gu_w/2, L.experts_gate_up.sc+e*gu_w/QBLK, gu, H, 2*MI, 1);
+        launch_swiglu(gu, gu+MI, hh, (size_t)MI);                  // silu(gate)*up
+        launch_gemv_q4(hh, L.experts_down.wq+e*dn_w/2, L.experts_down.sc+e*dn_w/QBLK, eo, MI, H, 1);
+        launch_axpy_acc(out+(size_t)s*H, wk, eo, H);              // out[s] += wk*eo
+    }
+    // shared expert (항상): SwiGLU → sigmoid(H→1) 게이트로 스케일 후 누적
+    float *sg=dmalloc((size_t)S*SI), *su=dmalloc((size_t)S*SI), *sh=dmalloc((size_t)S*SI);
+    float *so=dmalloc((size_t)S*H), *glog=dmalloc((size_t)S);
+    launch_gemv_q4(n2, L.shared_gate.wq, L.shared_gate.sc, sg, H, SI, S);
+    launch_gemv_q4(n2, L.shared_up.wq,   L.shared_up.sc,   su, H, SI, S);
+    launch_swiglu(sg, su, sh, (size_t)S*SI);
+    launch_gemv_q4(sh, L.shared_down.wq, L.shared_down.sc, so, SI, H, S);
+    launch_gemv_f32(n2, L.shared_gate_w, glog, H, 1, S);          // [S,1] logit
+    launch_moe_shared_add(out, so, glog, S, H);                   // out[s] += sigmoid(glog[s])*so[s]
+    for (float *p : {rlog,dw,gu,hh,eo,sg,su,sh,so,glog}) cudaFree(p);
+    cudaFree(didx);
 }
 
 // docs/02a-qwen35-blueprint.md 의 forward graph. config 로 dims/레이어타입 받음.
@@ -112,12 +150,18 @@ void qwen35_forward(const ModelConfig &c, const QwenWeights &w,
             launch_add(after, x, gdnout, (int)SH);
         }
 
-        // MLP (공통, SwiGLU)
+        // MLP: dense SwiGLU 또는 MoE 블록 (config num_experts 로 분기 — 백본은 위까지 전부 공유)
         launch_rmsnorm_zc(after, L.post_ln, n2, S, H, eps);
-        mm(L.gate, n2, g_mlp, H, FFN, S, use_q4);
-        mm(L.up,   n2, u_mlp, H, FFN, S, use_q4);
-        launch_swiglu(g_mlp, u_mlp, act, (size_t)S * FFN);
-        mm(L.down, act, dbuf, FFN, H, S, use_q4);
+        if (c.num_experts > 0) {
+            if (l == 0) dbg_dump("eng_moe_in", n2, (size_t)S * H);
+            moe_mlp(c, L, n2, dbuf, S);
+            if (l == 0) dbg_dump("eng_moe_out", dbuf, (size_t)S * H);
+        } else {
+            mm(L.gate, n2, g_mlp, H, FFN, S, use_q4);
+            mm(L.up,   n2, u_mlp, H, FFN, S, use_q4);
+            launch_swiglu(g_mlp, u_mlp, act, (size_t)S * FFN);
+            mm(L.down, act, dbuf, FFN, H, S, use_q4);
+        }
         launch_add(x, after, dbuf, (int)SH);
     }
 

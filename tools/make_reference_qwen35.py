@@ -37,18 +37,33 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--gdn-layer", type=int, default=0)
+    ap.add_argument("--moe-layer", type=int, default=-1, help="MoE 블록 격리 캡처 레이어(-1=자동 첫 MoE)")
+    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"],
+                    help="35B+ fp32=140GB OOM → bfloat16 골든(엔진 q4 검증엔 충분).")
     args = ap.parse_args()
     import torch
     import torch.nn.functional as F
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-    from transformers.models.qwen3_5 import modeling_qwen3_5 as M
+    # delta-rule recurrent 레퍼런스 모듈: qwen3_5 또는 qwen3_5_moe (모델군별).
+    try:
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as M
+    except Exception:
+        M = None
+    try:
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as Mmoe
+    except Exception:
+        Mmoe = None
     os.makedirs(args.out, exist_ok=True)
 
     cfg = AutoConfig.from_pretrained(args.model)
     tcfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
+    _dt = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
+    print(f"[ref] loading {args.model} ({args.dtype})...", flush=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=_dt, low_cpu_mem_usage=True)
     model.eval()
+    # GDN recurrent 레퍼런스 함수 (모듈 자동 선택)
+    Mref = M if (M is not None and hasattr(M, "torch_recurrent_gated_delta_rule")) else Mmoe
 
     try:
         base = model.get_submodule("model.language_model")  # 멀티모달 래퍼 로드 시
@@ -92,6 +107,17 @@ def main():
             lambda m, a, kw: cap.__setitem__("norm_in", (a[0].detach(), (kw.get("gate") if kw.get("gate") is not None else a[1]).detach())), with_kwargs=True))
         hooks.append(la.norm.register_forward_hook(lambda m, i, o: cap.__setitem__("norm_out", o.detach())))
         hooks.append(la.out_proj.register_forward_hook(lambda m, i, o: cap.__setitem__("out_proj", o.detach())))
+        # MoE 블록 격리 캡처 (mlp 가 SparseMoeBlock 일 때): in/out + router + shared(게이트 전/후)
+        ml = args.moe_layer if args.moe_layer >= 0 else gl
+        moe = base.layers[ml].mlp
+        if hasattr(moe, "experts") and hasattr(moe, "gate"):
+            hooks.append(moe.register_forward_pre_hook(lambda m, i: cap.__setitem__("moe_in", i[0].detach())))
+            hooks.append(moe.register_forward_hook(
+                lambda m, i, o: cap.__setitem__("moe_out", (o[0] if isinstance(o, tuple) else o).detach())))
+            hooks.append(moe.gate.register_forward_hook(
+                lambda m, i, o: cap.__setitem__("router", tuple(x.detach() for x in o) if isinstance(o, tuple) else o.detach())))
+            hooks.append(moe.shared_expert.register_forward_hook(lambda m, i, o: cap.__setitem__("shared_raw", o.detach())))
+            hooks.append(moe.shared_expert_gate.register_forward_hook(lambda m, i, o: cap.__setitem__("shared_gate_logit", o.detach())))
         # delta-rule 함수 래핑 (HF가 prefill에서 쓰는 chunk + 동일입력 recurrent 레퍼런스)
         orig_chunk = la.chunk_gated_delta_rule
         def wrap(q, k, v, g, beta, **kw):
@@ -100,7 +126,7 @@ def main():
             out = orig_chunk(q, k, v, g, beta, **kw)
             cap["dr_chunk_out"] = out[0].detach()
             # 동일 입력으로 recurrent 레퍼런스 (state 0, t순 누적) — 엔진 naive 커널의 tight 골든
-            rec, _ = M.torch_recurrent_gated_delta_rule(q, k, v, g=g, beta=beta,
+            rec, _ = Mref.torch_recurrent_gated_delta_rule(q, k, v, g=g, beta=beta,
                         initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
             cap["dr_recurrent_out"] = rec.detach()
             return out
@@ -127,6 +153,17 @@ def main():
         w(f"{tag}_gdn_z", cap["in_proj_z"][0])                  # [S, 2048] (gate z, reshape→[S*16,128])
         w(f"{tag}_gdn_norm_out", cap["norm_out"])               # [S*16, 128] gated-norm 출력
         w(f"{tag}_gdn_out_proj", cap["out_proj"][0])            # [S, H]
+        # MoE 블록 격리 골든 (있을 때): in/out [S,H], router_logits [S,E], shared(게이트 전/후)
+        if "moe_in" in cap:
+            sq = lambda t: t[0] if t.dim() == 3 else t        # batch(1) squeeze
+            w(f"{tag}_moe_in", sq(cap["moe_in"]))
+            w(f"{tag}_moe_out", sq(cap["moe_out"]))
+            rt = cap["router"]; rl = rt[0] if isinstance(rt, tuple) else rt
+            w(f"{tag}_moe_router_logits", sq(rl))              # [S, E] (router gate 출력 logits)
+            w(f"{tag}_moe_shared_raw", sq(cap["shared_raw"]))  # shared_expert MLP 출력 (sigmoid 게이트 전)
+            w(f"{tag}_moe_shared_gate_logit", sq(cap["shared_gate_logit"]))  # [S,1] (sigmoid 전)
+            print(f"[ref:{tag}] MoE 블록 캡처 in{tuple(sq(cap['moe_in']).shape)} "
+                  f"router{tuple(sq(rl).shape)} out{tuple(sq(cap['moe_out']).shape)}")
         am = out.logits[0].argmax(-1).tolist()
         dr_diff = (cap["dr_chunk_out"] - cap["dr_recurrent_out"]).abs().max().item()
         print(f"[ref:{tag}] hs={len(hs)} logits={tuple(out.logits[0].shape)} argmax={am} "

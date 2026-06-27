@@ -53,9 +53,20 @@ QwenWeights load_weights_qwen(const char *dir, const ModelConfig &c, int load_q4
         L.is_full = c.layer_is_full ? c.layer_is_full[i] : 1;
         L.input_ln = f32(p + "input_layernorm", H);
         L.post_ln  = f32(p + "post_attention_layernorm", H);
-        L.gate = mat(p + "mlp.gate_proj", FFN, H);
-        L.up   = mat(p + "mlp.up_proj",   FFN, H);
-        L.down = mat(p + "mlp.down_proj", H, FFN);
+        if (c.num_experts > 0) {                          // MoE MLP (batched experts + router + shared)
+            const size_t E = c.num_experts, MI = c.moe_intermediate_size, SI = c.shared_expert_intermediate_size;
+            L.experts_gate_up = mat(p + "mlp.experts.gate_up_proj", E * 2 * MI, H);   // [E,2*inter,H] flat
+            L.experts_down    = mat(p + "mlp.experts.down_proj",    E * H, MI);        // [E,H,inter] flat
+            L.router          = f32(p + "mlp.gate", E * H);                            // [E,H] fp32
+            L.shared_gate     = mat(p + "mlp.shared_expert.gate_proj", SI, H);
+            L.shared_up       = mat(p + "mlp.shared_expert.up_proj",   SI, H);
+            L.shared_down     = mat(p + "mlp.shared_expert.down_proj", H, SI);
+            L.shared_gate_w   = f32(p + "mlp.shared_expert_gate", H);                  // [1,H] fp32
+        } else {                                          // dense MLP
+            L.gate = mat(p + "mlp.gate_proj", FFN, H);
+            L.up   = mat(p + "mlp.up_proj",   FFN, H);
+            L.down = mat(p + "mlp.down_proj", H, FFN);
+        }
         if (L.is_full) {
             L.q = mat(p + "self_attn.q_proj", qdim2, H);
             L.k = mat(p + "self_attn.k_proj", kvdim, H);
@@ -89,6 +100,8 @@ void free_weights_qwen(QwenWeights &w) {
         FM(L.q); FM(L.k); FM(L.v); FM(L.o); F(L.q_norm); F(L.k_norm);
         FM(L.in_qkv); FM(L.in_z); FM(L.out_p);
         F(L.in_a); F(L.in_b); F(L.conv1d); F(L.A_log); F(L.dt_bias); F(L.gdn_norm);
+        FM(L.experts_gate_up); FM(L.experts_down); F(L.router);
+        FM(L.shared_gate); FM(L.shared_up); FM(L.shared_down); F(L.shared_gate_w);
     }
     free(w.layers); w.layers = nullptr; w.L = 0;
 }
