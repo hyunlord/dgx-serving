@@ -50,6 +50,25 @@ static inline void launch_gdn_conv1d_silu_decode(const float *in, const float *p
     gdn_conv1d_silu_decode_kernel<<<grid, block, 0, st>>>(in, prev, w, out, Sq, C, K);
 }
 
+// ---- batch decode conv1d (챕터3): B 독립 시퀀스, 각 1토큰 + 자기 prev(convctx[b]) ----
+//   in: [B, C] (각 시퀀스 1토큰), prev: [B, K-1, C], out: [B, C]. Sq=1당 ti=j-(K-1): j<K-1→prev[b][j], j=K-1→in[b].
+static __global__ void gdn_conv1d_silu_decode_batch_kernel(const float *in, const float *prev, const float *w,
+                                              float *out, int B, int C, int K) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)B * C) return;
+    int c = (int)(idx % C), b = (int)(idx / C);
+    const float *prevb = prev + (size_t)b * (K - 1) * C;
+    float acc = 0.f;
+    for (int j = 0; j < K - 1; j++) acc += w[(size_t)c * K + j] * prevb[(size_t)j * C + c];
+    acc += w[(size_t)c * K + (K - 1)] * in[(size_t)b * C + c];
+    out[(size_t)b * C + c] = acc / (1.0f + expf(-acc));
+}
+static inline void launch_gdn_conv1d_silu_decode_batch(const float *in, const float *prev, const float *w,
+                                                       float *out, int B, int C, int K, cudaStream_t st = 0) {
+    int block = 256; long n = (long)B * C; int grid = (int)((n + block - 1) / block);
+    gdn_conv1d_silu_decode_batch_kernel<<<grid, block, 0, st>>>(in, prev, w, out, B, C, K);
+}
+
 // ---- (2) decay g + beta (per head 스칼라) ----
 //   a,b: [S,H] (in_proj_a/b 출력). g[s,h] = -exp(A_log[h]) * softplus(a+dt_bias[h]); beta = sigmoid(b).
 static __device__ __forceinline__ float softplus_stable(float x) { return x > 20.f ? x : log1pf(expf(x)); }
@@ -159,6 +178,46 @@ static inline void launch_gdn_step(const float *Q, const float *K, const float *
                                    float *Ssnap, float *O, int Sq, int NH, int D, cudaStream_t st = 0) {
     size_t shmem = (size_t)(2 * D + 32) * sizeof(float);
     gdn_step_kernel<<<NH, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Ssnap, O, Sq, NH, D);
+}
+
+// ---- batch decode GDN step (챕터3): B 독립 시퀀스, 각 1스텝(행 간 recurrence 없음 — 병렬) ----
+//   Q,K,V,O: [B, NH, D]. G,Bt: [B, NH]. Sin/Sout: [B, NH, D, D] (시퀀스별 committed state). 1 step씩.
+//   grid(NH, B): 블록(h,b)가 시퀀스 b·head h의 1스텝. Sout = 갱신된 state(commit). (snapshot 불요 — plain decode.)
+static __global__ void gdn_step_batch_kernel(const float *Q, const float *K, const float *V,
+                                const float *G, const float *Bt,
+                                const float *Sin, float *Sout, float *O,
+                                int NH, int D) {
+    int h = blockIdx.x, b = blockIdx.y, v = threadIdx.x;
+    if (v >= D) return;
+    extern __shared__ float sh[];
+    float *qs = sh, *ks = sh + D, *red = sh + 2 * D;
+    float scol[128];
+    size_t stb = ((size_t)b * NH + h) * D * D;            // state[b][h] 시작
+    for (int k = 0; k < D; k++) scol[k] = Sin ? Sin[stb + (size_t)k * D + v] : 0.f;
+    const float invsD = rsqrtf((float)D);
+    size_t base = ((size_t)b * NH + h) * D;               // Q/K/V/O row (b,h)
+    float qe = Q[base + v], ke = K[base + v];
+    float sq = block_reduce_sum(qe * qe, red);
+    float sk = block_reduce_sum(ke * ke, red);
+    qs[v] = qe * rsqrtf(sq + 1e-6f) * invsD;
+    ks[v] = ke * rsqrtf(sk + 1e-6f);
+    __syncthreads();
+    float g_t = expf(G[(size_t)b * NH + h]), beta_t = Bt[(size_t)b * NH + h];
+    float kv = 0.f;
+    #pragma unroll 4
+    for (int k = 0; k < D; k++) { scol[k] *= g_t; kv += scol[k] * ks[k]; }
+    float delta = (V[base + v] - kv) * beta_t, out = 0.f;
+    #pragma unroll 4
+    for (int k = 0; k < D; k++) { scol[k] += ks[k] * delta; out += scol[k] * qs[k]; }
+    O[base + v] = out;
+    for (int k = 0; k < D; k++) Sout[stb + (size_t)k * D + v] = scol[k];   // 갱신 state commit
+}
+static inline void launch_gdn_step_batch(const float *Q, const float *K, const float *V,
+                                         const float *G, const float *Bt, const float *Sin,
+                                         float *Sout, float *O, int B, int NH, int D, cudaStream_t st = 0) {
+    dim3 grid(NH, B);
+    size_t shmem = (size_t)(2 * D + 32) * sizeof(float);
+    gdn_step_batch_kernel<<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, D);
 }
 
 // ---- (4) gated RMSNorm (Qwen3_5RMSNormGated) ----
