@@ -56,6 +56,40 @@
 - **회귀 0**: 17/17 PASS(기존 16 + test_engine). 0.8B 동작 불변(additive라 기존 경로 미수정).
 - 27B는 `engine_load(27B_dir)` 동일 경로(같은 qwen3_5 kind, config만 27B 값) — STEP 2서 검증.
 
+## STEP 2 결과 — 27B 추출/골든 OK, but GDN 보편화 갭 발견 (멈추고 보고)
+
+### 2.1 추출 (config 주도, 툴만 수정)
+- `extract_weights_qwen35.py` config 주도 확인. 추가: `--dtype bf16`(108GB→54GB OOM회피) + `--q4-only`(big fp32 생략).
+- **버그 수정**: 27B는 `tie_word_embeddings=False`(untied) — lm_head가 top-level `lm_head.weight`(prefix 밖)라 추출기가
+  스킵했음. untied lm_head 처리 추가(prefix 무관 save_q4). 0.8B는 tied라 안 드러난 갭.
+- 27B q4 추출 완료: 64층(16 full/48 GDN), q4 400 tensors, rel-err 0.0996(0.8B와 동일), ~19GB. 커널/graph 불변.
+
+### 2.2 골든 (fp32-CPU가 fit!)
+- make_reference fp32-CPU 로드: **108GB가 CPU RAM 119GB에 fit**(headroom 10GB) → **fp32 골든 가능**(bf16 폴백 불필요,
+  err-0 품질). golden_fp32 + golden_q4 생성, argmax [2614,314,279,369,11751], fp32==q4 last-tok MATCH(11751).
+- 메모리 물리학 재정정: 골든은 CPU(순차)라 fp32 가능. 우리 엔진 fp32(GPU 108GB)만 불가 → q4 엔진으로 검증.
+
+### 2.3 정확성 검증 — **GDN 보편화 갭 발견 (FAIL, 예상된 신호)**
+`test_27b`: engine_load(27B, q4) + qwen35_forward(use_q4=1) vs golden_q4. 결과: **L1(첫 GDN층)부터 hidden 발산
+(worst 11.73), 최종 NaN**(logits/prenorm "err 0"은 mae가 fmax로 NaN 무시한 artifact, last-tok eng=0=NaN argmax).
+
+**정체 = GDN GQA 그룹핑 미처리:**
+| | 0.8B | 27B |
+|---|---|---|
+| gdn_num_k_heads (q/k) | 16 | **16** |
+| gdn_num_v_heads (v) | 16 | **48** |
+- 0.8B는 k=v=16(동일) → graph가 `launch_gdn_step(NH=nvh, ...)`로 q/k/v 모두 nvh heads 가정해도 우연히 맞음.
+- 27B는 **k/q=16, v=48**(v-head 3개당 k-head 1개 공유 = GQA). graph의 qg2/kg2(kdim=16헤드) vs vg2(vdim=48헤드) +
+  gdn_step 커널이 head h의 q/k/v를 같은 h로 페어링 → 27B서 v-head 17이 없는 k-head 17 참조 → 발산/NaN.
+- 커널 주석도 "D<=128 가정(head_k=head_v)" — **k_heads==v_heads 암묵 가정이 0.8B 우연**.
+
+### 결론 — 보편화 첫 갭 (멈추고 보고, work order대로)
+**graph + GDN 커널이 num_k_heads==num_v_heads를 암묵 가정**(0.8B 우연). 27B의 GQA-스타일 GDN(16k/48v)이 이를 깸 →
+**config로 안 빠지고 graph/kernel에 샌 것 = 보편화 실패 신호.** 헌법("커널 수정 필요하면 멈추고 보고")대로 자율 수정 안 하고 보고.
+- 필요한 변경: gdn_step 커널 + graph 배선이 v-head→k-head 그룹핑(GQA in GDN) 지원. delta-rule에서 q/k는 k-head 인덱스,
+  v/state는 v-head 인덱스로 분리. = 커널/graph 경계 재설계(STEP 3 후보).
+- 추출/골든/엔진로드/레지스트리/인터페이스는 전부 OK(커널 불변) — 갭은 GDN 헤드 그룹핑 단 하나로 좁혀짐(좋은 신호).
+
 ## 6. 사용자 결정 (게이트)
 1. **첫 큰 모델 = Qwen3.5-4B(다운로드됨, 동일 arch, 골든 안전)로 시작** 동의? (의뢰서 27B 전에 — 4B로 코드베이스화+dense
    확장을 싸게 증명, 27B는 STEP 4서 다운로드+메모리 스케일.) 아니면 바로 27B(3.6) 다운로드부터?

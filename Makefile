@@ -55,3 +55,6 @@ test: $(TEST_BINS)
 clean:
 	rm -f $(TEST_BINS)
 	rm -rf $(BUILD)
+
+tests/test_27b: tests/test_27b.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_27b.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@

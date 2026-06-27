@@ -110,6 +110,11 @@ def main():
     errs = []
     n_q4 = n_f32 = 0
     for key, t in sd.items():
+        # untied lm_head: top-level "lm_head.weight" (prefix 밖) — tie=False 모델(27B 등) 대비
+        if key == "lm_head.weight" or key.endswith(".lm_head.weight"):
+            if "w_lm_head_q4.bin" not in os.listdir(args.out):
+                errs.append(save_q4("w_lm_head", t)); n_q4 += 1
+            continue
         if not key.startswith(prefix):
             continue
         rel = key[len(prefix):]
