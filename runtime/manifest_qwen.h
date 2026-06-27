@@ -26,6 +26,13 @@ static inline ModelConfig load_config_qwen(const char *manifest_path) {
     c.gdn_head_v_dim  = mf_int(s, "linear_value_head_dim");
     c.gdn_conv_kernel = mf_int(s, "linear_conv_kernel");
 
+    // MoE (dense 모델엔 키 없음 → 0 = dense). num_experts>0 이면 MoE graph.
+    c.num_experts                     = mf_int_opt(s, "num_experts", 0);
+    c.num_experts_per_tok             = mf_int_opt(s, "num_experts_per_tok", 0);
+    c.moe_intermediate_size           = mf_int_opt(s, "moe_intermediate_size", 0);
+    c.shared_expert_intermediate_size = mf_int_opt(s, "shared_expert_intermediate_size", 0);
+    c.norm_topk_prob                  = mf_int_opt(s, "norm_topk_prob", 1);  // Qwen-MoE renorm 함
+
     // layer_types: ["linear_attention","full_attention",...] → layer_is_full[i] (1/0)
     int *lf = (int *)malloc(sizeof(int) * c.num_layers);
     const char *p = strchr(mf_find(s, "layer_types"), '[');

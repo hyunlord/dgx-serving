@@ -28,6 +28,13 @@ static inline const char *mf_find(const char *s, const char *key) {
 
 static inline double mf_num(const char *s, const char *key) { return strtod(mf_find(s, key), nullptr); }
 static inline int mf_int(const char *s, const char *key) { return (int)strtol(mf_find(s, key), nullptr, 10); }
+// 선택 키: 없으면 exit 대신 기본값 (dense 모델의 MoE 필드 등).
+static inline int mf_int_opt(const char *s, const char *key, int def) {
+    char pat[128]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(s, pat); if (!p) return def;
+    p = strchr(p + strlen(pat), ':'); if (!p) return def;
+    return (int)strtol(p + 1, nullptr, 10);
+}
 static inline int mf_bool(const char *s, const char *key) {
     const char *p = mf_find(s, key);
     while (*p == ' ' || *p == '\n' || *p == '\t') p++;

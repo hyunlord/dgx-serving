@@ -4,6 +4,9 @@
 //   HF(Qwen3.5-MoE): softmax(E 전체, fp32) → top-K → top_w/=top_w.sum().
 //   수학 항등: softmax(E)→topK→renorm == softmax(topK logits) (full-E Z가 renorm서 상쇄,
 //   weight 차 ~3e-8). 후자로 구현(단순·정확, full softmax 불필요). 정확성-우선 naive(1스레드/토큰).
+//   ★ 가정: renorm(top_w/=sum) 있을 때만 항등 성립. Qwen3.5-MoE는 renorm 함 → OK.
+//     다음 MoE(예: Gemma4 26B-A4B)가 renorm 안 하면(top-K를 full-softmax 값 그대로 사용) 이 항등 깨짐
+//     → config 분기(renorm 여부) 필요. 지금은 Qwen-MoE 전용 가정.
 //   idx[S,K] (int, top-K expert), w[S,K] (float, 합=1). 효율화(병렬 선택)는 나중(ncu 후).
 
 #ifndef ROUTER_MAX_E

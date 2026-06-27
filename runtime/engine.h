@@ -12,14 +12,16 @@
 #include "../models/qwen35_batch.h"
 #include "decode_state.h"
 
-enum ModelKind { MK_QWEN3_5 = 0, MK_UNKNOWN = -1 };
+enum ModelKind { MK_QWEN3_5 = 0, MK_QWEN3_5_MOE = 1, MK_UNKNOWN = -1 };
 
 // 레지스트리: manifest의 "model_type" → ModelKind. (없으면 qwen3_5 기본 — 현 단일 패밀리.)
+//   주의: "qwen3_5_moe" 가 "qwen3_5" 를 부분포함 → 더 구체적인 moe 를 먼저 체크.
 static inline ModelKind model_kind_from_manifest(const char *manifest_path) {
     FILE *f = fopen(manifest_path, "rb");
     if (!f) return MK_QWEN3_5;
     char buf[4096]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f);
     if (strstr(buf, "\"model_type\"")) {
+        if (strstr(buf, "qwen3_5_moe") || strstr(buf, "qwen3.5_moe")) return MK_QWEN3_5_MOE;  // MoE 먼저
         if (strstr(buf, "qwen3_5") || strstr(buf, "qwen3.5") || strstr(buf, "qwen3_next")) return MK_QWEN3_5;
         return MK_UNKNOWN;   // 미등록 model_type — 새 graph 필요(보편화 신호)
     }

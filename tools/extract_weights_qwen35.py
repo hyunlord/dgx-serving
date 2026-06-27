@@ -17,9 +17,16 @@ from extract_weights import quantize_int4, dequant_relerr, QBLK
 
 
 def is_q4(name, ndim):
+    # MoE fused experts: 3D batched [E, out, in] = 본체 bulk → q4 (per-block-32, expert offset 인덱싱).
+    if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+        return True
     if ndim != 2:                      # norms(1D), conv1d(3D), A_log/dt_bias(1D) → fp32
         return False
     if "in_proj_a" in name or "in_proj_b" in name:  # 작은 gating proj [16,1024] → fp32
+        return False
+    if name.endswith("mlp.gate.weight"):            # MoE router (H→E) → fp32 (라우팅 정밀, gate_proj와 다름)
+        return False
+    if "shared_expert_gate" in name:                # shared expert sigmoid gate (H→1) → fp32
         return False
     if name.endswith("embed_tokens.weight"):        # embed 는 fp32 (룩업)
         return False
@@ -72,6 +79,7 @@ def main():
            getattr(tcfg, "partial_rotary_factor", 1.0))
     manifest = {
         "model": args.model,
+        "model_type": getattr(cfg, "model_type", None),   # qwen3_5 / qwen3_5_moe → 레지스트리 디스패치
         "hidden_size": g("hidden_size"), "intermediate_size": g("intermediate_size"),
         "num_layers": L, "num_q_heads": g("num_attention_heads"),
         "num_kv_heads": g("num_key_value_heads"), "head_dim": hd,
@@ -88,6 +96,15 @@ def main():
         "attn_output_gate": bool(g("attn_output_gate", False)),
         "full_attention_interval": g("full_attention_interval"),
     }
+    # MoE dims (num_experts 있을 때만 — dense 모델엔 미추가, config 주도)
+    if g("num_experts"):
+        manifest.update({
+            "num_experts": g("num_experts"),
+            "num_experts_per_tok": g("num_experts_per_tok"),
+            "moe_intermediate_size": g("moe_intermediate_size"),
+            "shared_expert_intermediate_size": g("shared_expert_intermediate_size"),
+            "norm_topk_prob": int(bool(g("norm_topk_prob", True))),  # int (C mf_int_opt 파싱)
+        })
 
     def save_f32(fname, t):
         a = t.detach().cpu().float().contiguous().numpy().astype(np.float32)
