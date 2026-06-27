@@ -77,6 +77,15 @@ thesis(stall 278→77, B=8 4.3×)가 in-engine 전체선 **6.5× 처리량**(for
 절감 실현 + DP4A + unpack amortize) — W4A8 vs q4 +55%@B=8. **W4A8 B=8 = 980 tok/s로 llama.cpp Q4_K_M(912) 추월**
 (B=1은 여전히 뒤짐=single 커널, B=16+는 그들이 더 scale). [`docs/ch3-batch-blueprint.md`](./docs/ch3-batch-blueprint.md).
 
+**챕터4 완료 (gemm 극한 — 정직한 부분 승리).** 챕터3의 양 끝 격차(B=1, B=16) 정조준. mmvq 정독으로
+세 번 데인 occupancy 함정의 정체 규명: 우리 실패는 "multiple-output-per-warp(1 warp에 누적기 몰기→reg 붕괴)",
+mmvq는 정반대 "multiple-WARPS-per-output"(여러 warp가 IN 분할+shared 축약→reg 작게, 병렬성은 warp 수).
+**개념 승리**: gemm_mw가 reg 35~40 유지(붕괴 회피) — 함정 정체 확정. **q4 +22%@B=8**(latency-bound라 이득).
+단 측정이 정직하게: B=1은 over-decompose 회귀(1-warp 유지), W4A8 best path(980)는 lane-minor dp4a로 이미 최적
+(mw 무익), B=16 "2×B8"은 직렬화 결함. **B=1/B=16 micro-gap은 한계효용 → 양 끝 큰 노력(smem tiling/MMQ)은
+diminishing returns로 보류, "알려진 격차"로 기록.** 경쟁 위치(B=8 W4A8 980>llama 912) 견고. 다음 = vLLM 외부 좌표.
+[`docs/ch4-gemm-blueprint.md`](./docs/ch4-gemm-blueprint.md).
+
 검증 재현:
 ```bash
 # (레퍼런스 venv 사용) 가중치/골든 생성 — 1회
