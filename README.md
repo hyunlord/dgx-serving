@@ -60,6 +60,15 @@ both-q4 spec **191 t/s = fp32 plain의 2.9×**, q4-spec net-POSITIVE 회복. acc
 q4 spec 191 vs 314 — **1.5~1.6× 뒤짐, 격차는 전적으로 q4 gemv 커널 성숙도**(fp32 경로는 88% 대등).
 다음 타깃 = q4 gemv 커널 최적화. [`docs/03a-q4spec-blueprint.md`](./docs/03a-q4spec-blueprint.md).
 
+**챕터2/2b 완료 (진단 — 진짜 병목 확정).** q4 gemv 커널 최적화 시도. 세 가설을 측정이 차례로 기각:
+① unpack 병목(ncu: 이미 fused, 주범은 byte 로드 sectors/req 2) ② fp32 uint4 wide load(in-engine 176→104 회귀:
+weight-wide ⊥ X-coalesce) ③ W4A8 int8-X "X 트래픽 4×↓"(산술 기각: batch-1서 X는 weight의 0.002~0.78%).
+재정의: int8-X = wide-load enabler. 실현(sectors/req 2→4.4, fp32 실패 우회)했으나 **여전히 latency-bound**
+(stall 44~78, mem 4~10%) → W4A8 180.5 vs q4 176 = +2.5%뿐. **결론: 격차 본질은 gemv 구조(memory-level
+parallelism)지 폭·정밀도 아님 = 2d "single-token=latency-bound, 배칭이 레버"와 일치.** W4A8 인프라(quantize_x/
+gemv_w4a8 DP4A-wide/shared-X/golden_w4a8)는 정확·격리(use_q4==2) 보존 — batch>1 자산. 다음 = 배칭 챕터.
+[`docs/ch2b-w4a8-blueprint.md`](./docs/ch2b-w4a8-blueprint.md), [`docs/ch2-q4kernel-blueprint.md`](./docs/ch2-q4kernel-blueprint.md).
+
 검증 재현:
 ```bash
 # (레퍼런스 venv 사용) 가중치/골든 생성 — 1회
