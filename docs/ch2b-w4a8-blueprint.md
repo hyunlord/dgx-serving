@@ -66,6 +66,35 @@ F16 vs Q4_K_M로 cross-engine 토큰 confound 회피하고 코드 프롬프트(t
 `Σ xq·(wq−8) = Σxq·wq − 8·Σxq`의 `8·Σxq` 항에 그대로 필요 → **블록당 (scale, sum) 저장 확정.**
 dot = sx·sw·(dp4a(xq,wq) − 8·sum_b). DP4A로 int 누적 후 블록 scale 곱.
 
+## STEP 1 결과 — X int8 양자화 커널 + W4A8 gemv + golden_w4a8 [완료]
+
+구현: `kernels/quantize_x.cuh`(quantize_x_q8: per-block-32 → xq int8, xs scale, xsum=Σxq int32),
+`kernels/gemv_w4a8.cuh`(dot = Σ_b xs·sw·(Σxq·wq − 8·xsum), STEP1은 정확성 우선 1warp/output 스칼라),
+`tests/test_w4a8.cu`(in-test fp64 golden_w4a8 = per-block-32 int8 X dequant × q4-W 정확 dot).
+
+### 구현 정확성 (오차0, 절대조건) ✅
+| shape | kernel==golden_w4a8 | xq_mis | xsum_mis |
+|---|---|---|---|
+| IN1024×OUT256 | 5.3e-6 | 0 | 0 |
+| IN1024×OUT2048 | 6.7e-6 | 0 | 0 |
+| IN3584×OUT1024 | 1.9e-5 | 0 | 0 |
+| IN1024×OUT4096 S5 | 7.0e-6 | 0 | 0 |
+오차는 fp32-vs-fp64 누적뿐(<2e-5). quantize 출력(xq/xsum)이 CPU와 bit-일치. make test 13/13 PASS.
+
+### 품질 델타 (gemv 레벨, W4A8 vs W4-fp32A) — 측정·기록
+int8 X가 fp32 X 대비 gemv 출력에 더하는 상대오차: **rel 0.35~0.44%** (max |Δ| 0.15~0.26, 출력 max 33~74).
+→ gemv 단위에선 작음. STEP0 토큰 측정(3/4 동일, 코드류 조기 flip)과 일관: 대부분 argmax 견딤, 누적 시 가끔 flip.
+
+### 양자화 비용 (ncu) — 순이득 경고
+quantize_x_q8 duration ~**8.9~12.3us/call** (compute 0.3~0.5%, grid 작아 **launch-overhead 지배**). gemv_w4a8(STEP1 naive)는 22~185us.
+- 우려: 토큰당 quantize 호출 多(layer마다 attn입력/mlp입력 ≈ 2회 × 24층 + lm_head ≈ ~50회). 10us×50 ≈ 500us/token =
+  현 5.68ms/token의 ~9%가 launch 오버헤드. **순이득(X 트래픽 4×↓) 갉아먹을 수 있음** → STEP 2에서 in-engine으로 판정,
+  필요시 quantize를 직전 커널에 fuse하거나 X 1회 양자화→여러 gemv 재사용으로 호출수↓.
+
+### STEP 1 결론
+quantize + W4A8 gemv 수치 정확(golden_w4a8 오차0), 품질델타 gemv 0.4%. DP4A는 아직 미사용(STEP2 최적화).
+다음 STEP 2: DP4A W4A8 gemv + in-engine 통합(X-shared 함정 회피 확인) + 양자화 호출수/비용 최적화 + in-engine t/s.
+
 ## 7. 사용자 결정 필요 (게이트)
 1. **품질 판정**: per-block-32에서 3/4 프롬프트 동일, 코드류 1/4 조기 flip(22.7%, cascade 과장). 이 정도 품질대가를
    감수하고 W4A8 진행 — 동의? (아니면 일부 민감 Linear는 fp32 유지하는 혼합도 가능 — 그건 STEP에서.)
