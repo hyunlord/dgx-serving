@@ -44,7 +44,19 @@
 - **STEP 4**: 27B — weight 다운로드(54GB) + fp16/레이어별 골든 + 큰 모델 메모리. (4B서 구조 증명 후 메모리 스케일.)
 - **STEP 5**: 보편화 회고 → 다음(35B MoE).
 
-## 6. 사용자 결정 필요 (게이트)
+## STEP 1 결과 — 모델 레지스트리 + 공통 Engine 인터페이스 [완료]
+
+`runtime/engine.h`(additive 레이어, 기존 코드 무손상):
+- **레지스트리**: `model_kind_from_manifest` — manifest "model_type" → `ModelKind`(qwen3_5 등록; 미등록은 MK_UNKNOWN=보편화 신호).
+- **공통 인터페이스**: `engine_load(dir)`(config+kind+weights) / `engine_alloc_batch` / `engine_decode_batch`(kind로 graph 디스패치).
+- 새 모델 = (같은 패밀리면) config만, (새 패밀리면) ModelKind+graph 엔트리. 커널/graph 불변.
+
+### 검증
+- **투명성**: `engine_decode_batch` == 직접 `qwen35_decode_batch` **max err 0.000e+00**(bit-identical 래퍼).
+- **회귀 0**: 17/17 PASS(기존 16 + test_engine). 0.8B 동작 불변(additive라 기존 경로 미수정).
+- 27B는 `engine_load(27B_dir)` 동일 경로(같은 qwen3_5 kind, config만 27B 값) — STEP 2서 검증.
+
+## 6. 사용자 결정 (게이트)
 1. **첫 큰 모델 = Qwen3.5-4B(다운로드됨, 동일 arch, 골든 안전)로 시작** 동의? (의뢰서 27B 전에 — 4B로 코드베이스화+dense
    확장을 싸게 증명, 27B는 STEP 4서 다운로드+메모리 스케일.) 아니면 바로 27B(3.6) 다운로드부터?
 2. **27B 모델 = Qwen3.6-27B**(캐시 메타 존재, 동일 qwen3_5 arch·dense; "Qwen3.5-27B"는 미존재) — 이걸로 동의?

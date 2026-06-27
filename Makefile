@@ -41,6 +41,9 @@ tests/test_spec: tests/test_spec.cu models/qwen35.cu models/qwen35_decode.cu run
 tests/test_batch_decode: tests/test_batch_decode.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_batch_decode.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
+tests/test_engine: tests/test_engine.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_engine.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
+
 # 단일 TU 테스트 (header-only 커널만 사용).
 tests/%: tests/%.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@
