@@ -33,12 +33,17 @@ def is_q4(name, ndim):
     return True
 
 
-def rope_theta(cfg):
-    for attr in ("rope_parameters", "rope_scaling"):
-        rp = getattr(cfg, attr, None)
-        if isinstance(rp, dict) and rp.get("rope_theta") is not None:
-            return float(rp["rope_theta"])
-    return float(getattr(cfg, "rope_theta", 10000.0))
+def rope_theta(cfg, tcfg=None):
+    # rope_parameters/rope_scaling 는 text config 에 있음(멀티모달은 top cfg 에 없음) → 둘 다 확인.
+    for c in (tcfg, cfg):
+        if c is None: continue
+        for attr in ("rope_parameters", "rope_scaling"):
+            rp = getattr(c, attr, None)
+            if isinstance(rp, dict) and rp.get("rope_theta") is not None:
+                return float(rp["rope_theta"])
+        if getattr(c, "rope_theta", None) is not None:
+            return float(c.rope_theta)
+    return 10000.0
 
 
 def main():
@@ -84,7 +89,7 @@ def main():
         "num_layers": L, "num_q_heads": g("num_attention_heads"),
         "num_kv_heads": g("num_key_value_heads"), "head_dim": hd,
         "vocab_size": g("vocab_size"), "rms_norm_eps": float(g("rms_norm_eps")),
-        "rope_theta": rope_theta(cfg), "partial_rotary_factor": float(prf),
+        "rope_theta": rope_theta(cfg, tcfg), "partial_rotary_factor": float(prf),
         "rotary_dim": int(round(hd * float(prf))),
         "tie_word_embeddings": bool(getattr(cfg, "tie_word_embeddings", False)),
         "qblk": QBLK, "hidden_act": g("hidden_act"),

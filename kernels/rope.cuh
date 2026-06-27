@@ -1,6 +1,25 @@
 #ifndef DGX_ROPE_CUH
 #define DGX_ROPE_CUH
 
+// rope cos/sin 테이블 엔진 내부 생성 (config theta/rotary_dim만 — 골든 rope 의존 제거, 임의 길이/32K).
+//   HF default rope: inv_freq[j]=theta^(-2j/rot) (j<rot/2), emb=cat(freqs,freqs) → cos/sin[p,rot] 앞=뒤 절반.
+//   모델 독립. 검증: 생성 vs 골든 rope_cos(짧은 S) 오차0.
+static __global__ void gen_rope_kernel(float *cosT, float *sinT, int rot, float theta) {
+    int p = blockIdx.x;                 // position
+    int j = threadIdx.x;                // freq index < rot/2
+    int half = rot >> 1;
+    if (j >= half) return;
+    float inv = powf(theta, -2.0f * j / (float)rot);   // theta^(-2j/rot)
+    float a = (float)p * inv;
+    float c = cosf(a), s = sinf(a);
+    size_t base = (size_t)p * rot;
+    cosT[base + j] = c; cosT[base + half + j] = c;     // 앞=뒤 (HF cat(freqs,freqs))
+    sinT[base + j] = s; sinT[base + half + j] = s;
+}
+static inline void launch_gen_rope(float *cosT, float *sinT, int max_len, int rot, float theta, cudaStream_t st = 0) {
+    gen_rope_kernel<<<max_len, (rot + 1) >> 1, 0, st>>>(cosT, sinT, rot, theta);   // rot/2 <= 1024 가정
+}
+
 // RoPE (rotate-half, Llama/HF 방식). 모델 독립.
 //   T: [S, NH, HD] in-place. cos/sin: [S, HD] (앞 HD/2 = 뒤 HD/2, HF cat(freqs,freqs)).
 //   pair (i, i+half): t1'=t1*c - t2*sn ; t2'=t2*c + t1*sn, c=cos[s*HD+i], sn=sin[s*HD+i], i<half.
