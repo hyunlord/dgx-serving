@@ -62,6 +62,38 @@ block = nwarps warp. block이 `rows_per_block` 출력행 × B열 담당.
 ## 7. 하지 않을 것
 - vLLM(2단계), continuous batching(3단계). naive MO 재시도(occupancy 붕괴 확정). 정확성 변경. microbench 채택.
 
+## STEP 1 결과 — multi-warp-per-output: occupancy 함정 회피 확인, but primary 타깃 미해결 [부분]
+
+`gemm_mw_f32/q4/w4a8` (template<B,NW,ROWS>, NW warp가 IN 분할 + shared 축약). 정확성: == golden 오차0(fp32/q4),
+16/16 PASS. q4 batch decode == B single argmax match.
+
+### 핵심 확인 (개념적 승리)
+- **occupancy 함정 구조적 회피**: B=1서 gemm_mw reg **35~40**(1-warp 38과 동일, 안 늘어남), occ 73→76~82%.
+  2d/챕터3서 세 번 데인 "1-warp에 누적기 몰기 → reg48 붕괴"를 multi-WARPS-per-output이 구조적으로 피함. mmvq 통찰 검증.
+
+### 처리량 (in-engine) — 경로별로 갈림
+| 경로 | B=1 | B=8 | 판정 |
+|---|---|---|---|
+| **q4** | 192(mw 무익, 1-warp 유지) | **633→772 (+22%)** | ✅ mw 이득 (B≥4) |
+| **W4A8**(best) | 213 | **980 (mw 955로 느림 → baseline 유지)** | ❌ 이미 lane-minor dp4a 최적, mw 무익 |
+| fp32 | 70 | 454 | ❌ bandwidth-bound(weight 4B), mw 무익 |
+
+- **q4만 mw 이득**(B≥4): q4는 latency-bound라 warp-split이 메모리병렬성↑. **W4A8/fp32는 무익**
+  (W4A8은 dp4a로 이미 compute-dense, fp32는 BW-bound).
+- **B=1 over-decompose 회귀**: lm_head OUT=248320 → mw가 248320 tiny block, thread당 8원소 → reduction 오버헤드 지배.
+  NW=4(157)·NW=2(149) 둘 다 1-warp(194)보다 느림. **B=1은 1-warp 유지가 최적.**
+
+### primary 타깃(B=1·B=16 W4A8) 미해결 — 정직
+- **B=1 W4A8 213 vs 277**: multi-warp가 over-decompose로 못 도움. W4A8 best path는 이미 최적. B=1 gap은
+  llama.cpp의 granular vec_dot(QK-block 단위 work) 등 다른 것 — multi-warp 아님.
+- **B=16**: "2×B8 분할"은 **결함**(2 그룹 sequential 실행 = 980 throughput < 단일 B16 1016, 직렬화로 더 느림).
+  진짜 B=16은 single 커널 register 완화(smem tiling, X-shared 위험) 또는 MMQ(tensor-core, 큼).
+
+### STEP 1 결론
+multi-warp는 **개념 검증(occupancy 함정 회피) + q4 +22%**의 부분 승리이나, **엔진 best path(W4A8)와 primary
+타깃(B=1/B=16)은 미개선**. W4A8 best는 이미 최적이라 커널 micro-gap의 한계 효용. 경쟁 위치(B=8 W4A8 980 >
+llama.cpp 912)는 유지. B=1/B=16 격차는 diminishing returns — 로드맵 큰 항목(vLLM 비교, continuous batching) 대비 판단 필요.
+
 ## 8. 사용자 결정 필요 (게이트)
 1. **B=1 답 = multi-warp-per-output**(nwarps warp가 IN 분할 + shared 축약, register 안 늘림) — mmvq 정독대로. 동의?
 2. **B=16 답 = 먼저 2×(B=8) 분할**(간단, register 천장 회피), MMQ tiled gemm은 막히면 — 동의? 아니면 바로 MMQ?
