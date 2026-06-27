@@ -50,6 +50,22 @@
 - STEP 2: W4A8 gemv(int8 X × int4 W + DP4A). in-engine t/s, X-shared 함정 회피 확인(ncu). 본체 큰 gemv부터.
 - STEP 3: 품질(fp32-X 대비 토큰, 위 22.7% 재확인) + accept + llama.cpp 재비교(비등/추월?). 3축 지도에 W4A8 점.
 
+## 6ب. 빈틈 보완 — llama.cpp와 품질 같이 뽑기 (3-way)
+
+우리가 잰 건 "우리 fp32-X vs 우리 int8-X". 진짜 비교 = "우리 W4A8 vs llama.cpp W4A8". 같은 엔진 내
+F16 vs Q4_K_M로 cross-engine 토큰 confound 회피하고 코드 프롬프트(token6 flip)를 검증:
+
+- **llama.cpp F16 vs Q4_K_M (fibonacci): 발산함.** thinking 텍스트가 초반에 갈림
+  (F16 "incomplete, need correct implementation" vs Q4_K_M "common beginner question, I should: 1.2.3.").
+  → **성숙한 llama.cpp의 W4A8(K-quant W + q8_1 X)도 코드류에서 자기 F16과 갈린다.**
+- **결론: 코드 프롬프트 flip은 양자화 본질 한계, 우리 scale 처리 미흡 아님.** 우리 int8 = llama.cpp와 같은 급.
+
+### q8_1 정독 (우리 설계 검증)
+`quantize.cu`: `QK8_1=32`(per-block-32), `d = amax/127`(symmetric), `ds = (d, sum)` 저장
+(sum = 블록 내 Σx). **우리 per-block-32 설계와 정확히 동일 스킴.** sum은 우리 int4 zero-point-8 보정
+`Σ xq·(wq−8) = Σxq·wq − 8·Σxq`의 `8·Σxq` 항에 그대로 필요 → **블록당 (scale, sum) 저장 확정.**
+dot = sx·sw·(dp4a(xq,wq) − 8·sum_b). DP4A로 int 누적 후 블록 scale 곱.
+
 ## 7. 사용자 결정 필요 (게이트)
 1. **품질 판정**: per-block-32에서 3/4 프롬프트 동일, 코드류 1/4 조기 flip(22.7%, cascade 과장). 이 정도 품질대가를
    감수하고 W4A8 진행 — 동의? (아니면 일부 민감 Linear는 fp32 유지하는 혼합도 가능 — 그건 STEP에서.)
