@@ -38,6 +38,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"],
+                    help="로드 dtype. 큰 모델(27B+)은 bfloat16로 OOM 회피 (q4 양자화는 source dtype에 거의 무관).")
+    ap.add_argument("--q4-only", action="store_true",
+                    help="big matmul의 fp32 복사본 생략(27B+ fp32 108GB는 엔진 OOM이라 불필요). q4+small-fp32만.")
     args = ap.parse_args()
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -45,8 +49,9 @@ def main():
 
     cfg = AutoConfig.from_pretrained(args.model)
     tcfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
-    print(f"[extract] loading {args.model} (fp32)...", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
+    _dt = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
+    print(f"[extract] loading {args.model} ({args.dtype})...", flush=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=_dt, low_cpu_mem_usage=True)
     model.eval()
     sd = model.state_dict()
 
@@ -115,7 +120,8 @@ def main():
             save_f32("w_embed", t)
             if manifest["tie_word_embeddings"]:
                 errs.append(save_q4("w_lm_head", t))  # tied lm_head (q4)
-                save_f32("w_lm_head_f32", t)           # + fp32 (검증/MTP 기준선 경로)
+                if not args.q4_only:
+                    save_f32("w_lm_head_f32", t)       # + fp32 (검증/MTP 기준선 경로)
             continue
         if rel == "norm.weight":
             save_f32("w_final_norm", t); continue
@@ -126,7 +132,8 @@ def main():
             continue  # 본체 외 (rotary_emb buffers 등)
         if is_q4(key, t.dim()):
             errs.append(save_q4(fn, t))      # q4 경로
-            save_f32(fn + "_f32", t)         # fp32 경로 (검증/MTP 기준선)
+            if not args.q4_only:
+                save_f32(fn + "_f32", t)     # fp32 경로 (검증/MTP 기준선)
             n_q4 += 1
         else:
             save_f32(fn, t); n_f32 += 1
