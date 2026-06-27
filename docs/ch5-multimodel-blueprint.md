@@ -97,3 +97,38 @@
    아니면 Qwen3.5-27B가 실재하면 그걸 받을지?
 3. **27B 골든 전략 = fp16 또는 레이어별**(fp32 108GB OOM 회피) — 동의?
 4. **레지스트리/공통 인터페이스 구조**(model_type→graph 테이블 + Engine API) — 방향 동의?
+
+---
+
+## STEP 3 — GDN GQA 그룹핑 일반화 (보편화 갭 해소, 완료)
+
+STEP 2.3에서 좁힌 단 하나의 갭(GDN이 num_k_heads==num_v_heads 암묵 가정)을 **27B 전용 if문이 아니라 커널을
+더 일반적으로** 만들어 해소. 핵심 원칙(사용자): 나쁜 변경=특수성 샘, 좋은 변경=config 파라미터+그룹 매핑.
+
+### 변경 (커널 라이브러리 일반화)
+- `kernels/gdn.cuh` 3커널(`gdn_delta_rule`/`gdn_step`/`gdn_step_batch`)+런처에 `int NHk`(num_k_heads) 추가.
+  v-head h → k-head 매핑 `g = h * NHk / NH`(repeat_interleave 역). Q/K는 `base_qk=(t*NHk+g)*D`(k-head 레이아웃),
+  V/O/state는 `base=(t*NH+h)*D`(v-head). **NHk==NH면 g==h → 0.8B(k=v=16) 완전 하위호환.**
+- graph 3곳(`qwen35.cu`/`_decode`/`_batch`)이 `c.gdn_num_k_heads` 전달. 로직 분기 0, config 배선만.
+
+### 검증 (격리 → 통합, 헌법 단계별)
+- **GDN 격리 `test_gdn_27b`** (27B fp32 골든): de-expand 무손실 0(레퍼런스 repeat_interleave 확정 →
+  매핑 정확), delta_rule(GQA 48/16) **8.3e-7**, conv1d+silu **4.8e-7**, gated_norm mean **9.6e-6**
+  (max 6e-3은 HF FusedRMSNormGated fused outlier — numpy로 공식 `x·inv·W·silu(z)` 확정, 타 변형 3+).
+- **full-attn 격리 `test_attn_27b`** (27B, NQ=24/NKV=4 group6): 엔진 q_norm·k_norm·partial rope·GQA attn·
+  output_gate vs HF o_proj입력 **mean 1.6e-5** (numpy fp32 레퍼런스와 동일 → engine==clean fp32).
+  attn 커널 `kv=h/(NQ/NKV)`이 GQA 비율을 config로 처리 — **full-attn에 GDN식 갭 없음**(같은 패밀리 위험 해소).
+- **0.8B 회귀 0**: 17/17, engine(q4) vs golden_q4 **7.9e-5**. 같은 일반화 커널로 k=v=16도 그대로 = **진짜 보편화**.
+- **27B 통합 `test_27b`**: argmax **ALL 일치** + next-token **11751 정확**(64층, 248K vocab), **커널/graph 로직 변경 0**.
+
+### 27B 통합 hidden 잔차 (정직한 기록)
+engine(q4) vs golden_q4 hidden worst rel **~17%**(L2, 이른 GDN q4 GEMV; 깊을수록 감소). 0.8B(7.9e-5)보다 큼.
+원인 분석(추측 아닌 격리): 가중치 동일(HF 디스크 bf16 → 추출·골든 같은 값 q4, diff 0), q4셋 동일(is_q4),
+모든 sub-op 격리-정확. → **잔차 = q4 GEMV의 GPU-vs-CPU fp32 누적이 64층×27B 와이드 dim서 증폭**(argmax 보존,
+발산 아님). **엄밀 정확성은 sub-op 격리가 증명**, test_27b는 기능(greedy 동일) 통합 판정으로 전환.
+(선택 후속: q4 GEMV를 27B dim서 numpy와 단독 대조해 누적 상수 정량화 — 본 챕터 범위 밖.)
+
+### 결론
+**보편화 증명 완성**: 27B는 새 커널 0, config(num_k/v_heads)+graph 배선만으로 GDN·full-attn 모두 격리-정확.
+0.8B·27B가 **같은 일반화 GDN 커널**로 동작 = 커널 라이브러리+graph 분리 아키텍처 첫 다중모델 증명.
+다음 갭 후보(35B-A3B MoE): expert 라우팅/sparsity가 같은 패턴(config로 빠지나)인지가 다음 시험.

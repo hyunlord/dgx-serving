@@ -157,7 +157,7 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             launch_gemv_f32(norm,L.in_a,ab,H,nvh,Sq); launch_gemv_f32(norm,L.in_b,bb,H,nvh,Sq);
             launch_gdn_decay_beta(ab,bb,L.A_log,L.dt_bias,gg,beta,Sq,nvh);
             // gdn_step from committed S, Sq steps, snapshot
-            launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv);
+            launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv, c.gdn_num_k_heads);
             if (!commit && va) {  // verify: per-step GDN snapshot + conv mixed → va (승격용)
                 size_t ssz=(size_t)nvh*hv*hv;
                 for(int t=0;t<Sq;t++)

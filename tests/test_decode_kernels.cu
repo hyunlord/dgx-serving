@@ -42,11 +42,11 @@ int main(){
         for(auto&v:G)v=-fabsf(frand(seed))*0.1f; for(auto&v:Bt)v=0.5f+0.4f*frand(seed);
         float*dQ=up(Q),*dK=up(K),*dV=up(Vv),*dG=up(G),*dB=up(Bt);
         float*dref; CK(cudaMalloc(&dref,(size_t)S*NH*D*4));
-        launch_gdn_delta_rule(dQ,dK,dV,dG,dB,dref,S,NH,D);     // ref
+        launch_gdn_delta_rule(dQ,dK,dV,dG,dB,dref,S,NH,D,NH);     // ref
         // (2) gdn_step Sin=0, 전체
         float*dO; CK(cudaMalloc(&dO,(size_t)S*NH*D*4));
         float*dSnap; CK(cudaMalloc(&dSnap,(size_t)S*NH*D*D*4));
-        launch_gdn_step(dQ,dK,dV,dG,dB,nullptr,dSnap,dO,S,NH,D);
+        launch_gdn_step(dQ,dK,dV,dG,dB,nullptr,dSnap,dO,S,NH,D,NH);
         CK(cudaDeviceSynchronize());
         chk("gdn_step(Sin=0)==delta", mae(dn(dref,(size_t)S*NH*D),dn(dO,(size_t)S*NH*D)), 1e-4);
 
@@ -54,13 +54,13 @@ int main(){
         int n1=2, n2=S-n1;
         float*dSnap1; CK(cudaMalloc(&dSnap1,(size_t)n1*NH*D*D*4));
         float*dO1; CK(cudaMalloc(&dO1,(size_t)n1*NH*D*4));
-        launch_gdn_step(dQ,dK,dV,dG,dB,nullptr,dSnap1,dO1,n1,NH,D);   // 첫 n1
+        launch_gdn_step(dQ,dK,dV,dG,dB,nullptr,dSnap1,dO1,n1,NH,D,NH);   // 첫 n1
         float*Sin = dSnap1 + (size_t)(n1-1)*NH*D*D;                   // state after n1
         // 이어갈 입력 = 토큰 n1..S-1 (offset)
         float*dSnap2; CK(cudaMalloc(&dSnap2,(size_t)n2*NH*D*D*4));
         float*dO2; CK(cudaMalloc(&dO2,(size_t)n2*NH*D*4));
         launch_gdn_step(dQ+(size_t)n1*NH*D, dK+(size_t)n1*NH*D, dV+(size_t)n1*NH*D,
-                        dG+(size_t)n1*NH, dB+(size_t)n1*NH, Sin, dSnap2, dO2, n2, NH, D);
+                        dG+(size_t)n1*NH, dB+(size_t)n1*NH, Sin, dSnap2, dO2, n2, NH, D, NH);
         CK(cudaDeviceSynchronize());
         // O2 == ref[n1..]
         std::vector<float> refv=dn(dref,(size_t)S*NH*D), o2=dn(dO2,(size_t)n2*NH*D);

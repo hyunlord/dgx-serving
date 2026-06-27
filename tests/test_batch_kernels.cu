@@ -58,12 +58,12 @@ int main(){
         for(auto&v:G)v=frand(seed)*0.1f; for(auto&v:Bt)v=frand(seed)*0.3f+0.4f; for(auto&v:Sin)v=frand(seed)*0.05f;
         float *dQ=up(Q),*dK=up(Kk),*dV=up(Vv),*dG=up(G),*dB=up(Bt),*dSin=up(Sin);
         float *dOb,*dSout; CK(cudaMalloc(&dOb,(size_t)B*row*4)); CK(cudaMalloc(&dSout,(size_t)B*ssz*4));
-        launch_gdn_step_batch(dQ,dK,dV,dG,dB,dSin,dSout,dOb,B,NH,D); CK(cudaDeviceSynchronize());
+        launch_gdn_step_batch(dQ,dK,dV,dG,dB,dSin,dSout,dOb,B,NH,D,NH); CK(cudaDeviceSynchronize());
         std::vector<float> Ob((size_t)B*row),Sb((size_t)B*ssz);
         CK(cudaMemcpy(Ob.data(),dOb,Ob.size()*4,cudaMemcpyDeviceToHost)); CK(cudaMemcpy(Sb.data(),dSout,Sb.size()*4,cudaMemcpyDeviceToHost));
         std::vector<float> Os((size_t)B*row),Ss((size_t)B*ssz);
         for(int b=0;b<B;b++){ float*dO1,*dSnap; CK(cudaMalloc(&dO1,row*4)); CK(cudaMalloc(&dSnap,ssz*4));  // Sq=1 → snap[0]=새 state
-            launch_gdn_step(dQ+(size_t)b*row,dK+(size_t)b*row,dV+(size_t)b*row,dG+(size_t)b*NH,dB+(size_t)b*NH,dSin+(size_t)b*ssz,dSnap,dO1,1,NH,D);
+            launch_gdn_step(dQ+(size_t)b*row,dK+(size_t)b*row,dV+(size_t)b*row,dG+(size_t)b*NH,dB+(size_t)b*NH,dSin+(size_t)b*ssz,dSnap,dO1,1,NH,D,NH);
             CK(cudaDeviceSynchronize()); CK(cudaMemcpy(Os.data()+(size_t)b*row,dO1,row*4,cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(Ss.data()+(size_t)b*ssz,dSnap,ssz*4,cudaMemcpyDeviceToHost)); cudaFree(dO1);cudaFree(dSnap); }
         check("gdn_step_batch O ==Bx", maxerr(Ob,Os));

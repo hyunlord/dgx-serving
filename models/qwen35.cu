@@ -92,7 +92,7 @@ void qwen35_forward(const ModelConfig &c, const QwenWeights &w,
             launch_gemv_f32(norm, L.in_a, abuf, H, nvh, S);            // in_proj_a/b 는 항상 fp32
             launch_gemv_f32(norm, L.in_b, bbuf, H, nvh, S);
             launch_gdn_decay_beta(abuf, bbuf, L.A_log, L.dt_bias, gg, beta, S, nvh);
-            launch_gdn_delta_rule(qg2, kg2, vg2, gg, beta, core, S, nvh, hv);
+            launch_gdn_delta_rule(qg2, kg2, vg2, gg, beta, core, S, nvh, hv, c.gdn_num_k_heads);
             launch_rms_norm_gated(core, zbuf, L.gdn_norm, normed, S * nvh, hv, eps);
             mm(L.out_p, normed, gdnout, vdim, H, S, use_q4);
             launch_add(after, x, gdnout, (int)SH);

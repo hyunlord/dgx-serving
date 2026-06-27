@@ -111,7 +111,7 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             mmb(L.in_z,norm,zb,H,vdim);
             launch_gemv_f32(norm,L.in_a,ab,H,nvh,B); launch_gemv_f32(norm,L.in_b,bb,H,nvh,B);
             launch_gdn_decay_beta(ab,bb,L.A_log,L.dt_bias,gg,beta,B,nvh);
-            launch_gdn_step_batch(qg2,kg2,vg2,gg,beta, st.S[l], st.S[l], core, B, nvh, hv);  // in-place state commit
+            launch_gdn_step_batch(qg2,kg2,vg2,gg,beta, st.S[l], st.S[l], core, B, nvh, hv, c.gdn_num_k_heads);  // in-place state commit
             // conv ctx 갱신: [convctx[b] ; mixed[b]] 의 마지막 K-1
             BK(cudaMemcpy2D(convfull, Kk*convd*4, st.convctx[l], (Kk-1)*convd*4, (Kk-1)*convd*4, B, cudaMemcpyDeviceToDevice));
             BK(cudaMemcpy2D(convfull+(size_t)(Kk-1)*convd, Kk*convd*4, mixed, convd*4, convd*4, B, cudaMemcpyDeviceToDevice));

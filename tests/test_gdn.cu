@@ -40,7 +40,7 @@ int main(){
         auto g=rd(GD+"fp32_gdn_dr_g",(size_t)S*NH), bt=rd(GD+"fp32_gdn_dr_beta",(size_t)S*NH);
         auto gold=rd(GD+"fp32_gdn_dr_recurrent_out",(size_t)S*NH*D);
         float*dq=up(q),*dk=up(k),*dv=up(v),*dg=up(g),*db=up(bt),*dout; CK(cudaMalloc(&dout,(size_t)S*NH*D*4));
-        launch_gdn_delta_rule(dq,dk,dv,dg,db,dout,S,NH,D); CK(cudaDeviceSynchronize());
+        launch_gdn_delta_rule(dq,dk,dv,dg,db,dout,S,NH,D,NH); CK(cudaDeviceSynchronize());
         std::vector<float>o((size_t)S*NH*D); CK(cudaMemcpy(o.data(),dout,o.size()*4,cudaMemcpyDeviceToHost));
         // --- 단일 head(0) t=0,1,2 먼저 점검 (state 첫 업데이트 방향 확인) ---
         printf("  [delta_rule head0 t=0..2 점검]\n");
