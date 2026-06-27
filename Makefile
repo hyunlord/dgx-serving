@@ -11,7 +11,8 @@ BUILD := build
 ENGINE_SRCS := models/smollm3.cu runtime/weights.cu
 
 # 테스트 소스 -> 실행파일 (tests/test_xxx.cu -> tests/test_xxx)
-TEST_SRCS := $(wildcard tests/*.cu)
+# test_27b는 대형모델(27B artifacts 필요) + GDN 보편화 갭 검증용 → 기본 스위트 제외, 수동 실행(make tests/test_27b).
+TEST_SRCS := $(filter-out tests/test_27b.cu, $(wildcard tests/*.cu))
 TEST_BINS := $(TEST_SRCS:.cu=)
 
 HEADERS := $(wildcard kernels/*.cuh) $(wildcard runtime/*.h) $(wildcard models/*.h)
