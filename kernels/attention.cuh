@@ -1,6 +1,26 @@
 #ifndef DGX_ATTENTION_CUH
 #define DGX_ATTENTION_CUH
 #include <float.h>
+#include <cstdio>
+#include <cstdlib>
+
+// ── 임시 가드 (챕터7 FA STEP 0) ───────────────────────────────────────────────
+//   현 attention 커널은 full scores[attendlen]를 dynamic shared에 올림 → context가 길면 shmem이
+//   기본 48KB를 넘어 launch가 조용히 실패(cudaDeviceSynchronize "no error"라 CK가 못 잡음) → 틀린 출력.
+//   가드: 48KB 초과 시 opt-in(최대 ~99KB, base~25K까지) / opt-in 한계 초과 시 명시적 에러+중단.
+//   ※ 근본해결은 FlashAttention(tiled KV 상수 shared). 이 가드는 그 전까지 "조용한 오답→명시적 중단".
+static inline void attn_smem_guard(const void *kernel, size_t shmem, const char *who, int ctxlen) {
+    static int optin = -1;
+    if (optin < 0) cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    if (shmem > (size_t)optin) {
+        fprintf(stderr, "[attn] %s: 필요 shared %zuKB > opt-in 한계 %dKB (context~%d토큰). "
+            "현 attention 커널은 이 길이 미지원 — FlashAttention 필요. 조용한 오답 대신 중단합니다.\n",
+            who, shmem / 1024, optin / 1024, ctxlen);
+        abort();
+    }
+    if (shmem > 48 * 1024)
+        cudaFuncSetAttribute(const_cast<void *>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+}
 
 // GQA causal attention (prefill, 모델 독립).
 //   Q: [S, NQ, HD], K/V: [S, NKV, HD], O: [S, NQ, HD]. scale = 1/sqrt(HD).
@@ -95,6 +115,7 @@ static inline void launch_attn_decode(const float *Q, const float *Kc, const flo
                                       int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
     dim3 grid(Sq, NQ);
     size_t shmem = (size_t)(HD + base + Sq) * sizeof(float);
+    attn_smem_guard((const void *)attn_decode_kernel, shmem, "attn_decode", base + Sq);
     attn_decode_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, HD, base);
 }
 
@@ -136,6 +157,7 @@ static inline void launch_attn_decode_batch(const float *Q, const float *Kc, con
                                             int B, int NQ, int NKV, int HD, int base, long kv_stride, cudaStream_t st = 0) {
     dim3 grid(B, NQ);
     size_t shmem = (size_t)(HD + base + 1) * sizeof(float);
+    attn_smem_guard((const void *)attn_decode_batch_kernel, shmem, "attn_decode_batch", base + 1);
     attn_decode_batch_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, NQ, NKV, HD, base, kv_stride);
 }
 
