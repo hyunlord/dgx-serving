@@ -38,7 +38,7 @@ void free_verify_artifacts(VerifyArtifacts &v);
 //   commit=0: committed S/convctx/n_past 불변 (verify). va!=NULL이면 스텝별 GDN snapshot + conv mixed 기록.
 //   d_cos/d_sin: [max_len, rot] rope 테이블 (위치 p → row p). use_q4: fp32(0) 기준선.
 //   d_postnorm: nullable [Sq, H] (final-norm 적용 후 = h_nextn, MTP draft 입력 — 2b 확정).
-//   last_logits_only=1: lm_head 를 마지막 토큰만 (prefill TTFT — 실엔진처럼; d_logits=[1,V]면 충분).
+//   last_logits_only: 1=마지막 토큰만(prefill TTFT, d_logits=[1,V]), 2=lm_head 생략(비-마지막 청크).
 void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                    const int *d_tokens, int Sq, const float *d_cos, const float *d_sin,
                    float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4,

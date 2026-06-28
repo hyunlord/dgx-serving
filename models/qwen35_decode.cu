@@ -198,8 +198,9 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     if (d_prenorm) DK(cudaMemcpy(d_prenorm,x,SH*4,cudaMemcpyDeviceToDevice));
     launch_rmsnorm_zc(x,w.final_norm,fn,Sq,H,eps);
     if (d_postnorm) DK(cudaMemcpy(d_postnorm,fn,SH*4,cudaMemcpyDeviceToDevice));  // h_nextn (MTP 입력)
-    if (last_logits_only) mm(w.lm_head, fn+(size_t)(Sq-1)*H, d_logits, H, V, 1, use_q4);  // 마지막 토큰만(prefill TTFT)
-    else                  mm(w.lm_head, fn, d_logits, H, V, Sq, use_q4);
+    if (last_logits_only == 2) { /* lm_head 생략 — prefill 비-마지막 청크(logits 불필요, KV/state만) */ }
+    else if (last_logits_only) mm(w.lm_head, fn+(size_t)(Sq-1)*H, d_logits, H, V, 1, use_q4);  // 마지막 토큰만(prefill TTFT)
+    else                       mm(w.lm_head, fn, d_logits, H, V, Sq, use_q4);
     if (commit) st.n_past += Sq;
     DK(cudaDeviceSynchronize());
 

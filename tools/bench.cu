@@ -75,7 +75,7 @@ int main(int argc,char**argv){
     // ★ 단발 prefill Sq 상한 (컴퓨트-행 방지): decode 커널(gemv_q4=untiled GEMM, O(Sq²) attn, 순차 GDN)은
     //   짧은 Sq 전제 — 32K 단발 prefill은 ~825 TFLOP/71M블록 = 수십 분 GPU 점유 → GB10 행/크래시(2차 크래시 원인).
     //   메모리 가드로는 못 막음(메모리는 안전). 청크 prefill(2번) 구현 전까지 단발 상한으로 차단.
-    const int PREFILL_SQ_CAP = 2048;
+    const int PREFILL_SQ_CAP = 8192;   // 청크 prefill로 안전 — 단계적 상향(8192 먼저, 확인 후 32768)
     // ---- B=1 (qwen35_decode: prefill Sq=C 1콜 + decode 루프) ----
     for(int C: ctxs) for(int N: ngens){
         if(C > PREFILL_SQ_CAP){
@@ -95,7 +95,7 @@ int main(int argc,char**argv){
         DecodeState st=alloc_decode_state(e.c, C+N+1);
         // prefill: 청크(PCHUNK)씩 — 각 호출 작은 Sq → 16-타일 GEMM + 짧은 GDN. 마지막 청크만 logits. (TTFT)
         CK(cudaDeviceSynchronize()); cudaEventRecord(t0);
-        for(int t=0;t<C;t+=PCHUNK){ int s=(C-t<PCHUNK)?(C-t):PCHUNK; int last=(t+s>=C)?1:0;
+        for(int t=0;t<C;t+=PCHUNK){ int s=(C-t<PCHUNK)?(C-t):PCHUNK; int last=(t+s>=C)?1:2;  // 마지막=1(logits), 그 외=2(lm_head 생략)
             qwen35_decode(e.c,e.w,st,d_tok+t,s,d_cos,d_sin,d_logits,nullptr,1,nullptr,use_q4,nullptr,last); }
         cudaEventRecord(t1); CK(cudaEventSynchronize(t1));
         float ttft=ev(t0,t1);
