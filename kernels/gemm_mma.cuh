@@ -55,9 +55,9 @@ static __global__ void gemm_mma_w4a8_pipe_kernel(const int8_t *X, const float *x
 
     load_blk(0, 0);
     for (int blk = 0; blk < nblk; blk++) {
-        if (blk+1 < nblk) load_blk((blk+1)&1, blk+1);   // 다음 타일 prefetch (겹침)
-        asm volatile("cp.async.wait_group 1;\n");        // ≤1 pending → 현재(blk) 적재 완료
+        asm volatile("cp.async.wait_group 0;\n");        // 현재(blk) 적재 완료 대기 (이 시점 pending=현재 1개)
         __syncthreads();
+        if (blk+1 < nblk) load_blk((blk+1)&1, blk+1);   // 다음 타일 prefetch — 아래 MMA와 겹침(정식 순서)
         int cur = blk & 1;
         #pragma unroll
         for (int ms=0; ms<2; ms++) { int mb=wm*32+ms*16;

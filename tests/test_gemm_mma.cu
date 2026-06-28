@@ -40,6 +40,12 @@ int main(){
         CK(cudaMemcpy(Yg.data(),dYg,Yg.size()*4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(Ym.data(),dYm,Ym.size()*4,cudaMemcpyDeviceToHost));
         double e=0,rms=0; for(size_t i=0;i<Yg.size();i++){e=fmax(e,fabs((double)Ym[i]-Yg[i]));rms+=Yg[i]*Yg[i];} rms=sqrt(rms/Yg.size());
         bool ok=e/rms<1e-5; printf("  M=%-4d N=%-4d K=%-5d | MMA vs gemv_w4a8: max err=%.3e (rms=%.2e rel=%.2e) %s\n",M,N,K,e,rms,e/rms,ok?"OK":"FAIL"); if(!ok)g_fail=1;
+        // 결정성 가드(cp.async race 회귀 방지 — 과거 wait_group 순서 버그가 flaky 비결정 유발): MMA 30회 == 첫 결과 bitwise
+        std::vector<float> Yd((size_t)M*N); bool det=true;
+        for(int r=0;r<30 && det;r++){ launch_gemm_mma_w4a8(dXq,dxs,dW,dsw,dYg,M,N,K); CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(Yd.data(),dYg,Yd.size()*4,cudaMemcpyDeviceToHost));
+            for(size_t i=0;i<Yd.size();i++) if(Yd[i]!=Ym[i]){det=false;break;} }
+        printf("  M=%-4d N=%-4d K=%-5d | MMA 결정성 30회 %s\n",M,N,K,det?"OK":"FAIL(비결정-race!)"); if(!det)g_fail=1;
         cudaFree(dXf);cudaFree(dXq);cudaFree(dxs);cudaFree(dxsum);cudaFree(dW);cudaFree(dsw);cudaFree(dYg);cudaFree(dYm);
     }
     printf("[test_gemm_mma] %s (tensor-core MMA W4A8 == gemv_w4a8)\n",g_fail?"FAIL":"PASS");
