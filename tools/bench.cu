@@ -72,8 +72,17 @@ int main(int argc,char**argv){
     int *d_tok; CK(cudaMalloc(&d_tok,(size_t)MAXLEN*4)); CK(cudaMemcpy(d_tok,htok.data(),(size_t)MAXLEN*4,cudaMemcpyHostToDevice));
 
     printf("# %-4s %-6s %-7s | %-10s %-10s %-12s %-12s\n","B","ctx","ngen","TTFT(ms)","TPOT(ms)","decode tok/s","prefill tok/s");
+    // ★ 단발 prefill Sq 상한 (컴퓨트-행 방지): decode 커널(gemv_q4=untiled GEMM, O(Sq²) attn, 순차 GDN)은
+    //   짧은 Sq 전제 — 32K 단발 prefill은 ~825 TFLOP/71M블록 = 수십 분 GPU 점유 → GB10 행/크래시(2차 크래시 원인).
+    //   메모리 가드로는 못 막음(메모리는 안전). 청크 prefill(2번) 구현 전까지 단발 상한으로 차단.
+    const int PREFILL_SQ_CAP = 2048;
     // ---- B=1 (qwen35_decode: prefill Sq=C 1콜 + decode 루프) ----
     for(int C: ctxs) for(int N: ngens){
+        if(C > PREFILL_SQ_CAP){
+            printf("  %-4d %-6d %-7d | SKIP — 단발 prefill Sq=%d > 상한 %d (청크 prefill 필요, 컴퓨트-행 방지)\n",
+                   1,C,N,C,PREFILL_SQ_CAP);
+            continue;
+        }
         // 메모리 가드 (GB10 unified 크래시 방지): 예상 workspace+KV가 가용 초과면 skip+경고.
         size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB);
         size_t need=est_workspace_bytes(e.c,C)+est_kv_bytes(e.c,C+N+1);
