@@ -2,6 +2,18 @@
 #define DGX_ATTENTION_FLASH_CUH
 #include <float.h>
 #include <math.h>
+#include <cstdio>
+#include <cstdlib>
+
+// ── attention 커널 landscape (왜 여러 개인가 — mm() 복붙이 조용히 갈라진 교훈, 명시 기록) ──────────
+//   1) launch_attn (attention.cuh)            — 레퍼런스 forward(qwen35.cu/smollm3.cu). golden 생성용.
+//        S≤HD 제약, 작은 S만(벽 무관). **의도적 독립**: 엔진 FA와 다른 커널 = 교차검증 ground truth.
+//   2) launch_flash_attn (이 파일)            — 엔진 prefill+decode(qwen35_decode.cu). FA.1a. 12K 벽 없음.
+//        attn_decode를 **교체**. full-attn 16층.
+//   3) launch_attn_decode_batch (attention.cuh) — batch decode(qwen35_batch.cu). **아직 12K 벽 있음**
+//        (full scores in shared). batch 긴-context는 나중 FA 교체 예정(TODO).
+//   4) launch_attn_decode (attention.cuh)     — 옛 엔진 경로. 이제 test_flash_attn의 벽-안 대조 레퍼런스로만.
+//   ⚠ FA 개선(FA.1b/FA.2) 시 1)·3)은 자동 안 받음 → 갈라질 잠재. golden 틀어지면 여기부터 의심.
 
 // 챕터7 FA.1a: tiled FlashAttention (online softmax). full-attn 16층용 (GQA causal).
 //   현 attn_decode의 두 문제 해결: ① full scores[attendlen]를 shared에 → 48KB 벽(context>12K 깨짐).
@@ -71,12 +83,17 @@ static inline void launch_flash_attn_t(const float *Q, const float *Kc, const fl
     flash_attn_kernel<HD, BC><<<grid, HD, 0, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base);
 }
 
-// 엔진용 기본 진입 (HD=128, BC=32). attn_decode 교체 대상.
+// 엔진용 기본 진입. head_dim별 인스턴스(BC는 shared<48KB 유지): HD256→BC16(33KB), HD128→BC32(33KB).
+//   ⚠ 미지원 HD는 abort(조용한 return 금지 — 그게 0.8B/27B head_dim=256을 놓친 버그였음).
 static inline void launch_flash_attn(const float *Q, const float *Kc, const float *Vc, float *O,
                                      int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
-    // head_dim은 128 고정(검증 모델군). 다른 값 들어오면 단언 실패로 드러냄(조용한 오답 방지).
-    if (HD != 128) { /* 미지원 head_dim — 확장 시 인스턴스 추가 */ return; }
-    launch_flash_attn_t<128, 32>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+    if      (HD == 256) launch_flash_attn_t<256, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+    else if (HD == 128) launch_flash_attn_t<128, 32>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+    else {
+        fprintf(stderr, "[flash_attn] 미지원 head_dim=%d (128/256만 인스턴스됨). "
+            "확장 시 launch_flash_attn에 인스턴스 추가. 조용한 오답 대신 중단합니다.\n", HD);
+        abort();
+    }
 }
 
 #endif // DGX_ATTENTION_FLASH_CUH

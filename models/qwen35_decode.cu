@@ -13,6 +13,7 @@
 #include "../kernels/gemm_mma.cuh"     // 챕터7 Phase B: tensor-core MMA W4A8 (prefill)
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
+#include "../kernels/attention_flash.cuh"  // 챕터7 FA.1a: full-attn 16층 (attn_decode 교체 — 12K 벽 제거)
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
 #include "../kernels/gdn.cuh"
@@ -150,7 +151,7 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             // append roped K, V to cache at slot base..
             DK(cudaMemcpy(st.Kc[l]+(size_t)base*kvdim, kn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
             DK(cudaMemcpy(st.Vc[l]+(size_t)base*kvdim, vb, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
-            launch_attn_decode(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, NKV, HD, base);
+            launch_flash_attn(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, NKV, HD, base);  // FA.1a: tiled online-softmax (상수 shared, 12K 벽 없음)
             launch_gate_sigmoid(attn, gate, (int)((size_t)Sq*qdim));
             mm(L.o,attn,ob,qdim,H,Sq,use_q4);
             launch_add(after,x,ob,(int)SH);
