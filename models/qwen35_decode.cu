@@ -10,6 +10,7 @@
 #include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/gemm_batch.cuh"
 #include "../kernels/gemm_tiled.cuh"   // 챕터7 Phase A: software tiled q4 GEMM (prefill)
+#include "../kernels/gemm_mma.cuh"     // 챕터7 Phase B: tensor-core MMA W4A8 (prefill)
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
@@ -47,7 +48,8 @@ static void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, 
         if (g_xqcap < n) { if(g_xq)cudaFree(g_xq); if(g_xs)cudaFree(g_xs); if(g_xsum)cudaFree(g_xsum);
             DK(cudaMalloc(&g_xq,n)); DK(cudaMalloc(&g_xs,(n/QBLK)*4)); DK(cudaMalloc(&g_xsum,(n/QBLK)*4)); g_xqcap=n; }
         launch_quantize_x_q8(X, g_xq, g_xs, g_xsum, IN, S);
-        launch_gemv_w4a8(g_xq, g_xs, g_xsum, m.wq, m.sc, Y, IN, OUT, S);
+        if (S > 1) launch_gemm_mma_w4a8(g_xq, g_xs, m.wq, m.sc, Y, S, OUT, IN);   // prefill: tensor-core MMA(Phase B)
+        else       launch_gemv_w4a8(g_xq, g_xs, g_xsum, m.wq, m.sc, Y, IN, OUT, S);
     } else if (use_q4) launch_gemm_tiled_q4(X, m.wq, m.sc, Y, S, OUT, IN);   // prefill tiled GEMM(Phase A); S=1은 gemv
     else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
 }
@@ -124,7 +126,8 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     if (use_q4==2) { xqn=wsi8(bi,SH); xq2=wsi8(bi,SH); xsn=ws(wi,SH/QBLK); xs2=ws(wi,SH/QBLK); xsmN=ws(wi,SH/QBLK); }
     // shared-X gemv: use_q4==2면 미리 양자화한 (xq,xs) 사용(재양자화 안 함), 아니면 mm() 경로.
     auto MMs=[&](const QMat&m,const float*X,const int8_t*xqs,const float*xss,float*Y,int IN,int OUT){
-        if (use_q4==2) launch_gemv_w4a8(xqs,xss,nullptr,m.wq,m.sc,Y,IN,OUT,Sq);
+        if (use_q4==2) { if (Sq>1) launch_gemm_mma_w4a8(xqs,xss,m.wq,m.sc,Y,Sq,OUT,IN);   // prefill MMA
+                         else      launch_gemv_w4a8(xqs,xss,nullptr,m.wq,m.sc,Y,IN,OUT,Sq); }
         else           mm(m,X,Y,IN,OUT,Sq,use_q4);
     };
 
