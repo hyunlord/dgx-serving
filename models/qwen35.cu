@@ -10,6 +10,7 @@
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/gemm_batch.cuh"
+#include "../kernels/gemm_tiled.cuh"   // 챕터7 Phase A: software tiled q4 GEMM (prefill)
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
@@ -39,7 +40,7 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
             QK(cudaMalloc(&gf_xq,n)); QK(cudaMalloc(&gf_xs,(n/QBLK)*4)); QK(cudaMalloc(&gf_xsum,(n/QBLK)*4)); gf_xqcap=n; }
         launch_quantize_x_q8(X, gf_xq, gf_xs, gf_xsum, IN, S);
         launch_gemv_w4a8(gf_xq, gf_xs, gf_xsum, m.wq, m.sc, Y, IN, OUT, S);
-    } else if (use_q4) launch_gemm_q4_tiled(X, m.wq, m.sc, Y, IN, OUT, S);   // prefill 16-타일 GEMM
+    } else if (use_q4) launch_gemm_tiled_q4(X, m.wq, m.sc, Y, S, OUT, IN);   // prefill tiled GEMM(Phase A); S=1은 gemv
     else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
 }
 

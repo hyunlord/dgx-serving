@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include "../kernels/gemv_q4.cuh"
 #include "../kernels/gemm_batch.cuh"
+#include "../kernels/gemm_tiled.cuh"
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"%s\n",cudaGetErrorString(e));exit(1);}}while(0)
 int main(){
     const int IN=5120, OUT=17408, S=256;   // 27B MLP up dim, prefill 256 토큰
@@ -21,6 +22,8 @@ int main(){
     launch_gemm_q4_tiled(dX,dwq,dsc,dYt,IN,OUT,S);      // 16-타일 gemm_batch: weight S/16회
     // mw 8-타일 (멀티워프, X 접근 다름 — X-bound 완화 시험)
     for(int t=0;t+8<=S;t+=8) launch_gemm_mw_q4(dX+(size_t)t*IN,dwq,dsc,dYt+(size_t)t*OUT,IN,OUT,8);
+    // 챕터7 Phase A: software tiled GEMM (X·W shared K-slice)
+    launch_gemm_tiled_q4(dX,dwq,dsc,dYt,S,OUT,IN);
     CK(cudaDeviceSynchronize());
     printf("done (IN=%d OUT=%d S=%d)\n",IN,OUT,S);
     return 0;
