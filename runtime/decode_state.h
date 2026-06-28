@@ -38,10 +38,11 @@ void free_verify_artifacts(VerifyArtifacts &v);
 //   commit=0: committed S/convctx/n_past 불변 (verify). va!=NULL이면 스텝별 GDN snapshot + conv mixed 기록.
 //   d_cos/d_sin: [max_len, rot] rope 테이블 (위치 p → row p). use_q4: fp32(0) 기준선.
 //   d_postnorm: nullable [Sq, H] (final-norm 적용 후 = h_nextn, MTP draft 입력 — 2b 확정).
+//   last_logits_only=1: lm_head 를 마지막 토큰만 (prefill TTFT — 실엔진처럼; d_logits=[1,V]면 충분).
 void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                    const int *d_tokens, int Sq, const float *d_cos, const float *d_sin,
                    float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4,
-                   float *d_postnorm = nullptr);
+                   float *d_postnorm = nullptr, int last_logits_only = 0);
 
 // verify 후 앞 m 토큰을 committed 로 승격 (임시승격: GDN snap[m-1] 복사 + conv ctx 갱신 + n_past+=m).
 //   KV/cache 의 [n_past..n_past+m-1] 은 verify 중 이미 기록됨 → 길이 포인터만 전진.

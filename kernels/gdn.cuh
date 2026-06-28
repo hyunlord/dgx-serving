@@ -144,7 +144,7 @@ static inline void launch_gdn_delta_rule(const float *Q, const float *K, const f
 static __global__ void gdn_step_kernel(const float *Q, const float *K, const float *V,
                                 const float *G, const float *Bt,
                                 const float *Sin, float *Ssnap, float *O,
-                                int Sq, int NH, int D, int NHk) {
+                                int Sq, int NH, int D, int NHk, int snapshot_all) {
     int h = blockIdx.x, v = threadIdx.x;
     if (v >= D) return;
     int g = h * NHk / NH;                   // GQA: v-head h → 공유 k-head g
@@ -171,18 +171,25 @@ static __global__ void gdn_step_kernel(const float *Q, const float *K, const flo
         #pragma unroll 4
         for (int k = 0; k < D; k++) { scol[k] += ks[k] * delta; out += scol[k] * qs[k]; }
         O[base + v] = out;
-        // 스냅샷 (스텝 t 후 state)
-        float *snap = Ssnap + (size_t)t * NH * D * D + (size_t)h * D * D;
-        for (int k = 0; k < D; k++) snap[(size_t)k * D + v] = scol[k];
+        // 스냅샷: snapshot_all 이면 매 스텝 Ssnap[t](verify 승격용), 아니면 최종 state만 Ssnap[0]
+        //   (긴 prefill에서 Ssnap=O(1) — Sq×NH×D² 폭발 방지, 32K 크래시 근본 원인 제거).
+        if (snapshot_all || t == Sq - 1) {
+            size_t slot = snapshot_all ? (size_t)t : 0;
+            float *snap = Ssnap + slot * NH * D * D + (size_t)h * D * D;
+            for (int k = 0; k < D; k++) snap[(size_t)k * D + v] = scol[k];
+        }
         __syncthreads();
     }
 }
 
+//   snapshot_all=1(기본): 매 스텝 state 스냅샷(verify 승격용, Ssnap=[Sq,NH,D,D]).
+//   snapshot_all=0: 최종 state만 Ssnap[0](plain prefill/decode — Ssnap=[NH,D,D] 1개면 충분, 긴 Sq 안전).
 static inline void launch_gdn_step(const float *Q, const float *K, const float *V,
                                    const float *G, const float *Bt, const float *Sin,
-                                   float *Ssnap, float *O, int Sq, int NH, int D, int NHk, cudaStream_t st = 0) {
+                                   float *Ssnap, float *O, int Sq, int NH, int D, int NHk,
+                                   int snapshot_all = 1, cudaStream_t st = 0) {
     size_t shmem = (size_t)(2 * D + 32) * sizeof(float);
-    gdn_step_kernel<<<NH, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Ssnap, O, Sq, NH, D, NHk);
+    gdn_step_kernel<<<NH, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Ssnap, O, Sq, NH, D, NHk, snapshot_all);
 }
 
 // ---- batch decode GDN step (챕터3): B 독립 시퀀스, 각 1스텝(행 간 recurrence 없음 — 병렬) ----

@@ -13,6 +13,7 @@
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
 #include "../kernels/gdn.cuh"
+#include "moe_block.cuh"   // moe_mlp_block (decode MoE 분기)
 
 #define DK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
     fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
@@ -92,7 +93,7 @@ void free_verify_artifacts(VerifyArtifacts &v) { if(v.gdn_snap)cudaFree(v.gdn_sn
 void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                    const int *d_tokens, int Sq, const float *d_cos, const float *d_sin,
                    float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4,
-                   float *d_postnorm) {
+                   float *d_postnorm, int last_logits_only) {
     const int H=c.hidden_size, FFN=c.intermediate_size, HD=c.head_dim, V=c.vocab_size;
     const int NQ=c.num_q_heads, NKV=c.num_kv_heads, rot=c.rotary_dim;
     const float eps=c.rms_norm_eps;
@@ -111,7 +112,9 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     float *zb=ws(wi,(size_t)Sq*vdim),*ab=ws(wi,(size_t)Sq*nvh),*bb=ws(wi,(size_t)Sq*nvh),*gg=ws(wi,(size_t)Sq*nvh),*beta=ws(wi,(size_t)Sq*nvh);
     float *core=ws(wi,(size_t)Sq*vdim),*normed=ws(wi,(size_t)Sq*vdim),*gout=ws(wi,SH);
     float *gm=ws(wi,(size_t)Sq*FFN),*um=ws(wi,(size_t)Sq*FFN),*act=ws(wi,(size_t)Sq*FFN),*dbuf=ws(wi,SH),*fn=ws(wi,SH);
-    float *snap=ws(wi,(size_t)Sq*nvh*hv*hv);   // per-layer GDN snapshot scratch
+    // GDN snapshot scratch: verify(va)만 per-token([Sq,NH,D²]); plain prefill/decode는 최종 state 1개([NH,D²]).
+    //   va 없을 때 Sq×NH×D² 폭발 방지(32K prefill에서 103GB→3MB — 시스템 크래시 근본 원인 제거).
+    float *snap=ws(wi,(size_t)(va?Sq:1)*nvh*hv*hv);
     float *convfull=ws(wi,(size_t)(Kk-1+Sq)*convd);
 
     // W4A8 shared-X quantize 버퍼: norm/n2(IN=H)를 1회 양자화해 q/k/v(또는 in_qkv/in_z)·gate/up 재사용.
@@ -157,7 +160,7 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             launch_gemv_f32(norm,L.in_a,ab,H,nvh,Sq); launch_gemv_f32(norm,L.in_b,bb,H,nvh,Sq);
             launch_gdn_decay_beta(ab,bb,L.A_log,L.dt_bias,gg,beta,Sq,nvh);
             // gdn_step from committed S, Sq steps, snapshot
-            launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv, c.gdn_num_k_heads);
+            launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv, c.gdn_num_k_heads, va?1:0);
             if (!commit && va) {  // verify: per-step GDN snapshot + conv mixed → va (승격용)
                 size_t ssz=(size_t)nvh*hv*hv;
                 for(int t=0;t<Sq;t++)
@@ -168,8 +171,8 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                                   mixed + (size_t)t*convd, (size_t)convd*4, cudaMemcpyDeviceToDevice));
             }
             if (commit) {
-                // 최종 state = snap[Sq-1]
-                DK(cudaMemcpy(st.S[l], snap+(size_t)(Sq-1)*nvh*hv*hv, (size_t)nvh*hv*hv*4, cudaMemcpyDeviceToDevice));
+                // 최종 state: va면 snap[Sq-1](per-token), 아니면 snap[0](snapshot_all=0 → 최종만 기록됨)
+                DK(cudaMemcpy(st.S[l], snap+(size_t)(va?(Sq-1):0)*nvh*hv*hv, (size_t)nvh*hv*hv*4, cudaMemcpyDeviceToDevice));
                 // conv ctx 갱신 = [convctx ; mixed] 의 마지막 K-1 토큰
                 DK(cudaMemcpy(convfull, st.convctx[l], (size_t)(Kk-1)*convd*4, cudaMemcpyDeviceToDevice));
                 DK(cudaMemcpy(convfull+(size_t)(Kk-1)*convd, mixed, (size_t)Sq*convd*4, cudaMemcpyDeviceToDevice));
@@ -181,16 +184,21 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             lin++;
         }
         launch_rmsnorm_zc(after,L.post_ln,n2,Sq,H,eps);
-        if (use_q4==2) launch_quantize_x_q8(n2, xq2, xs2, (int32_t*)xsmN, H, Sq);  // n2 1회 양자화 → gate/up 공유
-        MMs(L.gate,n2,xq2,xs2,gm,H,FFN); MMs(L.up,n2,xq2,xs2,um,H,FFN);
-        launch_swiglu(gm,um,act,(size_t)Sq*FFN);
-        mm(L.down,act,dbuf,FFN,H,Sq,use_q4);
+        if (c.num_experts>0) {                                  // MoE 분기 (prefill과 동일 블록 공유)
+            moe_mlp_block(c, L, n2, dbuf, Sq);
+        } else {
+            if (use_q4==2) launch_quantize_x_q8(n2, xq2, xs2, (int32_t*)xsmN, H, Sq);  // n2 1회 양자화 → gate/up 공유
+            MMs(L.gate,n2,xq2,xs2,gm,H,FFN); MMs(L.up,n2,xq2,xs2,um,H,FFN);
+            launch_swiglu(gm,um,act,(size_t)Sq*FFN);
+            mm(L.down,act,dbuf,FFN,H,Sq,use_q4);
+        }
         launch_add(x,after,dbuf,(int)SH);
     }
     if (d_prenorm) DK(cudaMemcpy(d_prenorm,x,SH*4,cudaMemcpyDeviceToDevice));
     launch_rmsnorm_zc(x,w.final_norm,fn,Sq,H,eps);
     if (d_postnorm) DK(cudaMemcpy(d_postnorm,fn,SH*4,cudaMemcpyDeviceToDevice));  // h_nextn (MTP 입력)
-    mm(w.lm_head,fn,d_logits,H,V,Sq,use_q4);
+    if (last_logits_only) mm(w.lm_head, fn+(size_t)(Sq-1)*H, d_logits, H, V, 1, use_q4);  // 마지막 토큰만(prefill TTFT)
+    else                  mm(w.lm_head, fn, d_logits, H, V, Sq, use_q4);
     if (commit) st.n_past += Sq;
     DK(cudaDeviceSynchronize());
 
