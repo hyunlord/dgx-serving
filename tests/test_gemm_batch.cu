@@ -24,13 +24,6 @@ static void run(int IN,int OUT,int B,unsigned&seed){
     bool ok=e<1e-2;
     printf("  [IN=%4d OUT=%4d B=%2d] batch gemm == B gemv  max err=%.3e (worst seq %d)  %s\n",IN,OUT,B,e,worst_b,ok?"OK":"FAIL");
     if(!ok)g_fail=1;
-    // multi-warp 커널 (챕터4) == 같은 골든 (B=1,2,4,8만 지원)
-    if(launch_gemm_mw_f32(dX,dW,dY,IN,OUT,B)){ CK(cudaDeviceSynchronize());
-        CK(cudaMemcpy(Y.data(),dY,Y.size()*4,cudaMemcpyDeviceToHost));
-        double e2=0; for(int b=0;b<B;b++)for(int o=0;o<OUT;o++) e2=fmax(e2,fabs((double)Y[(size_t)b*OUT+o]-gold[(size_t)b*OUT+o]));
-        printf("  [IN=%4d OUT=%4d B=%2d] gemm_mw    == golden   max err=%.3e          %s\n",IN,OUT,B,e2,e2<1e-2?"OK":"FAIL");
-        if(e2>=1e-2)g_fail=1;
-    }
     cudaFree(dX);cudaFree(dW);cudaFree(dY);
 }
 

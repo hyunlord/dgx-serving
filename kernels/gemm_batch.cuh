@@ -49,67 +49,6 @@ static inline void launch_gemm_batch_f32(const float *X, const float *W, float *
     }
 }
 
-// ===== multi-warp-per-output gemm (챕터4, mmvq식): NW warp가 한 출력행을 IN 분할 협력 + shared 축약 =====
-//   2d/챕터3 실패(1 warp에 누적기 몰기 → register 붕괴)를 구조적 회피: register=B×ROWS(작음), 병렬성=warp 수.
-//   shared는 partial-sum만(B·ROWS 작음) — X는 global 유지 → X-shared bank conflict 회피.
-//   block=(32, NW), grid.x=ceil(OUT/ROWS). block이 ROWS 출력행 × B열 담당.
-template<int B, int NW, int ROWS>
-static __global__ void gemm_mw_f32_kernel(const float *X, const float *W, float *Y, int IN, int OUT) {
-    int lane = threadIdx.x, wid = threadIdx.y, tid = wid * 32 + lane;
-    int row0 = blockIdx.x * ROWS;
-    float tmp[B][ROWS];
-    #pragma unroll
-    for (int cc = 0; cc < B; cc++)
-        #pragma unroll
-        for (int r = 0; r < ROWS; r++) tmp[cc][r] = 0.f;
-    for (int i = tid; i < IN; i += NW * 32) {
-        float wv[ROWS];
-        #pragma unroll
-        for (int r = 0; r < ROWS; r++) wv[r] = (row0 + r < OUT) ? W[(size_t)(row0 + r) * IN + i] : 0.f;
-        #pragma unroll
-        for (int cc = 0; cc < B; cc++) {
-            float xv = X[(size_t)cc * IN + i];
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) tmp[cc][r] += xv * wv[r];
-        }
-    }
-    #pragma unroll
-    for (int cc = 0; cc < B; cc++)
-        #pragma unroll
-        for (int r = 0; r < ROWS; r++) tmp[cc][r] = warp_reduce_sum(tmp[cc][r]);   // 워프 내 32 lane 축약
-    __shared__ float sh[NW][B][ROWS];
-    if (lane == 0)
-        #pragma unroll
-        for (int cc = 0; cc < B; cc++)
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) sh[wid][cc][r] = tmp[cc][r];
-    __syncthreads();
-    if (wid == 0 && lane == 0)                                                       // cross-warp 축약 + write
-        #pragma unroll
-        for (int cc = 0; cc < B; cc++)
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                float s = 0.f;
-                #pragma unroll
-                for (int wq = 0; wq < NW; wq++) s += sh[wq][cc][r];
-                if (row0 + r < OUT) Y[(size_t)cc * OUT + row0 + r] = s;
-            }
-}
-template<int B, int NW, int ROWS>
-static inline void launch_gemm_mw_f32_B(const float *X, const float *W, float *Y, int IN, int OUT, cudaStream_t st) {
-    dim3 block(32, NW); int grid = (OUT + ROWS - 1) / ROWS;
-    gemm_mw_f32_kernel<B, NW, ROWS><<<grid, block, 0, st>>>(X, W, Y, IN, OUT);
-}
-// B별 (NW,ROWS) 테이블(mmvq 차용). 지원 B: 1,2,4,8. 그 외는 호출측 분할/fallback.
-// 정책(챕터4 STEP1 측정): multi-warp는 B≥4서만 이득(B≤2는 over-decompose 회귀 → gemm_batch).
-static inline bool launch_gemm_mw_f32(const float *X, const float *W, float *Y, int IN, int OUT, int B, cudaStream_t st = 0) {
-    switch (B) {
-        case 4: launch_gemm_mw_f32_B<4,4,2>(X,W,Y,IN,OUT,st); return true;
-        case 8: launch_gemm_mw_f32_B<8,2,2>(X,W,Y,IN,OUT,st); return true;
-        default: return false;
-    }
-}
-
 // ---- q4 batch gemm: weight row 1회 로드 + unpack 1회 → B행 재사용(unpack도 amortize, 챕터2b 통찰) ----
 template<int B>
 static __global__ void gemm_batch_q4_kernel(const float *X, const uint8_t *Wq, const float *sc, float *Y, int IN, int OUT) {
@@ -217,75 +156,6 @@ __device__ __forceinline__ int gb_pk(int lo_byte, int hi_byte) {
          | ((( hi_byte       & 0xF) - 8) & 0xFF) << 16
          | ((((hi_byte >> 4)  & 0xF) - 8) & 0xFF) << 24;
 }
-// ---- multi-warp W4A8 gemm (챕터4): NW warp가 한 출력행 협력, thread당 4원소 chunk(dp4a), shared 축약 ----
-template<int B, int NW, int ROWS>
-static __global__ void gemm_mw_w4a8_kernel(const int8_t *xq, const float *xs, const uint8_t *Wq, const float *sw, float *Y, int IN, int OUT) {
-    int lane = threadIdx.x, wid = threadIdx.y, tid = wid * 32 + lane;
-    int row0 = blockIdx.x * ROWS, nb = IN / QBLK;
-    float tmp[B][ROWS];
-    #pragma unroll
-    for (int cc = 0; cc < B; cc++)
-        #pragma unroll
-        for (int r = 0; r < ROWS; r++) tmp[cc][r] = 0.f;
-    for (int base = tid * 8; base < IN; base += NW * 32 * 8) {       // 8원소 chunk (base>>1=tid*4, 4-aligned)
-        int blk = base / QBLK;
-        int wA[ROWS], wB[ROWS]; float swb[ROWS];
-        #pragma unroll
-        for (int r = 0; r < ROWS; r++) {
-            if (row0 + r < OUT) {
-                const uint8_t *w = Wq + (size_t)(row0 + r) * (IN / 2);
-                unsigned Wd = *reinterpret_cast<const unsigned*>(w + (base >> 1));   // 4 byte = 8 nibble
-                wA[r] = gb_pk(Wd & 0xFF, (Wd >> 8) & 0xFF);
-                wB[r] = gb_pk((Wd >> 16) & 0xFF, (Wd >> 24) & 0xFF);
-                swb[r] = sw[(size_t)(row0 + r) * nb + blk];
-            } else { wA[r] = wB[r] = 0; swb[r] = 0.f; }
-        }
-        #pragma unroll
-        for (int cc = 0; cc < B; cc++) {
-            const int8_t *xqc = xq + (size_t)cc * IN + base;
-            int x0 = *reinterpret_cast<const int*>(xqc), x1 = *reinterpret_cast<const int*>(xqc + 4);
-            float xsb = xs[(size_t)cc * nb + blk];
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                int dot = __dp4a(x0, wA[r], 0); dot = __dp4a(x1, wB[r], dot);
-                tmp[cc][r] += xsb * swb[r] * (float)dot;
-            }
-        }
-    }
-    #pragma unroll
-    for (int cc = 0; cc < B; cc++)
-        #pragma unroll
-        for (int r = 0; r < ROWS; r++) tmp[cc][r] = warp_reduce_sum(tmp[cc][r]);
-    __shared__ float sh[NW][B][ROWS];
-    if (lane == 0)
-        #pragma unroll
-        for (int cc = 0; cc < B; cc++)
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) sh[wid][cc][r] = tmp[cc][r];
-    __syncthreads();
-    if (wid == 0 && lane == 0)
-        #pragma unroll
-        for (int cc = 0; cc < B; cc++)
-            #pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                float s = 0.f;
-                #pragma unroll
-                for (int wq2 = 0; wq2 < NW; wq2++) s += sh[wq2][cc][r];
-                if (row0 + r < OUT) Y[(size_t)cc * OUT + row0 + r] = s;
-            }
-}
-template<int B, int NW, int ROWS>
-static inline void launch_gemm_mw_w4a8_B(const int8_t *xq, const float *xs, const uint8_t *Wq, const float *sw, float *Y, int IN, int OUT, cudaStream_t st) {
-    dim3 block(32, NW); int grid = (OUT + ROWS - 1) / ROWS;
-    gemm_mw_w4a8_kernel<B, NW, ROWS><<<grid, block, 0, st>>>(xq, xs, Wq, sw, Y, IN, OUT);
-}
-static inline bool launch_gemm_mw_w4a8(const int8_t *xq, const float *xs, const uint8_t *Wq, const float *sw, float *Y, int IN, int OUT, int B, cudaStream_t st = 0) {
-    switch (B) {
-        case 4: launch_gemm_mw_w4a8_B<4,4,2>(xq,xs,Wq,sw,Y,IN,OUT,st); return true;
-        case 8: launch_gemm_mw_w4a8_B<8,2,2>(xq,xs,Wq,sw,Y,IN,OUT,st); return true;
-        default: return false;
-    }
-}
 
 template<int B>
 static __global__ void gemm_batch_w4a8_kernel(const int8_t *xq, const float *xs, const uint8_t *Wq, const float *sw, float *Y, int IN, int OUT) {
@@ -327,19 +197,6 @@ static inline void launch_gemm_batch_w4a8(const int8_t *xq, const float *xs, con
         case 16: launch_gemm_batch_w4a8_B<16>(xq, xs, Wq, sw, Y, IN, OUT, st); break;
         default: { for (int b = 0; b < B; b++) launch_gemm_batch_w4a8_B<1>(xq + (size_t)b*IN, xs + (size_t)b*(IN/QBLK), Wq, sw, Y + (size_t)b*OUT, IN, OUT, st); }
     }
-}
-
-// prefill q4 행렬곱: 16-타일 batch GEMM(weight 1회 read+unpack → 16토큰 재사용 = 트래픽 Sq→Sq/16).
-//   S=1(decode)은 gemv_q4(이미 최적). 나머지(<16)는 8/4/2/1 분해(재사용 최대화). prefill·decode 공유.
-static inline void launch_gemm_q4_tiled(const float *X, const uint8_t *wq, const float *sc,
-                                        float *Y, int IN, int OUT, int S, cudaStream_t st = 0) {
-    if (S == 1) { launch_gemv_q4(X, wq, sc, Y, IN, OUT, 1, st); return; }
-    int t = 0;
-    for (; t + 16 <= S; t += 16)
-        launch_gemm_batch_q4(X + (size_t)t*IN, wq, sc, Y + (size_t)t*OUT, IN, OUT, 16, st);
-    int r = S - t;
-    for (int b = 8; b >= 1; b >>= 1)
-        while (r >= b) { launch_gemm_batch_q4(X + (size_t)t*IN, wq, sc, Y + (size_t)t*OUT, IN, OUT, b, st); t += b; r -= b; }
 }
 
 #endif // DGX_GEMM_BATCH_CUH
