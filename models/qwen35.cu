@@ -32,18 +32,6 @@ static void dbg_dump(const char *name, const float *d, size_t n) {
 
 // 행렬곱 dispatch: q4(int4 dequant) / fp32 / W4A8(int8 act × int4 weight) 경로.
 static int8_t *gf_xq=nullptr; static float *gf_xs=nullptr; static int32_t *gf_xsum=nullptr; static size_t gf_xqcap=0;
-// prefill q4 행렬곱: 16-타일 batch GEMM(weight row 1회 read+unpack → 16토큰 재사용 = 트래픽 Sq→Sq/16).
-//   S=1(decode)은 gemv_q4(이미 최적). S>1(prefill)은 타일링. 나머지(<16)는 launch가 1/2/4/8 분해.
-static inline void mm_q4_tiled(const float *X, const uint8_t *wq, const float *sc, float *Y, int IN, int OUT, int S) {
-    if (S == 1) { launch_gemv_q4(X, wq, sc, Y, IN, OUT, 1); return; }
-    int t = 0;
-    for (; t + 16 <= S; t += 16)
-        launch_gemm_batch_q4(X + (size_t)t*IN, wq, sc, Y + (size_t)t*OUT, IN, OUT, 16);
-    int r = S - t;                              // 나머지 1..15 → 8+4+2+1 분해(재사용 최대화)
-    for (int b = 8; b >= 1; b >>= 1)
-        while (r >= b) { launch_gemm_batch_q4(X + (size_t)t*IN, wq, sc, Y + (size_t)t*OUT, IN, OUT, b); t += b; r -= b; }
-}
-
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4) {
     if (use_q4==2) {
         size_t n=(size_t)S*IN;
@@ -51,7 +39,7 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
             QK(cudaMalloc(&gf_xq,n)); QK(cudaMalloc(&gf_xs,(n/QBLK)*4)); QK(cudaMalloc(&gf_xsum,(n/QBLK)*4)); gf_xqcap=n; }
         launch_quantize_x_q8(X, gf_xq, gf_xs, gf_xsum, IN, S);
         launch_gemv_w4a8(gf_xq, gf_xs, gf_xsum, m.wq, m.sc, Y, IN, OUT, S);
-    } else if (use_q4) mm_q4_tiled(X, m.wq, m.sc, Y, IN, OUT, S);   // prefill 16-타일 GEMM
+    } else if (use_q4) launch_gemm_q4_tiled(X, m.wq, m.sc, Y, IN, OUT, S);   // prefill 16-타일 GEMM
     else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
 }
 

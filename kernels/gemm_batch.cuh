@@ -3,6 +3,7 @@
 #include <cstdint>
 #include "reduce.cuh"
 #include "../runtime/config.h"   // QBLK
+#include "gemv_q4.cuh"           // launch_gemv_q4 (S=1 fallback)
 
 // batch gemm (fp32): Y[B,OUT] = X[B,IN] · Wᵀ, W[OUT,IN] row-major.
 //   챕터3 STEP1 thesis: weight row를 1회 로드 → B행에 재사용(누적기 B개) = weight read OUT×IN(현 gemv는 OUT×B×IN).
@@ -326,6 +327,19 @@ static inline void launch_gemm_batch_w4a8(const int8_t *xq, const float *xs, con
         case 16: launch_gemm_batch_w4a8_B<16>(xq, xs, Wq, sw, Y, IN, OUT, st); break;
         default: { for (int b = 0; b < B; b++) launch_gemm_batch_w4a8_B<1>(xq + (size_t)b*IN, xs + (size_t)b*(IN/QBLK), Wq, sw, Y + (size_t)b*OUT, IN, OUT, st); }
     }
+}
+
+// prefill q4 행렬곱: 16-타일 batch GEMM(weight 1회 read+unpack → 16토큰 재사용 = 트래픽 Sq→Sq/16).
+//   S=1(decode)은 gemv_q4(이미 최적). 나머지(<16)는 8/4/2/1 분해(재사용 최대화). prefill·decode 공유.
+static inline void launch_gemm_q4_tiled(const float *X, const uint8_t *wq, const float *sc,
+                                        float *Y, int IN, int OUT, int S, cudaStream_t st = 0) {
+    if (S == 1) { launch_gemv_q4(X, wq, sc, Y, IN, OUT, 1, st); return; }
+    int t = 0;
+    for (; t + 16 <= S; t += 16)
+        launch_gemm_batch_q4(X + (size_t)t*IN, wq, sc, Y + (size_t)t*OUT, IN, OUT, 16, st);
+    int r = S - t;
+    for (int b = 8; b >= 1; b >>= 1)
+        while (r >= b) { launch_gemm_batch_q4(X + (size_t)t*IN, wq, sc, Y + (size_t)t*OUT, IN, OUT, b, st); t += b; r -= b; }
 }
 
 #endif // DGX_GEMM_BATCH_CUH

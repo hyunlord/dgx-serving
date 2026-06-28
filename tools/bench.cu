@@ -85,16 +85,18 @@ int main(int argc,char**argv){
         }
         // 메모리 가드 (GB10 unified 크래시 방지): 예상 workspace+KV가 가용 초과면 skip+경고.
         size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB);
-        size_t need=est_workspace_bytes(e.c,C)+est_kv_bytes(e.c,C+N+1);
+        const int PCHUNK=256;   // 청크 prefill: 한 번에 PCHUNK 토큰 → workspace/GDN 커널 작게(O(Sq) 폭발·행 방지)
+        size_t need=est_workspace_bytes(e.c, C<PCHUNK?C:PCHUNK)+est_kv_bytes(e.c,C+N+1);  // workspace는 청크 비례
         if(need > (size_t)(0.75*(double)freeB)){
             printf("  %-4d %-6d %-7d | SKIP — 예산 %.1fGB > 가용 %.1fGB×0.75 (메모리 가드)\n",
                    1,C,N, need/1e9, freeB/1e9);
             continue;
         }
         DecodeState st=alloc_decode_state(e.c, C+N+1);
-        // prefill: C 토큰 한 번에 (TTFT)
+        // prefill: 청크(PCHUNK)씩 — 각 호출 작은 Sq → 16-타일 GEMM + 짧은 GDN. 마지막 청크만 logits. (TTFT)
         CK(cudaDeviceSynchronize()); cudaEventRecord(t0);
-        qwen35_decode(e.c,e.w,st,d_tok,C,d_cos,d_sin,d_logits,nullptr,1,nullptr,use_q4,nullptr,/*last_logits_only*/1);
+        for(int t=0;t<C;t+=PCHUNK){ int s=(C-t<PCHUNK)?(C-t):PCHUNK; int last=(t+s>=C)?1:0;
+            qwen35_decode(e.c,e.w,st,d_tok+t,s,d_cos,d_sin,d_logits,nullptr,1,nullptr,use_q4,nullptr,last); }
         cudaEventRecord(t1); CK(cudaEventSynchronize(t1));
         float ttft=ev(t0,t1);
         // decode N 토큰 (per-token)
