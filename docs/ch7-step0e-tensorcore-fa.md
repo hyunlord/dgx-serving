@@ -46,10 +46,19 @@ CTA = (쿼리 블록 Br, head h). KV를 Bc씩 타일 순회 + online softmax(run
 5. **ncu**: tensor-core(pipe) active 비율, mem/compute util. software FA 대비 속도.
 6. **성능 재측정**: 3-way decode/prefill 곡선 — software 9→3.2를 얼마로, llama flat 12 추월하나.
 
-## 4. 단계 (구현은 합의 후)
-- **FA.2a**: tensor-core fp16 FA 커널(작은 Br/Bc, 정확성+결정성). CPU 오차0 + FA.1 대조.
-- **FA.2b**: 타일 크기/opt-in shared/double-buffer 튜닝(ncu util). 엔진 통합.
-- **FA.2c**: decode 특화(Sq=1 긴 KV) 최적 — decode 곡선 flat 목표.
+## 3b. 직교성 원칙 (검증 기준 — 사용자 정립)
+**두 축 직교**: weight 정밀도(q4/W4A8/q2 = 사용자 선택)와 계산 최적화(FA.2 bf16 tensor-core = 엔진)는 독립.
+FA.2는 **모든 weight 선택에서 동일하게 정확+결정적**이어야. **q4서 되고 W4A8서 깨지면(혹은 반대) = 최적화가
+weight 선택에 샌 것 = 버그**(방금 Phase C race의 정체: 엔진최적화 MMA가 W4A8서만 깨지고 q4 운 통과).
+챕터5 "모델 특수성 커널 누출 금지"의 정밀도 버전. → **검증에 q4·W4A8 둘 다(가능하면 q2) 포함, 한 쪽만 되면
+멈추고 보고.** (FA.2는 투영 후 활성화 attention이라 weight 무관해야 정상 — 새면 결합 버그.)
+
+## 4. 단계 (Phase B식 de-risk — fragment 레이아웃 데인 지점)
+- **FA.2.0**: 단일타일 S=Q·Kᵀ bf16 MMA(m16n8k16.row.col) == CPU dot 오차0. score matmul fragment 확정.
+- **FA.2.1**: 단일타일 O=P·V bf16 MMA == CPU. V 레이아웃(P·V는 K와 다른 operand 배치 — transpose/레이아웃 주의).
+- **FA.2.2**: full FA(online softmax 타일 순회, FA.1 검증 로직) == CPU rel<1e-2 + 다중타일 + GQA + 결정성.
+- **FA.2b**: 타일/opt-in shared/cp.async 더블버퍼 튜닝(ncu tensor-core util). **엔진 통합 — q4·W4A8 둘 다 검증**.
+- **FA.2c**: decode 특화(Sq=1 긴 KV) — decode 곡선 flat 목표. 3-way 재측정.
 
 ## 5. 안전·구조
 - 작은 Br/Bc/Sq부터 정확성·결정성 통과 후 상향. 메모리 가드([[gb10-unified-memory-crash]]).
