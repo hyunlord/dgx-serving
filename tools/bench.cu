@@ -47,8 +47,8 @@ int main(int argc,char**argv){
     printf("# model=%s H=%d L=%d V=%d %s use_q4=%d (1=q4,2=W4A8)\n",
            WD.c_str(),H,L,V, moe?"MoE":"dense", use_q4);
 
-    std::vector<int> ctxs={128,2048,8192,32768};
-    std::vector<int> ngens={128,512};
+    std::vector<int> ctxs={2048,8192,16384,32768};   // 긴-context 스윕(GDN 이점 곡선)
+    std::vector<int> ngens={64};
     int MAXLEN=32768+512+8;
 
     // rope 테이블 엔진 생성 (theta from config — 골든 의존 없음)
@@ -75,7 +75,7 @@ int main(int argc,char**argv){
     // ★ 단발 prefill Sq 상한 (컴퓨트-행 방지): decode 커널(gemv_q4=untiled GEMM, O(Sq²) attn, 순차 GDN)은
     //   짧은 Sq 전제 — 32K 단발 prefill은 ~825 TFLOP/71M블록 = 수십 분 GPU 점유 → GB10 행/크래시(2차 크래시 원인).
     //   메모리 가드로는 못 막음(메모리는 안전). 청크 prefill(2번) 구현 전까지 단발 상한으로 차단.
-    const int PREFILL_SQ_CAP = 8192;   // 청크 prefill로 안전 — 단계적 상향(8192 먼저, 확인 후 32768)
+    const int PREFILL_SQ_CAP = 32768;  // 청크 prefill(PCHUNK=256)+FA(12K벽 제거)로 긴 context 안전. 메모리 가드가 KV 보호.
     // ---- B=1 (qwen35_decode: prefill Sq=C 1콜 + decode 루프) ----
     for(int C: ctxs) for(int N: ngens){
         if(C > PREFILL_SQ_CAP){

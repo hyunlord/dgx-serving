@@ -91,14 +91,21 @@ static inline void launch_flash_attn2_t(const float *Q, const float *Kc, const f
                                         int Sq, int NQ, int NKV, int base, cudaStream_t st = 0);
 static inline void launch_flash_attn(const float *Q, const float *Kc, const float *Vc, float *O,
                                      int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
-    // FA.2(bf16 tensor-core)가 FA.1a(software) 교체. BC=16(P·V 1 k-step). 미지원 HD는 abort(조용한 오답 방지).
-    if      (HD == 256) launch_flash_attn2_t<256, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
-    else if (HD == 128) launch_flash_attn2_t<128, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
-    else {
-        fprintf(stderr, "[flash_attn] 미지원 head_dim=%d (128/256만 인스턴스됨). "
-            "확장 시 launch_flash_attn에 인스턴스 추가. 조용한 오답 대신 중단합니다.\n", HD);
-        abort();
+    // 측정 결과 분기: prefill(Sq>1)=FA.2(bf16 tensor-core, 2-3×) / decode(Sq=1)=FA.1(software, 쿼리1블록 효율).
+    //   FA.2는 BR=16 타일이라 Sq=1서 15/16 낭비 → decode 퇴보. decode 특화(FA.2c)는 추후. 미지원 HD는 abort.
+    if (Sq > 1) {
+        if      (HD == 256) launch_flash_attn2_t<256, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+        else if (HD == 128) launch_flash_attn2_t<128, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+        else goto unsup;
+    } else {
+        if      (HD == 256) launch_flash_attn_t<256, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);   // BC=16 → shared 33KB(48KB내)
+        else if (HD == 128) launch_flash_attn_t<128, 32>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+        else goto unsup;
     }
+    return;
+unsup:
+    fprintf(stderr, "[flash_attn] 미지원 head_dim=%d (128/256만). 조용한 오답 대신 중단합니다.\n", HD);
+    abort();
 }
 
 // ── FA.2: bf16 tensor-core FlashAttention (m16n8k16) ─────────────────────────────────────────
