@@ -8,278 +8,14 @@
 
 #define FD_SPLIT_KV 512   // KV split 크기(BC16 배수). B(MMA split) + FA.2c(flash_decode) 공용.
 
-// ── attention 커널 landscape (왜 여러 개인가 — mm() 복붙이 조용히 갈라진 교훈, 명시 기록) ──────────
-//   1) launch_attn (attention.cuh)            — 레퍼런스 forward(qwen35.cu/smollm3.cu). golden 생성용.
-//        S≤HD 제약, 작은 S만(벽 무관). **의도적 독립**: 엔진 FA와 다른 커널 = 교차검증 ground truth.
-//   2) launch_flash_attn (이 파일)            — 엔진 prefill+decode(qwen35_decode.cu). FA.1a. 12K 벽 없음.
-//        attn_decode를 **교체**. full-attn 16층.
-//   3) launch_attn_decode_batch (attention.cuh) — batch decode(qwen35_batch.cu). **아직 12K 벽 있음**
-//        (full scores in shared). batch 긴-context는 나중 FA 교체 예정(TODO).
-//   4) launch_attn_decode (attention.cuh)     — 옛 엔진 경로. 이제 test_flash_attn의 벽-안 대조 레퍼런스로만.
-//   ⚠ FA 개선(FA.1b/FA.2) 시 1)·3)은 자동 안 받음 → 갈라질 잠재. golden 틀어지면 여기부터 의심.
+// ── attention 커널(정리: B 단일) ───────────────────────────────────────────────────────────
+//   launch_flash_attn(엔진 진입, qwen35_decode/batch) → flash_attn2bs(B: MMA + KV split 2-패스).
+//   prefill split=1(멀티워프 MMA, 빠름) + decode split>1(KV 분할, GPU 채움). split=f(attendlen)=Sq독립
+//   → 단발==청크/verify==decode 자동(단일 커널). 중간단계(FA.1/FA.2/FA.2b non-split/flash_decode) 제거됨.
+//   레퍼런스 forward는 attention.cuh launch_attn(독립 교차검증).
 
-// 챕터7 FA.1a: tiled FlashAttention (online softmax). full-attn 16층용 (GQA causal).
-//   현 attn_decode의 두 문제 해결: ① full scores[attendlen]를 shared에 → 48KB 벽(context>12K 깨짐).
-//   ② softmax를 단일 스레드 직렬. → FA는 KV를 BC씩 타일 순회 + running(m,l,acc) → shared 상수(BC 고정)
-//   + 타일별 softmax. shared = q[HD]+Ks[BC][HD]+Vs[BC][HD]+s[BC] = BC 고정(32K/256K든 동일) → 벽 없음.
-//
-//   매핑: block=(query i, head h), blockDim=HD. thread d = 출력 dim d 소유(acc[d] running).
-//   GQA: kv head = h/(NQ/NKV) — 각 query head가 올바른 KV head attend (데인 함정, 명시).
-//   causal: query 절대위치 qpos=base+i, attend [0..qpos] (attendlen=qpos+1). 루프 bound가 causality 보장.
-//   BC = 타일 크기(템플릿). 정확성 핵심 = online softmax running 갱신(m 바뀔 때 exp(m_old-m_new) rescale).
-template<int HD, int BC>
-static __global__ void flash_attn_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
-                                         int Sq, int NQ, int NKV, int base) {
-    int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    int GRP = NQ / NKV, kv = h / GRP;
-    int qpos = base + i, attendlen = qpos + 1;
-    float scale = 1.0f / sqrtf((float)HD);
-
-    __shared__ float q[HD];
-    __shared__ float Ks[BC][HD];
-    __shared__ float Vs[BC][HD];
-    __shared__ float s[BC];
-
-    q[d] = Q[((size_t)i * NQ + h) * HD + d];
-    __syncthreads();
-
-    float m = -FLT_MAX, l = 0.f, acc = 0.f;   // running: m=max, l=denom, acc=출력 dim d
-    for (int j0 = 0; j0 < attendlen; j0 += BC) {
-        int Bcur = (attendlen - j0 < BC) ? (attendlen - j0) : BC;
-        // KV 타일 적재 (thread d = 각 행의 dim d, coalesced)
-        for (int r = 0; r < Bcur; r++) {
-            Ks[r][d] = Kc[((size_t)(j0 + r) * NKV + kv) * HD + d];
-            Vs[r][d] = Vc[((size_t)(j0 + r) * NKV + kv) * HD + d];
-        }
-        __syncthreads();
-        // scores: thread d(<Bcur)가 key j=d 의 full dot (q·Ks[d])
-        if (d < Bcur) {
-            float dot = 0.f;
-            for (int t = 0; t < HD; t++) dot += q[t] * Ks[d][t];
-            s[d] = dot * scale;
-        }
-        __syncthreads();
-        // online softmax: 타일 max → running rescale (모든 스레드 중복 계산, Bcur<=BC 작음)
-        float tile_m = -FLT_MAX;
-        for (int j = 0; j < Bcur; j++) tile_m = fmaxf(tile_m, s[j]);
-        float m_new = fmaxf(m, tile_m);
-        float alpha = expf(m - m_new);             // 이전 누적 보정 (첫 타일 m=-FLT_MAX → 0)
-        float tile_l = 0.f, acc_tile = 0.f;
-        for (int j = 0; j < Bcur; j++) {
-            float p = expf(s[j] - m_new);
-            tile_l += p;
-            acc_tile += p * Vs[j][d];              // thread d = 출력 dim d
-        }
-        l = l * alpha + tile_l;
-        acc = acc * alpha + acc_tile;
-        m = m_new;
-        __syncthreads();                           // 다음 타일이 Ks/Vs 덮기 전
-    }
-    O[((size_t)i * NQ + h) * HD + d] = acc / l;
-}
-
-// 런처: HD는 컴파일타임(head_dim 고정 — 헌법 허용 상수). BC=32 → shared ~33KB 상수(벽 없음).
-template<int HD, int BC>
-static inline void launch_flash_attn_t(const float *Q, const float *Kc, const float *Vc, float *O,
-                                       int Sq, int NQ, int NKV, int base, cudaStream_t st = 0) {
-    dim3 grid(Sq, NQ);
-    flash_attn_kernel<HD, BC><<<grid, HD, 0, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base);
-}
-
-// 엔진용 기본 진입. head_dim별 인스턴스(BC는 shared<48KB 유지): HD256→BC16(33KB), HD128→BC32(33KB).
-//   ⚠ 미지원 HD는 abort(조용한 return 금지 — 그게 0.8B/27B head_dim=256을 놓친 버그였음).
-template<int HD, int BC>   // FA.2 런처 forward 선언 (정의는 파일 하단, 기본인자는 여기만)
-static inline void launch_flash_attn2_t(const float *Q, const float *Kc, const float *Vc, float *O,
-                                        int Sq, int NQ, int NKV, int base, cudaStream_t st = 0);
-template<int HD, int BC, int NW>   // FA.2b 런처 forward 선언
-static inline void launch_flash_attn2b_t(const float *Q, const float *Kc, const float *Vc, float *O,
-                                         int Sq, int NQ, int NKV, int base, cudaStream_t st = 0);
-template<int HD>                   // FA.2c flash_decode 런처 forward 선언 (Sq≥1 통일, 기본인자 여기만)
-static inline void launch_flash_decode(const float *Q, const float *Kc, const float *Vc, float *O,
-                                       int Sq, int NQ, int NKV, int base, cudaStream_t st = 0);
-template<int HD, int BC, int NW>   // B: MMA + KV split 2-패스 런처 forward 선언
-static inline void launch_flash_attn2bs(const float *Q, const float *Kc, const float *Vc, float *O,
-                                        int Sq, int NQ, int NKV, int base, cudaStream_t st = 0);
-static inline void launch_flash_attn(const float *Q, const float *Kc, const float *Vc, float *O,
-                                     int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
-    // ★ B: MMA 단일 커널 + KV split(split=f(attendlen), Sq·split 독립 → 완전 일관). prefill split=1(FA.2b.1
-    //   멀티워프 MMA, 빠름) + decode split>1(MMA + KV 분할, GPU 채움). 검증된 두 조각(FA.2b.1 + flash_decode 2-패스) 결합.
-    if      (HD == 256) launch_flash_attn2bs<256, 16, 8>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
-    else if (HD == 128) launch_flash_attn2bs<128, 16, 8>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
-    else {
-        fprintf(stderr, "[flash_attn] 미지원 head_dim=%d (128/256만). 조용한 오답 대신 중단합니다.\n", HD);
-        abort();
-    }
-}
-
-// ── FA.2: bf16 tensor-core FlashAttention (m16n8k16) ─────────────────────────────────────────
-//   FA.1a(software) 교체용. S=Q·Kᵀ / O=P·V를 bf16 MMA, online softmax는 shared-왕복(warp-분산 회피, 정확성먼저).
-//   fp32 누적 전부(S/acc/running m,l) — vLLM FP8 FA 긴-context 붕괴(누적 부정확) 회피. CTA=1 warp=(쿼리타일 BR, head h).
-//   BR=16(MMA m-tile), BC=16(k-step 1). HD 템플릿. GQA kv=h/(NQ/NKV). causal는 행별 qpos 마스크.
 __device__ __forceinline__ unsigned fa_pkbf(const __nv_bfloat16 &x, const __nv_bfloat16 &y){
     return (unsigned)(*(const unsigned short*)&x) | ((unsigned)(*(const unsigned short*)&y) << 16);
-}
-template<int HD, int BR, int BC>
-static __global__ void flash_attn2_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
-                                          int Sq, int NQ, int NKV, int base) {
-    int q0 = blockIdx.x * BR, h = blockIdx.y;
-    int GRP = NQ / NKV, kv = h / GRP;
-    int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    float scale = 1.0f / sqrtf((float)HD);
-    __shared__ __nv_bfloat16 sQ[BR][HD], sK[BC][HD], sV[BC][HD], sP[BR][BC];
-    __shared__ float sS[BR][BC], sAcc[BR][HD], sm[BR], sl[BR];
-
-    for (int i = lane; i < BR*HD; i += 32) { int r=i/HD,c=i%HD,gq=q0+r;
-        sQ[r][c] = (gq<Sq) ? __float2bfloat16(Q[((size_t)gq*NQ+h)*HD+c]) : (__nv_bfloat16)0; sAcc[r][c]=0.f; }
-    for (int i = lane; i < BR; i += 32) { sm[i]=-FLT_MAX; sl[i]=0.f; }
-    __syncwarp();
-
-    int qend = (q0+BR < Sq) ? q0+BR : Sq;   // 타일 내 실제 query 끝 (부분타일 KV OOB 방지)
-    int maxlen = base + qend;                // 최대 attendlen (행별 마스크로 causal). ≤ base+Sq = KV 길이
-    for (int j0 = 0; j0 < maxlen; j0 += BC) {
-        for (int i = lane; i < BC*HD; i += 32) { int r=i/HD,c=i%HD,gk=j0+r;
-            bool v = gk < maxlen;
-            sK[r][c] = v ? __float2bfloat16(Kc[((size_t)gk*NKV+kv)*HD+c]) : (__nv_bfloat16)0;
-            sV[r][c] = v ? __float2bfloat16(Vc[((size_t)gk*NKV+kv)*HD+c]) : (__nv_bfloat16)0; }
-        __syncwarp();
-        // S = Q·Kᵀ (bf16 MMA, FA.2.0 레이아웃). n-타일 BC/8, k-스텝 HD/16.
-        #pragma unroll
-        for (int ns=0; ns<BC/8; ns++) {
-            float c0=0,c1=0,c2=0,c3=0;
-            for (int ks=0; ks<HD; ks+=16) {
-                unsigned a0=*(unsigned*)&sQ[g][ks+2*t], a1=*(unsigned*)&sQ[g+8][ks+2*t];
-                unsigned a2=*(unsigned*)&sQ[g][ks+2*t+8], a3=*(unsigned*)&sQ[g+8][ks+2*t+8];
-                unsigned b0=*(unsigned*)&sK[ns*8+g][ks+2*t], b1=*(unsigned*)&sK[ns*8+g][ks+2*t+8];
-                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
-                  :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
-            }
-            sS[g][ns*8+2*t]=c0*scale; sS[g][ns*8+2*t+1]=c1*scale; sS[g+8][ns*8+2*t]=c2*scale; sS[g+8][ns*8+2*t+1]=c3*scale;
-        }
-        __syncwarp();
-        // online softmax (shared-왕복, 행별. 모든 fp32). lane<BR이 행 담당.
-        if (lane < BR) { int r=lane, gq=q0+r, qpos=base+gq;
-            if (gq < Sq) {
-                float tm=-FLT_MAX;
-                for (int j=0;j<BC;j++){ int gk=j0+j; float s=(gk<=qpos)?sS[r][j]:-FLT_MAX; sS[r][j]=s; tm=fmaxf(tm,s); }
-                float mnew=fmaxf(sm[r],tm), alpha=expf(sm[r]-mnew), tl=0.f;
-                for (int j=0;j<BC;j++){ float p=expf(sS[r][j]-mnew); sP[r][j]=__float2bfloat16(p); tl+=p; }
-                sl[r]=sl[r]*alpha+tl; sm[r]=mnew;
-                for (int c=0;c<HD;c++) sAcc[r][c]*=alpha;
-            } else for (int j=0;j<BC;j++) sP[r][j]=(__nv_bfloat16)0;
-        }
-        __syncwarp();
-        // O += P·V (bf16 MMA, FA.2.1 레이아웃). BC=16=k-step 1. n-타일 HD/8.
-        #pragma unroll
-        for (int n0=0;n0<HD;n0+=8) {
-            unsigned a0=*(unsigned*)&sP[g][2*t], a1=*(unsigned*)&sP[g+8][2*t];
-            unsigned a2=*(unsigned*)&sP[g][2*t+8], a3=*(unsigned*)&sP[g+8][2*t+8];
-            unsigned b0=fa_pkbf(sV[2*t][n0+g], sV[2*t+1][n0+g]);
-            unsigned b1=fa_pkbf(sV[2*t+8][n0+g], sV[2*t+9][n0+g]);
-            float c0=0,c1=0,c2=0,c3=0;
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
-              :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
-            sAcc[g][n0+2*t]+=c0; sAcc[g][n0+2*t+1]+=c1; sAcc[g+8][n0+2*t]+=c2; sAcc[g+8][n0+2*t+1]+=c3;
-        }
-        __syncwarp();
-    }
-    if (lane < BR) { int r=lane, gq=q0+r;
-        if (gq < Sq) { float li=1.0f/sl[r]; for (int c=0;c<HD;c++) O[((size_t)gq*NQ+h)*HD+c]=sAcc[r][c]*li; } }
-}
-template<int HD, int BC>
-static inline void launch_flash_attn2_t(const float *Q, const float *Kc, const float *Vc, float *O,
-                                        int Sq, int NQ, int NKV, int base, cudaStream_t st) {
-    dim3 grid((Sq + 15) / 16, NQ);    // BR=16
-    flash_attn2_kernel<HD, 16, BC><<<grid, 32, 0, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base);
-}
-
-// ── FA.2b.1: 멀티워프(출력-HD 분할) + acc 레지스터 ─────────────────────────────────────────
-//   ncu 진단: FA.2 occupancy 4%(1 warp + sAcc[BR][HD]fp32 16KB → Block Limit Shared Mem=2).
-//   처방: NW warp이 출력 HD 분할(warp w = col [w·HD/NW..)) → acc/warp=BR×(HD/NW) 레지스터(sAcc 제거→shared↓).
-//   S=Q·Kᵀ(HD contract)는 warp0이 1회 계산→shared 공유. P·V(HD 출력)는 warp가 col 분할. online softmax shared.
-//   block=32·NW. CTA=(쿼리타일 BR, head h). 정확성: FA.2와 동일 수학(분할만). 결정성: warp0 단독 S/softmax→race 없음.
-template<int HD, int BR, int BC, int NW>
-static __global__ void flash_attn2b_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
-                                           int Sq, int NQ, int NKV, int base) {
-    int q0 = blockIdx.x * BR, h = blockIdx.y;
-    int GRP = NQ / NKV, kv = h / GRP;
-    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
-    float scale = 1.0f / sqrtf((float)HD);
-    const int HW = HD / NW;          // warp당 출력 col 수
-    const int NT = HW / 8;           // warp당 n-타일(n8) 수
-    __shared__ __nv_bfloat16 sQ[BR][HD], sK[BC][HD], sV[BC][HD], sP[BR][BC];
-    __shared__ float sS[BR][BC], sm[BR], sl[BR], salpha[BR];
-    float acc[NT][4];                // warp별 출력 col chunk (레지스터)
-    #pragma unroll
-    for (int n=0;n<NT;n++) for(int c=0;c<4;c++) acc[n][c]=0.f;
-
-    for (int i = tid; i < BR*HD; i += 32*NW) { int r=i/HD,c=i%HD,gq=q0+r;
-        sQ[r][c] = (gq<Sq) ? __float2bfloat16(Q[((size_t)gq*NQ+h)*HD+c]) : (__nv_bfloat16)0; }
-    if (tid < BR) { sm[tid]=-FLT_MAX; sl[tid]=0.f; }
-    __syncthreads();
-
-    int qend = (q0+BR < Sq) ? q0+BR : Sq;
-    int maxlen = base + qend;
-    int wcol = warp * HW;            // 이 warp의 출력 col 시작
-    for (int j0 = 0; j0 < maxlen; j0 += BC) {
-        for (int i = tid; i < BC*HD; i += 32*NW) { int r=i/HD,c=i%HD,gk=j0+r; bool v=gk<maxlen;
-            sK[r][c]=v?__float2bfloat16(Kc[((size_t)gk*NKV+kv)*HD+c]):(__nv_bfloat16)0;
-            sV[r][c]=v?__float2bfloat16(Vc[((size_t)gk*NKV+kv)*HD+c]):(__nv_bfloat16)0; }
-        __syncthreads();
-        // S=Q·Kᵀ: warp0 단독(BC/8 n-타일, HD/16 k-스텝) → sS
-        if (warp==0) {
-            #pragma unroll
-            for (int ns=0; ns<BC/8; ns++) { float c0=0,c1=0,c2=0,c3=0;
-                for (int ks=0; ks<HD; ks+=16) {
-                    unsigned a0=*(unsigned*)&sQ[g][ks+2*t], a1=*(unsigned*)&sQ[g+8][ks+2*t];
-                    unsigned a2=*(unsigned*)&sQ[g][ks+2*t+8], a3=*(unsigned*)&sQ[g+8][ks+2*t+8];
-                    unsigned b0=*(unsigned*)&sK[ns*8+g][ks+2*t], b1=*(unsigned*)&sK[ns*8+g][ks+2*t+8];
-                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
-                      :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
-                }
-                sS[g][ns*8+2*t]=c0*scale; sS[g][ns*8+2*t+1]=c1*scale; sS[g+8][ns*8+2*t]=c2*scale; sS[g+8][ns*8+2*t+1]=c3*scale;
-            }
-        }
-        __syncthreads();
-        // online softmax (shared, 행별. tid<BR이 행 담당) → sP, salpha. 모든 fp32.
-        if (tid < BR) { int r=tid, gq=q0+r, qpos=base+gq;
-            if (gq < Sq) {
-                float tm=-FLT_MAX;
-                for (int j=0;j<BC;j++){ int gk=j0+j; float s=(gk<=qpos)?sS[r][j]:-FLT_MAX; sS[r][j]=s; tm=fmaxf(tm,s); }
-                float mnew=fmaxf(sm[r],tm), alpha=expf(sm[r]-mnew), tl=0.f;
-                for (int j=0;j<BC;j++){ float p=expf(sS[r][j]-mnew); sP[r][j]=__float2bfloat16(p); tl+=p; }
-                sl[r]=sl[r]*alpha+tl; sm[r]=mnew; salpha[r]=alpha;
-            } else { for (int j=0;j<BC;j++) sP[r][j]=(__nv_bfloat16)0; salpha[r]=1.f; }
-        }
-        __syncthreads();
-        // O += P·V: 각 warp 자기 col chunk. acc rescale(salpha). A=sP[BR][BC](k=BC,1 kstep), B=sV[bc][wcol+...]
-        float ag=salpha[g], ag8=salpha[g+8];
-        unsigned a0=*(unsigned*)&sP[g][2*t], a1=*(unsigned*)&sP[g+8][2*t];
-        unsigned a2=*(unsigned*)&sP[g][2*t+8], a3=*(unsigned*)&sP[g+8][2*t+8];
-        #pragma unroll
-        for (int nt=0; nt<NT; nt++) { int col0=wcol+nt*8;
-            acc[nt][0]*=ag; acc[nt][1]*=ag; acc[nt][2]*=ag8; acc[nt][3]*=ag8;
-            unsigned b0=fa_pkbf(sV[2*t][col0+g], sV[2*t+1][col0+g]);
-            unsigned b1=fa_pkbf(sV[2*t+8][col0+g], sV[2*t+9][col0+g]);
-            float c0=acc[nt][0],c1=acc[nt][1],c2=acc[nt][2],c3=acc[nt][3];
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
-              :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
-            acc[nt][0]=c0; acc[nt][1]=c1; acc[nt][2]=c2; acc[nt][3]=c3;
-        }
-        __syncthreads();
-    }
-    // write: warp 자기 col chunk. row g/g+8, col wcol+nt*8+2t(,+1). /sl
-    #pragma unroll
-    for (int nt=0; nt<NT; nt++) { int col0=wcol+nt*8;
-        int gq0=q0+g, gq1=q0+g+8;
-        if (gq0<Sq){ float li=1.0f/sl[g];     O[((size_t)gq0*NQ+h)*HD+col0+2*t]=acc[nt][0]*li; O[((size_t)gq0*NQ+h)*HD+col0+2*t+1]=acc[nt][1]*li; }
-        if (gq1<Sq){ float li=1.0f/sl[g+8];   O[((size_t)gq1*NQ+h)*HD+col0+2*t]=acc[nt][2]*li; O[((size_t)gq1*NQ+h)*HD+col0+2*t+1]=acc[nt][3]*li; }
-    }
-}
-template<int HD, int BC, int NW>
-static inline void launch_flash_attn2b_t(const float *Q, const float *Kc, const float *Vc, float *O,
-                                         int Sq, int NQ, int NKV, int base, cudaStream_t st) {
-    dim3 grid((Sq + 15) / 16, NQ);
-    flash_attn2b_kernel<HD, 16, BC, NW><<<grid, 32*NW, 0, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base);
 }
 
 // ── B: MMA(FA.2b.1) + KV split 2-패스 ─────────────────────────────────────────────────────────
@@ -374,7 +110,7 @@ static __global__ void flash_attn2bs_p2_kernel(const float *pm, const float *pl,
 static float *g_bs_m=nullptr, *g_bs_l=nullptr, *g_bs_acc=nullptr; static size_t g_bs_cap=0;
 template<int HD, int BC, int NW>
 static inline void launch_flash_attn2bs(const float *Q, const float *Kc, const float *Vc, float *O,
-                                        int Sq, int NQ, int NKV, int base, cudaStream_t st) {
+                                        int Sq, int NQ, int NKV, int base, cudaStream_t st = 0) {
     int maxlen = base + Sq, NS = (maxlen + FD_SPLIT_KV - 1)/FD_SPLIT_KV;
     size_t need = (size_t)Sq*NQ*NS;
     if (g_bs_cap < need) { if(g_bs_m)cudaFree(g_bs_m); if(g_bs_l)cudaFree(g_bs_l); if(g_bs_acc)cudaFree(g_bs_acc);
@@ -384,65 +120,17 @@ static inline void launch_flash_attn2bs(const float *Q, const float *Kc, const f
     flash_attn2bs_p2_kernel<HD><<<Sq*NQ, HD, 0, st>>>(g_bs_m,g_bs_l,g_bs_acc,O,Sq,NQ,NS);
 }
 
-// ── FA.2c: 2-패스 Flash-Decoding (KV 분할, decode 병렬성) ─────────────────────────────────────
-//   ncu: decode(Sq=1) grid 24 CTA, Waves 0.17(GPU 83% 놂). → KV를 NS split로 나눠 여러 CTA 병렬.
-//   패스1: split별 부분 online softmax(m_s, l_s, unnormalized acc_s=Σ exp(s-m_s)·V). 패스2: 결정적 결합.
-//   결정성: 2-패스(atomic 없음)라 race 없음. split=ceil(attendlen/SPLIT_KV) = attendlen만 의존(Sq 독립 — Sq 일관).
-//   FA.2c.0: decode Sq=1 정확성+GPU채움. (FD_SPLIT_KV는 헤더 상단 정의.)
-// 패스1: grid(NS, Sq·NQ), block=HD. CTA(split s, (query qi, head h)) → 부분 m/l/acc.
-//   ★ A-2 통일: Sq≥1 + causal. query qi 절대위치 base+qi → attendlen=base+qi+1(query별). split=f(attendlen)이라
-//   Sq 독립(단발==청크, verify==decode). prefill/decode/verify 단일 커널 = test_promote 깨질 수 없음.
-template<int HD>
-static __global__ void flash_decode_p1_kernel(const float *Q, const float *Kc, const float *Vc,
-                                              float *pm, float *pl, float *pacc, int Sq, int NQ, int NKV, int base, int NS) {
-    int s = blockIdx.x, qh = blockIdx.y, d = threadIdx.x;
-    int qi = qh / NQ, h = qh % NQ;
-    int GRP = NQ / NKV, kv = h / GRP;
-    int attendlen = base + qi + 1;                  // causal: query qi는 [0..base+qi] attend
-    int j0 = s * FD_SPLIT_KV, j1 = j0 + FD_SPLIT_KV; if (j1 > attendlen) j1 = attendlen;
-    int oi = qh * NS + s;
-    if (j0 >= attendlen) { if (d==0){ pm[oi]=-FLT_MAX; pl[oi]=0.f; } pacc[(size_t)oi*HD+d]=0.f; return; }
-    extern __shared__ float sfd[];                 // sq[HD] + sc[FD_SPLIT_KV]
-    float *sq = sfd, *sc = sfd + HD;
-    float scale = 1.0f/sqrtf((float)HD);
-    sq[d] = Q[((size_t)qi*NQ+h)*HD+d];
-    __syncthreads();
-    for (int j = j0+d; j < j1; j += HD) {           // thread d = key index(strided), 각 full dot
-        const float *kp = Kc + (size_t)(j*NKV+kv)*HD;
-        float dot=0.f; for (int t=0;t<HD;t++) dot += sq[t]*kp[t];
-        sc[j-j0] = dot*scale;
+static inline void launch_flash_attn(const float *Q, const float *Kc, const float *Vc, float *O,
+                                     int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
+    // ★ B: MMA 단일 커널 + KV split(split=f(attendlen), Sq·split 독립 → 완전 일관). prefill split=1(FA.2b.1
+    //   멀티워프 MMA, 빠름) + decode split>1(MMA + KV 분할, GPU 채움). 검증된 두 조각(FA.2b.1 + flash_decode 2-패스) 결합.
+    if      (HD == 256) launch_flash_attn2bs<256, 16, 8>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+    else if (HD == 128) launch_flash_attn2bs<128, 16, 8>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+    else {
+        fprintf(stderr, "[flash_attn] 미지원 head_dim=%d (128/256만). 조용한 오답 대신 중단합니다.\n", HD);
+        abort();
     }
-    __syncthreads();
-    __shared__ float s_m, s_l;
-    if (d==0) { int n=j1-j0; float m=-FLT_MAX; for(int j=0;j<n;j++)m=fmaxf(m,sc[j]);
-        float l=0.f; for(int j=0;j<n;j++){ sc[j]=expf(sc[j]-m); l+=sc[j]; } s_m=m; s_l=l; }
-    __syncthreads();
-    float acc=0.f; for (int j=j0;j<j1;j++) acc += sc[j-j0]*Vc[(size_t)(j*NKV+kv)*HD+d];  // unnormalized
-    pacc[(size_t)oi*HD+d]=acc;
-    if (d==0) { pm[oi]=s_m; pl[oi]=s_l; }
 }
-// 패스2: grid(Sq·NQ), block=HD. split들 (m,l,acc) 결정적 결합 → O[qi][h][d].
-template<int HD>
-static __global__ void flash_decode_p2_kernel(const float *pm, const float *pl, const float *pacc,
-                                              float *O, int Sq, int NQ, int NS) {
-    int qh = blockIdx.x, d = threadIdx.x;
-    float mg=-FLT_MAX; for (int s=0;s<NS;s++) mg=fmaxf(mg, pm[qh*NS+s]);
-    float lg=0.f, acc=0.f;
-    for (int s=0;s<NS;s++){ float w=expf(pm[qh*NS+s]-mg); lg+=pl[qh*NS+s]*w; acc+=pacc[(size_t)(qh*NS+s)*HD+d]*w; }
-    O[(size_t)qh*HD+d] = acc/lg;                     // qh = qi*NQ+h → O[(qi*NQ+h)*HD+d]
-}
-// 통일 진입(prefill/decode/verify). NS=ceil((base+Sq)/SPLIT_KV) = max attendlen 기준(Sq 독립). 중간버퍼 static.
-static float *g_fd_m=nullptr, *g_fd_l=nullptr, *g_fd_acc=nullptr; static size_t g_fd_cap=0;
-template<int HD>
-static inline void launch_flash_decode(const float *Q, const float *Kc, const float *Vc, float *O,
-                                       int Sq, int NQ, int NKV, int base, cudaStream_t st) {
-    int maxlen = base + Sq, NS = (maxlen + FD_SPLIT_KV - 1)/FD_SPLIT_KV;
-    size_t need = (size_t)Sq*NQ*NS;
-    if (g_fd_cap < need) { if(g_fd_m)cudaFree(g_fd_m); if(g_fd_l)cudaFree(g_fd_l); if(g_fd_acc)cudaFree(g_fd_acc);
-        cudaMalloc(&g_fd_m,need*4); cudaMalloc(&g_fd_l,need*4); cudaMalloc(&g_fd_acc,need*HD*4); g_fd_cap=need; }
-    size_t sh = ((size_t)HD + FD_SPLIT_KV)*sizeof(float);
-    flash_decode_p1_kernel<HD><<<dim3(NS,Sq*NQ), HD, sh, st>>>(Q,Kc,Vc,g_fd_m,g_fd_l,g_fd_acc,Sq,NQ,NKV,base,NS);
-    flash_decode_p2_kernel<HD><<<Sq*NQ, HD, 0, st>>>(g_fd_m,g_fd_l,g_fd_acc,O,Sq,NQ,NS);
-}
+
 
 #endif // DGX_ATTENTION_FLASH_CUH

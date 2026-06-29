@@ -7,6 +7,13 @@ build/
 /tests/test_*
 !/tests/*.cu
 !/tests/*.cuh
+# compiled tool binaries (no extension, produced by nvcc) — *.cu 소스만 추적
+/tools/bench
+/tools/memdiag
+/tools/ncu_*
+/tools/prefill_prof
+!/tools/*.cu
+!/tools/*.cuh
 
 # Weight dumps / quantized blobs / goldens — never commit big binaries
 *.bin
