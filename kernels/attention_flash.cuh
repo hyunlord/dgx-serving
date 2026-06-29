@@ -4,6 +4,7 @@
 #include <math.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda_bf16.h>
 
 // ── attention 커널 landscape (왜 여러 개인가 — mm() 복붙이 조용히 갈라진 교훈, 명시 기록) ──────────
 //   1) launch_attn (attention.cuh)            — 레퍼런스 forward(qwen35.cu/smollm3.cu). golden 생성용.
@@ -94,6 +95,86 @@ static inline void launch_flash_attn(const float *Q, const float *Kc, const floa
             "확장 시 launch_flash_attn에 인스턴스 추가. 조용한 오답 대신 중단합니다.\n", HD);
         abort();
     }
+}
+
+// ── FA.2: bf16 tensor-core FlashAttention (m16n8k16) ─────────────────────────────────────────
+//   FA.1a(software) 교체용. S=Q·Kᵀ / O=P·V를 bf16 MMA, online softmax는 shared-왕복(warp-분산 회피, 정확성먼저).
+//   fp32 누적 전부(S/acc/running m,l) — vLLM FP8 FA 긴-context 붕괴(누적 부정확) 회피. CTA=1 warp=(쿼리타일 BR, head h).
+//   BR=16(MMA m-tile), BC=16(k-step 1). HD 템플릿. GQA kv=h/(NQ/NKV). causal는 행별 qpos 마스크.
+__device__ __forceinline__ unsigned fa_pkbf(const __nv_bfloat16 &x, const __nv_bfloat16 &y){
+    return (unsigned)(*(const unsigned short*)&x) | ((unsigned)(*(const unsigned short*)&y) << 16);
+}
+template<int HD, int BR, int BC>
+static __global__ void flash_attn2_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
+                                          int Sq, int NQ, int NKV, int base) {
+    int q0 = blockIdx.x * BR, h = blockIdx.y;
+    int GRP = NQ / NKV, kv = h / GRP;
+    int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    float scale = 1.0f / sqrtf((float)HD);
+    __shared__ __nv_bfloat16 sQ[BR][HD], sK[BC][HD], sV[BC][HD], sP[BR][BC];
+    __shared__ float sS[BR][BC], sAcc[BR][HD], sm[BR], sl[BR];
+
+    for (int i = lane; i < BR*HD; i += 32) { int r=i/HD,c=i%HD,gq=q0+r;
+        sQ[r][c] = (gq<Sq) ? __float2bfloat16(Q[((size_t)gq*NQ+h)*HD+c]) : (__nv_bfloat16)0; sAcc[r][c]=0.f; }
+    for (int i = lane; i < BR; i += 32) { sm[i]=-FLT_MAX; sl[i]=0.f; }
+    __syncwarp();
+
+    int qend = (q0+BR < Sq) ? q0+BR : Sq;   // 타일 내 실제 query 끝 (부분타일 KV OOB 방지)
+    int maxlen = base + qend;                // 최대 attendlen (행별 마스크로 causal). ≤ base+Sq = KV 길이
+    for (int j0 = 0; j0 < maxlen; j0 += BC) {
+        for (int i = lane; i < BC*HD; i += 32) { int r=i/HD,c=i%HD,gk=j0+r;
+            bool v = gk < maxlen;
+            sK[r][c] = v ? __float2bfloat16(Kc[((size_t)gk*NKV+kv)*HD+c]) : (__nv_bfloat16)0;
+            sV[r][c] = v ? __float2bfloat16(Vc[((size_t)gk*NKV+kv)*HD+c]) : (__nv_bfloat16)0; }
+        __syncwarp();
+        // S = Q·Kᵀ (bf16 MMA, FA.2.0 레이아웃). n-타일 BC/8, k-스텝 HD/16.
+        #pragma unroll
+        for (int ns=0; ns<BC/8; ns++) {
+            float c0=0,c1=0,c2=0,c3=0;
+            for (int ks=0; ks<HD; ks+=16) {
+                unsigned a0=*(unsigned*)&sQ[g][ks+2*t], a1=*(unsigned*)&sQ[g+8][ks+2*t];
+                unsigned a2=*(unsigned*)&sQ[g][ks+2*t+8], a3=*(unsigned*)&sQ[g+8][ks+2*t+8];
+                unsigned b0=*(unsigned*)&sK[ns*8+g][ks+2*t], b1=*(unsigned*)&sK[ns*8+g][ks+2*t+8];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                  :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+            }
+            sS[g][ns*8+2*t]=c0*scale; sS[g][ns*8+2*t+1]=c1*scale; sS[g+8][ns*8+2*t]=c2*scale; sS[g+8][ns*8+2*t+1]=c3*scale;
+        }
+        __syncwarp();
+        // online softmax (shared-왕복, 행별. 모든 fp32). lane<BR이 행 담당.
+        if (lane < BR) { int r=lane, gq=q0+r, qpos=base+gq;
+            if (gq < Sq) {
+                float tm=-FLT_MAX;
+                for (int j=0;j<BC;j++){ int gk=j0+j; float s=(gk<=qpos)?sS[r][j]:-FLT_MAX; sS[r][j]=s; tm=fmaxf(tm,s); }
+                float mnew=fmaxf(sm[r],tm), alpha=expf(sm[r]-mnew), tl=0.f;
+                for (int j=0;j<BC;j++){ float p=expf(sS[r][j]-mnew); sP[r][j]=__float2bfloat16(p); tl+=p; }
+                sl[r]=sl[r]*alpha+tl; sm[r]=mnew;
+                for (int c=0;c<HD;c++) sAcc[r][c]*=alpha;
+            } else for (int j=0;j<BC;j++) sP[r][j]=(__nv_bfloat16)0;
+        }
+        __syncwarp();
+        // O += P·V (bf16 MMA, FA.2.1 레이아웃). BC=16=k-step 1. n-타일 HD/8.
+        #pragma unroll
+        for (int n0=0;n0<HD;n0+=8) {
+            unsigned a0=*(unsigned*)&sP[g][2*t], a1=*(unsigned*)&sP[g+8][2*t];
+            unsigned a2=*(unsigned*)&sP[g][2*t+8], a3=*(unsigned*)&sP[g+8][2*t+8];
+            unsigned b0=fa_pkbf(sV[2*t][n0+g], sV[2*t+1][n0+g]);
+            unsigned b1=fa_pkbf(sV[2*t+8][n0+g], sV[2*t+9][n0+g]);
+            float c0=0,c1=0,c2=0,c3=0;
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+              :"+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+            sAcc[g][n0+2*t]+=c0; sAcc[g][n0+2*t+1]+=c1; sAcc[g+8][n0+2*t]+=c2; sAcc[g+8][n0+2*t+1]+=c3;
+        }
+        __syncwarp();
+    }
+    if (lane < BR) { int r=lane, gq=q0+r;
+        if (gq < Sq) { float li=1.0f/sl[r]; for (int c=0;c<HD;c++) O[((size_t)gq*NQ+h)*HD+c]=sAcc[r][c]*li; } }
+}
+template<int HD, int BC>
+static inline void launch_flash_attn2_t(const float *Q, const float *Kc, const float *Vc, float *O,
+                                        int Sq, int NQ, int NKV, int base, cudaStream_t st = 0) {
+    dim3 grid((Sq + 15) / 16, NQ);    // BR=16
+    flash_attn2_kernel<HD, 16, BC><<<grid, 32, 0, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base);
 }
 
 #endif // DGX_ATTENTION_FLASH_CUH
