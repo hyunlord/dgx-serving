@@ -192,6 +192,102 @@ static inline void launch_gdn_step(const float *Q, const float *K, const float *
     gdn_step_kernel<<<NH, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Ssnap, O, Sq, NH, D, NHk, snapshot_all);
 }
 
+// ---- STEP 1 de-risk: q/k l2norm 사전계산(state-무관 → recurrence 밖 병렬, in-loop block_reduce 제거) ----
+//   Q/K: [rows, D] (rows=S*NHk). Qn=q·rsqrt(Σq²+eps)·1/√D, Kn=k·rsqrt(Σk²+eps). block=D, grid=rows.
+static __global__ void gdn_qk_norm_kernel(const float *Q, const float *K, float *Qn, float *Kn, int D) {
+    int row = blockIdx.x, k = threadIdx.x; if (k >= D) return;
+    extern __shared__ float r[];
+    float qe = Q[(size_t)row * D + k], ke = K[(size_t)row * D + k];
+    float sq = block_reduce_sum(qe * qe, r);
+    float sk = block_reduce_sum(ke * ke, r);
+    Qn[(size_t)row * D + k] = qe * rsqrtf(sq + 1e-6f) * rsqrtf((float)D);
+    Kn[(size_t)row * D + k] = ke * rsqrtf(sk + 1e-6f);
+}
+static inline void launch_gdn_qk_norm(const float *Q, const float *K, float *Qn, float *Kn,
+                                      int rows, int D, cudaStream_t st = 0) {
+    gdn_qk_norm_kernel<<<rows, D, 32 * sizeof(float), st>>>(Q, K, Qn, Kn, D);
+}
+// prenorm 버전 gdn_step: Qn/Kn(사전정규화) 입력 → in-loop block_reduce 제거. recurrence(t순차) 동일 → Sq일관·오차0 보존.
+static __global__ void gdn_step_prenorm_kernel(const float *Qn, const float *Kn, const float *V,
+                                const float *G, const float *Bt, const float *Sin, float *Ssnap, float *O,
+                                int Sq, int NH, int D, int NHk, int snapshot_all) {
+    int h = blockIdx.x, v = threadIdx.x; if (v >= D) return;
+    int g = h * NHk / NH;
+    extern __shared__ float sh[]; float *qs = sh, *ks = sh + D;
+    float scol[128];
+    for (int k = 0; k < D; k++) scol[k] = Sin ? Sin[((size_t)h * D + k) * D + v] : 0.f;
+    for (int t = 0; t < Sq; t++) {
+        size_t base = ((size_t)t * NH + h) * D, base_qk = ((size_t)t * NHk + g) * D;
+        qs[v] = Qn[base_qk + v]; ks[v] = Kn[base_qk + v];
+        __syncthreads();
+        float g_t = expf(G[(size_t)t * NH + h]), beta_t = Bt[(size_t)t * NH + h];
+        float kv = 0.f;
+        #pragma unroll 4
+        for (int k = 0; k < D; k++) { scol[k] *= g_t; kv += scol[k] * ks[k]; }
+        float delta = (V[base + v] - kv) * beta_t, out = 0.f;
+        #pragma unroll 4
+        for (int k = 0; k < D; k++) { scol[k] += ks[k] * delta; out += scol[k] * qs[k]; }
+        O[base + v] = out;
+        if (snapshot_all || t == Sq - 1) {
+            size_t slot = snapshot_all ? (size_t)t : 0;
+            float *snap = Ssnap + slot * NH * D * D + (size_t)h * D * D;
+            for (int k = 0; k < D; k++) snap[(size_t)k * D + v] = scol[k];
+        }
+        __syncthreads();
+    }
+}
+static inline void launch_gdn_step_prenorm(const float *Qn, const float *Kn, const float *V,
+                                   const float *G, const float *Bt, const float *Sin,
+                                   float *Ssnap, float *O, int Sq, int NH, int D, int NHk,
+                                   int snapshot_all = 1, cudaStream_t st = 0) {
+    gdn_step_prenorm_kernel<<<NH, D, (size_t)2 * D * sizeof(float), st>>>(Qn, Kn, V, G, Bt, Sin, Ssnap, O, Sq, NH, D, NHk, snapshot_all);
+}
+
+// k-split: block=D*KSPLIT, k-차원을 KSPLIT warp-그룹이 분할(thread=(v,grp), scol[D/KSPLIT]). occupancy↑(8%→KSPLIT×)로
+//   k-loop shared-read stall 은닉. recurrence(t순차) 동일·부분합 결합 → 오차0·Sq일관. D는 2의 거듭제곱(=128). Qn/Kn 사전정규화.
+template<int D, int KSPLIT>
+static __global__ void __launch_bounds__(D*KSPLIT, 1) gdn_step_ksplit_kernel(
+        const float *Qn, const float *Kn, const float *V, const float *G, const float *Bt,
+        const float *Sin, float *Ssnap, float *O, int Sq, int NH, int NHk, int snapshot_all) {
+    constexpr int KL = D / KSPLIT;
+    int h = blockIdx.x, tid = threadIdx.x, v = tid & (D-1), grp = tid / D, kb = grp*KL, gq = h*NHk/NH;
+    extern __shared__ float sh[]; float *qs = sh, *ks = sh + D, *part = sh + 2*D;  // qs[D],ks[D],part[KSPLIT*D]
+    float scol[KL];
+    #pragma unroll
+    for (int j=0;j<KL;j++) scol[j] = Sin ? Sin[((size_t)h*D + (kb+j))*D + v] : 0.f;
+    for (int t=0;t<Sq;t++) {
+        size_t base = ((size_t)t*NH+h)*D, base_qk = ((size_t)t*NHk+gq)*D;
+        if (grp==0) { qs[v]=Qn[base_qk+v]; ks[v]=Kn[base_qk+v]; }
+        __syncthreads();
+        float g_t=expf(G[(size_t)t*NH+h]), beta_t=Bt[(size_t)t*NH+h];
+        float kvp=0.f;
+        #pragma unroll
+        for (int j=0;j<KL;j++){ scol[j]*=g_t; kvp+=scol[j]*ks[kb+j]; }
+        part[grp*D+v]=kvp; __syncthreads();
+        float kv=0.f;
+        #pragma unroll
+        for (int gg=0;gg<KSPLIT;gg++) kv+=part[gg*D+v];
+        float delta=(V[base+v]-kv)*beta_t, outp=0.f;
+        #pragma unroll
+        for (int j=0;j<KL;j++){ scol[j]+=ks[kb+j]*delta; outp+=scol[j]*qs[kb+j]; }
+        __syncthreads();                       // part 재사용 전 (kv read 완료)
+        part[grp*D+v]=outp; __syncthreads();
+        if (grp==0){ float o=0.f; for(int gg=0;gg<KSPLIT;gg++) o+=part[gg*D+v]; O[base+v]=o; }
+        if (snapshot_all || t==Sq-1){ size_t slot=snapshot_all?(size_t)t:0; float*snap=Ssnap+slot*NH*D*D+(size_t)h*D*D;
+            #pragma unroll
+            for (int j=0;j<KL;j++) snap[(size_t)(kb+j)*D+v]=scol[j]; }
+        __syncthreads();
+    }
+}
+template<int D, int KSPLIT>
+static inline void launch_gdn_step_ksplit(const float *Qn, const float *Kn, const float *V,
+                                   const float *G, const float *Bt, const float *Sin,
+                                   float *Ssnap, float *O, int Sq, int NH, int NHk,
+                                   int snapshot_all = 1, cudaStream_t st = 0) {
+    size_t shmem = (size_t)(2*D + KSPLIT*D) * sizeof(float);
+    gdn_step_ksplit_kernel<D,KSPLIT><<<NH, D*KSPLIT, shmem, st>>>(Qn,Kn,V,G,Bt,Sin,Ssnap,O,Sq,NH,NHk,snapshot_all);
+}
+
 // ---- batch decode GDN step (챕터3): B 독립 시퀀스, 각 1스텝(행 간 recurrence 없음 — 병렬) ----
 //   Q,K,V,O: [B, NH, D]. G,Bt: [B, NH]. Sin/Sout: [B, NH, D, D] (시퀀스별 committed state). 1 step씩.
 //   grid(NH, B): 블록(h,b)가 시퀀스 b·head h의 1스텝. Sout = 갱신된 state(commit). (snapshot 불요 — plain decode.)

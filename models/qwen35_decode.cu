@@ -168,7 +168,11 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             launch_gemv_f32(norm,L.in_a,ab,H,nvh,Sq); launch_gemv_f32(norm,L.in_b,bb,H,nvh,Sq);
             launch_gdn_decay_beta(ab,bb,L.A_log,L.dt_bias,gg,beta,Sq,nvh);
             // gdn_step from committed S, Sq steps, snapshot
-            launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv, c.gdn_num_k_heads, va?1:0);
+            if (hv==128) {  // STEP1 GDN k-split(8.75×): qk l2norm in-place(안전,자기원소) + occupancy↑ ksplit. Sq일관 보존(결합순서 Sq-무관)
+                launch_gdn_qk_norm(qg2,kg2,qg2,kg2, Sq*c.gdn_num_k_heads, hv);
+                launch_gdn_step_ksplit<128,2>(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, c.gdn_num_k_heads, va?1:0);
+            } else
+            launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv, c.gdn_num_k_heads, va?1:0);  // fallback(D≠128)
             if (!commit && va) {  // verify: per-step GDN snapshot + conv mixed → va (승격용)
                 size_t ssz=(size_t)nvh*hv*hv;
                 for(int t=0;t<Sq;t++)
