@@ -1,0 +1,57 @@
+# 챕터7 STEP 0 (FA 근본 재구조) — prefill occupancy 벽 넘어 llama 추월
+
+> B로 prefill 24×→3.4×(240 t/s) / decode 6.7×→1.6×(7.4) 좁힘. 추월(llama prefill 806)엔 근본 재구조 필요.
+> 측정이 "현 구조 천장 = occupancy 50%, 미세조정 다 기각" 확정 → 근본 재구조를 제대로 설계해서 추월(포기 아님).
+
+## 0. 측정 입력 (FA.2b.2 — 추측 아닌 확정)
+
+**occupancy 50% = Block Limit Shared(3) AND Reg(3) 동시 제한** (ncu, prefill Sq=256):
+- Static Shared **26.3KB/block** (sQ[16][256]+sK[16][256]+sV[16][256] bf16 = **24KB 본질** + sP/sS/sm/sl).
+  SM shared 102KB → 102/26.3 ≈ 3 CTA.
+- **Registers 72/thread** × 256 = 18.4K/block. SM 64K reg → 3 CTA. (acc[4][4]=16 필수 + fragment/temp ~56.)
+- Block Limit Warps 6. → occupancy = min(Shared 3, Reg 3, Warp 6)×8 warp = 24/48 = **50%**.
+
+**미세조정 다 측정 기각 (단일 자원만 줄이면 다른 게 묶음):**
+| 시도 | 결과 | 이유 |
+|---|---|---|
+| warp 협력 S k-분담(+8KB) | occupancy 49→32%, 2.60→4.63ms | shared↑ → Block Limit Shared 3→2 |
+| cp.async | 스킵 | KV fp32→bf16 변환 위해 fp32 shared 2배 → occupancy↓ |
+| NW 8→16 | occupancy 50→33%, dur 6.11ms | CTA당 thread 2배 → reg total 2배 → Block Limit 1 |
+| NW 8→4 | 2.62 vs 2.60ms 미미 | warp0 단독 S가 NW 무관 sibling |
+
+→ **shared(24KB) AND reg(72) 동시 감축**해야 occupancy↑. 단일 미세조정 불가 = 근본 재구조 확정.
+(stall 73.7% = warp0 단독 S sibling 35.2% + shared 적재 38.5%도 occupancy 낮아 은닉 안 됨 → occupancy↑가 근본.)
+
+## 1. 근본 재구조 후보 (architect 평가 + 측정 종합)
+
+shared 24KB(sQ/sK/sV) + reg 72 동시 감축 방향:
+
+| 후보 | shared 효과 | reg 효과 | 트레이드 | 비고 |
+|---|---|---|---|---|
+| **(a) KV bf16 글로벌 저장** | 동일(bf16) | — | 엔진 변경(decode_state KV fp32→bf16) | **cp.async 직접 가능**(변환 제거) → shared 적재 38.5% stall 은닉. 변환 reg/temp↓도. |
+| (b) sQ register-resident | −8KB(18KB) | +8 reg | shared↓ ↔ reg↑(상충) | Q[16][256]/256thread=16 bf16=8 reg. occupancy min(shared,reg)라 효과 의문 |
+| (c) 작은 타일(BR/BC↓ or HD 2-pass) | ↓ | ↓(acc↓) | tensor-core 효율↓ | shared+reg 둘 다↓ 가능, 단 MMA util |
+| (d) warp-specialization(producer/consumer) | — | — | 복잡(CUTLASS-style) | 적재 warp / compute warp 분리 → stall 은닉 |
+| (e) fragment/temp reg 정리 | — | reg 72→? | — | acc 16 외 56 temp 줄이면 Block Limit Reg↑ |
+
+**우선순위 확정 (측정+산수+de-risk 기반):**
+- **1순위 (a) KV bf16 글로벌 + cp.async** — bf16 cp.async de-risk OK(변환 없이 byte 복사 확인). occupancy 50% 유지하나 **shared 적재 38.5% stall 은닉** + **KV 메모리 절반**(긴 context bonus). 엔진 변경(decode_state KV fp32→bf16 + 저장 시 변환). **단 sibling 35.2%(warp0 S)는 안 풀림 → 부분 개선**(prefill 240→~300 추정, 추월 806엔 부족).
+- **2순위 (c) 작은 타일/HD 2-pass** — occupancy↑(shared+reg 동시↓ → sibling 35.2% 은닉). 단 S=Q·Kᵀ가 HD-contract라 HD 분할이 부분합 복잡(k-분담 유사) + MMA 효율↓. occupancy 50→높이는 근본.
+- **기각**: (b) sQ register화(reg가 묶어 occupancy 무변, 산수), (e) reg temp 정리(shared 3이 묶음).
+
+**정직한 한계**: 추월(3.4×)은 cp.async(38.5%) + occupancy↑(35.2%) **둘 다** 필요 + α. 단일 후보론 부분. 단계적 큰 작업이고 **추월 보장 불확실**(occupancy↑가 MMA 효율↓ 상쇄할 수도). architect 결론 전달 실패(plain-text만) — 측정으로 진행.
+
+## 2. 검증 (헌법 — 재구조라도 불변)
+- **정확성 오차0**: CPU naive == rel<1e-2(bf16). 다중 split + GQA + 긴 KV(vLLM 함정).
+- **결정성**: N회 bitwise(2-패스 race 없음 유지).
+- **Sq·split 일관**: B 단일 커널 정신 유지(단발==청크, verify==decode, test_promote/chunk). 재구조가 이걸 깨면 안 됨.
+- **직교성**: q4·W4A8 둘 다.
+- **ncu**: occupancy 50%→? Block Limit Shared/Reg 동시 확인. prefill t/s(240→? vs llama 806).
+
+## 3. 안전·단계
+- 검증 베이스 = B(8972608). 재구조는 별도 커널/단계, B 롤백 가능.
+- 작은 타일/Sq부터, occupancy 측정하며. GB10 메모리 가드.
+- 큰 작업 단계적 — 후보 1개씩 측정(occupancy↑ 확인 후 다음).
+
+---
+*측정(occupancy 50% = shared+reg 동시) → architect 방향 → 후보 우선순위 → 단계 구현(각 occupancy/정확성/일관 검증) → prefill 추월. "다음 챕터" 미룸 아니라 지금 설계.*
