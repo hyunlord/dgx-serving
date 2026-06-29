@@ -86,10 +86,14 @@ static inline void launch_flash_attn_t(const float *Q, const float *Kc, const fl
 
 // 엔진용 기본 진입. head_dim별 인스턴스(BC는 shared<48KB 유지): HD256→BC16(33KB), HD128→BC32(33KB).
 //   ⚠ 미지원 HD는 abort(조용한 return 금지 — 그게 0.8B/27B head_dim=256을 놓친 버그였음).
+template<int HD, int BC>   // FA.2 런처 forward 선언 (정의는 파일 하단, 기본인자는 여기만)
+static inline void launch_flash_attn2_t(const float *Q, const float *Kc, const float *Vc, float *O,
+                                        int Sq, int NQ, int NKV, int base, cudaStream_t st = 0);
 static inline void launch_flash_attn(const float *Q, const float *Kc, const float *Vc, float *O,
                                      int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
-    if      (HD == 256) launch_flash_attn_t<256, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
-    else if (HD == 128) launch_flash_attn_t<128, 32>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+    // FA.2(bf16 tensor-core)가 FA.1a(software) 교체. BC=16(P·V 1 k-step). 미지원 HD는 abort(조용한 오답 방지).
+    if      (HD == 256) launch_flash_attn2_t<256, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+    else if (HD == 128) launch_flash_attn2_t<128, 16>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
     else {
         fprintf(stderr, "[flash_attn] 미지원 head_dim=%d (128/256만 인스턴스됨). "
             "확장 시 launch_flash_attn에 인스턴스 추가. 조용한 오답 대신 중단합니다.\n", HD);
@@ -172,7 +176,7 @@ static __global__ void flash_attn2_kernel(const float *Q, const float *Kc, const
 }
 template<int HD, int BC>
 static inline void launch_flash_attn2_t(const float *Q, const float *Kc, const float *Vc, float *O,
-                                        int Sq, int NQ, int NKV, int base, cudaStream_t st = 0) {
+                                        int Sq, int NQ, int NKV, int base, cudaStream_t st) {
     dim3 grid((Sq + 15) / 16, NQ);    // BR=16
     flash_attn2_kernel<HD, 16, BC><<<grid, 32, 0, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base);
 }

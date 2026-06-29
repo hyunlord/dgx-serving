@@ -54,15 +54,19 @@ int main(int argc,char**argv){
     printf("[decode] n_past after %d steps = %d\n",S,st.n_past);
 
     double el=mae(dec_log,prefill_log), ep=mae(dec_pn,prefill_pn);
-    printf("\n=== incremental decode vs prefill ===\n  logits   max abs err = %.3e\n  pre-norm max abs err = %.3e\n",el,ep);
-    // argmax 일치도
+    // 기준: decode=FA.2(bf16 tensor-core), prefill ref=qwen35_forward(fp32 launch_attn). bf16-vs-fp32라 max-abs는
+    //   bf16 정밀도(~4e-2, 모델 dtype). 올바른 척도 = argmax/next-token(생성) + MEAN-rel(계통오차, test_27b 방식).
+    double sa=0,sr=0; for(size_t i=0;i<dec_log.size();i++){sa+=fabs((double)dec_log[i]-prefill_log[i]);sr+=fabs((double)prefill_log[i]);}
+    double mrel=sa/(sr>0?sr:1);
+    printf("\n=== incremental decode(FA.2 bf16) vs prefill(fp32 ref) ===\n  logits max-abs=%.3e MEAN-rel=%.3e (bf16)\n  pre-norm max-abs=%.3e\n",el,mrel,ep);
     auto am=[&](const std::vector<float>&lg,int p){int b=0;float bv=lg[(size_t)p*V];for(int j=1;j<V;j++){float z=lg[(size_t)p*V+j];if(z>bv){bv=z;b=j;}}return b;};
     bool amok=true; for(int p=0;p<S;p++) if(am(dec_log,p)!=am(prefill_log,p)) amok=false;
     printf("  argmax per pos: %s\n", amok?"ALL match":"MISMATCH");
 
     free_decode_state(st); free_weights_qwen(w); free_config_qwen(c);
     cudaFree(d_ids);cudaFree(d_cos);cudaFree(d_sin);cudaFree(pl);cudaFree(ppn);cudaFree(dl);cudaFree(dpn);
-    bool pass=(el<1e-2)&&(ep<1e-2)&&amok;
-    printf("\n[test_decode] %s\n",pass?"PASS":"FAIL");
+    // argmax 전부 일치(생성 동일) + logit MEAN-rel<3e-3(bf16 계통오차) + pre-norm mean. max-abs는 bf16라 비척도.
+    bool pass=amok && (mrel<3e-3) && (ep<2e-2);
+    printf("\n[test_decode] %s (bf16 attn: argmax+MEAN-rel 기준)\n",pass?"PASS":"FAIL");
     return pass?0:1;
 }

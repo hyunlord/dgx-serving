@@ -10,6 +10,7 @@
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
+#include "../kernels/attention_flash.cuh"  // FA.2: batch도 single과 같은 attention(정밀도 일치)
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
 #include "../kernels/gdn.cuh"
@@ -99,7 +100,10 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             // 각 시퀀스 b: K[b]/V[b]를 cache[b]의 위치 base에 append (시퀀스별 stride)
             BK(cudaMemcpy2D(st.Kc[l]+(size_t)base*kvdim, kvstride*4, kn, kvdim*4, kvdim*4, B, cudaMemcpyDeviceToDevice));
             BK(cudaMemcpy2D(st.Vc[l]+(size_t)base*kvdim, kvstride*4, vb, kvdim*4, kvdim*4, B, cudaMemcpyDeviceToDevice));
-            launch_attn_decode_batch(qn, st.Kc[l], st.Vc[l], attn, B, NQ, NKV, HD, base, kvstride);
+            // FA.2 통일: 시퀀스별 KV(kvstride 간격)에 FA.2(single과 동일 attention). decode Sq=1.
+            for (int b=0; b<B; b++)
+                launch_flash_attn(qn+(size_t)b*qdim, st.Kc[l]+(size_t)b*kvstride, st.Vc[l]+(size_t)b*kvstride,
+                                  attn+(size_t)b*qdim, 1, NQ, NKV, HD, base);
             launch_gate_sigmoid(attn, gate, (int)((size_t)B*qdim));
             mmb(L.o,attn,ob,qdim,H); launch_add(after,x,ob,(int)BH);
         } else {
