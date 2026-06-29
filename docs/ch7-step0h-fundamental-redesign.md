@@ -48,6 +48,21 @@ shared 24KB(sQ/sK/sV) + reg 72 동시 감축 방향:
 - **직교성**: q4·W4A8 둘 다.
 - **ncu**: occupancy 50%→? Block Limit Shared/Reg 동시 확인. prefill t/s(240→? vs llama 806).
 
+## 2b. 1순위 구현 단계 (KV bf16 → cp.async)
+
+**단계 1 — KV bf16 (정확성 베이스, cp.async 전):** decode_state Kc/Vc fp32→bf16, 저장 시 f32→bf16 변환커널,
+flash_attn2bs Kc/Vc bf16 입력(sK/sV 적재 변환 제거). 효과: KV 메모리 절반(독립 가치) + cp.async 전제.
+검증: make test + test_fa2bs rel<1e-2 + Sq·split 일관 + KV 메모리 확인. (진행 중.)
+
+**단계 2 — cp.async 더블버퍼 (shared 적재 38.5% stall 은닉):** KV가 bf16라 변환 없이 cp.async 가능(de-risk OK).
+- flash_attn2bs_p1의 split 구간 KV 타일(BC=16) 순회를 2-stage 더블버퍼: 다음 BC 타일 prefetch ↔ 현재 MMA.
+- **★ canonical 순서(Phase C race 교훈 [[w4a8-chunk-prefill-divergence]]): wait_group→sync→prefetch→compute.**
+  prefetch-먼저(Phase C 초기 버그)는 race — 정식 순서 재사용.
+- bf16 cp.async = 16byte(8 bf16) 청크. bounds(gk≥maxlen) predicated zero-fill.
+- 검증: 오차0 + **결정성 가드 필수**(cp.async race — 단발 테스트가 flaky race 못 잡음, N회 bitwise) + ncu(shared 적재
+  stall 38.5%↓, occupancy 50% 유지하나 stall 은닉으로 prefill↑) + prefill t/s(240→?).
+- 한계: sibling 35.2%(warp0 S)는 안 풀림 → 부분. occupancy↑(작은 타일, 2순위)가 그 다음.
+
 ## 3. 안전·단계
 - 검증 베이스 = B(8972608). 재구조는 별도 커널/단계, B 롤백 가능.
 - 작은 타일/Sq부터, occupancy 측정하며. GB10 메모리 가드.

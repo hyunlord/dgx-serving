@@ -11,13 +11,14 @@
 #include "../kernels/attention_flash.cuh"
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 static float frand(unsigned&s){s=s*1664525u+1013904223u;return ((s>>8)&0xFFFFFF)/8388608.0f-1.0f;}
-static void cpu_attn(const std::vector<float>&Q,const std::vector<float>&Kc,const std::vector<float>&Vc,
+// KV는 bf16 저장(엔진 변경 반영). CPU 레퍼런스는 bf16 KV를 float로 읽어(=__bfloat162float) 계산.
+static void cpu_attn(const std::vector<float>&Q,const std::vector<__nv_bfloat16>&Kc,const std::vector<__nv_bfloat16>&Vc,
                      std::vector<float>&O,int Sq,int NQ,int NKV,int HD,int base){
     int GRP=NQ/NKV; double scale=1.0/sqrt((double)HD);
     for(int i=0;i<Sq;i++)for(int h=0;h<NQ;h++){int kv=h/GRP,al=base+i+1;std::vector<double>s(al);
-        for(int j=0;j<al;j++){double d=0;for(int t=0;t<HD;t++)d+=(double)Q[((size_t)i*NQ+h)*HD+t]*Kc[((size_t)j*NKV+kv)*HD+t];s[j]=d*scale;}
+        for(int j=0;j<al;j++){double d=0;for(int t=0;t<HD;t++)d+=(double)Q[((size_t)i*NQ+h)*HD+t]*__bfloat162float(Kc[((size_t)j*NKV+kv)*HD+t]);s[j]=d*scale;}
         double m=-1e300;for(double v:s)m=fmax(m,v);double sm=0;for(int j=0;j<al;j++){s[j]=exp(s[j]-m);sm+=s[j];}
-        for(int t=0;t<HD;t++){double a=0;for(int j=0;j<al;j++)a+=s[j]*Vc[((size_t)j*NKV+kv)*HD+t];O[((size_t)i*NQ+h)*HD+t]=(float)(a/sm);}}
+        for(int t=0;t<HD;t++){double a=0;for(int j=0;j<al;j++)a+=s[j]*__bfloat162float(Vc[((size_t)j*NKV+kv)*HD+t]);O[((size_t)i*NQ+h)*HD+t]=(float)(a/sm);}}
 }
 static double maxrel(const std::vector<float>&A,const std::vector<float>&B){
     double e=0,rms=0;for(size_t i=0;i<A.size();i++){e=fmax(e,fabs((double)A[i]-B[i]));rms+=(double)B[i]*B[i];}
@@ -25,13 +26,14 @@ static double maxrel(const std::vector<float>&A,const std::vector<float>&B){
 static int g_fail=0;
 static void test(int Sq,int NQ,int NKV,int base,unsigned&seed,bool det){
     const int HD=256; int Lc=base+Sq;
-    std::vector<float> Q((size_t)Sq*NQ*HD),Kc((size_t)Lc*NKV*HD),Vc((size_t)Lc*NKV*HD);
-    // bf16 입력으로 통일(FA.2 내부 bf16) → 오차가 알고리즘/누적인지 격리(bf16 입력반올림 상수 제거)
+    std::vector<float> Q((size_t)Sq*NQ*HD);
+    std::vector<__nv_bfloat16> Kc((size_t)Lc*NKV*HD),Vc((size_t)Lc*NKV*HD);  // KV는 bf16(엔진 저장 dtype)
+    // Q는 fp32 입력(엔진과 동일: Q fp32, KV bf16). KV는 bf16 저장 → frand→__float2bfloat16.
     for(auto&v:Q)v=__bfloat162float(__float2bfloat16(frand(seed)));
-    for(auto&v:Kc)v=__bfloat162float(__float2bfloat16(frand(seed)));
-    for(auto&v:Vc)v=__bfloat162float(__float2bfloat16(frand(seed)));
+    for(auto&v:Kc)v=__float2bfloat16(frand(seed));
+    for(auto&v:Vc)v=__float2bfloat16(frand(seed));
     std::vector<float> Oref((size_t)Sq*NQ*HD); cpu_attn(Q,Kc,Vc,Oref,Sq,NQ,NKV,HD,base);
-    float*dQ,*dK,*dV,*dO; size_t qb=Q.size()*4,kb=Kc.size()*4,ob=Oref.size()*4;
+    float*dQ,*dO; __nv_bfloat16*dK,*dV; size_t qb=Q.size()*4,kb=Kc.size()*sizeof(__nv_bfloat16),ob=Oref.size()*4;
     CK(cudaMalloc(&dQ,qb));CK(cudaMalloc(&dK,kb));CK(cudaMalloc(&dV,kb));CK(cudaMalloc(&dO,ob));
     CK(cudaMemcpy(dQ,Q.data(),qb,cudaMemcpyHostToDevice));CK(cudaMemcpy(dK,Kc.data(),kb,cudaMemcpyHostToDevice));CK(cudaMemcpy(dV,Vc.data(),kb,cudaMemcpyHostToDevice));
     launch_flash_attn2bs<HD,16,8>(dQ,dK,dV,dO,Sq,NQ,NKV,base); CK(cudaDeviceSynchronize());

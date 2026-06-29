@@ -1,5 +1,6 @@
 #ifndef DGX_DECODE_STATE_H
 #define DGX_DECODE_STATE_H
+#include <cuda_bf16.h>
 #include "config.h"
 #include "weights_qwen.h"
 
@@ -12,7 +13,7 @@ struct DecodeState {
     int   n_past;     // 확정된 시퀀스 길이 (= committed KV 길이 = 다음 토큰 위치)
     int   max_len;
     int   L;          // 레이어 수 (free 시 사용)
-    float **Kc, **Vc;       // [L], full 레이어만 (roped K, V)
+    __nv_bfloat16 **Kc, **Vc;  // [L], full 레이어만 (roped K, V; bf16=모델 dtype, 메모리 절반)
     float **S;              // [L], linear 레이어만 (committed GDN state)
     float **convctx;        // [L], linear 레이어만 ([K-1, conv_dim])
 };

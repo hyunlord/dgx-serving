@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include "../runtime/config.h"
 #include "../runtime/manifest_qwen.h"
 #include "../runtime/weights_qwen.h"
@@ -17,6 +18,8 @@ static std::string WD,GD;
 static std::vector<float> rfg(const std::string&p,size_t n){FILE*f=fopen((GD+p).c_str(),"rb");if(!f)exit(1);std::vector<float>v(n);if(fread(v.data(),4,n,f)!=n)exit(1);fclose(f);return v;}
 static std::vector<int> ri(const std::string&p){FILE*f=fopen((GD+p).c_str(),"rb");if(!f)exit(1);fseek(f,0,SEEK_END);long b=ftell(f);fseek(f,0,SEEK_SET);std::vector<int>v(b/4);if(fread(v.data(),4,v.size(),f)!=v.size())exit(1);fclose(f);return v;}
 static std::vector<float> dn(const float*d,size_t n){std::vector<float>h(n);TCK(cudaMemcpy(h.data(),d,n*4,cudaMemcpyDeviceToHost));return h;}
+// bf16 KV cache 다운로드 → float (지문 비교용; 두 실행 모두 bf16 저장이라 비교는 동일)
+static std::vector<float> dnh(const __nv_bfloat16*d,size_t n){std::vector<__nv_bfloat16>t(n);TCK(cudaMemcpy(t.data(),d,n*sizeof(__nv_bfloat16),cudaMemcpyDeviceToHost));std::vector<float>h(n);for(size_t i=0;i<n;i++)h[i]=__bfloat162float(t[i]);return h;}
 static double mae(const std::vector<float>&a,const std::vector<float>&b){double e=0;for(size_t i=0;i<a.size();i++)e=fmax(e,fabs((double)a[i]-b[i]));return e;}
 
 int main(int argc,char**argv){
@@ -44,7 +47,7 @@ int main(int argc,char**argv){
             if(!c.layer_is_full[l]){ auto s=dn(st.S[l],Ssz); out.insert(out.end(),s.begin(),s.end());
                                      auto cc=dn(st.convctx[l],Csz); out.insert(out.end(),cc.begin(),cc.end()); }
         }
-        auto kv=dn(st.Kc[fl],(size_t)st.n_past*NKV*HD); out.insert(out.end(),kv.begin(),kv.end());
+        auto kv=dnh(st.Kc[fl],(size_t)st.n_past*NKV*HD); out.insert(out.end(),kv.begin(),kv.end());
         return out;
     };
 

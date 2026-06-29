@@ -1,5 +1,6 @@
 #ifndef DGX_ELEMENTWISE_CUH
 #define DGX_ELEMENTWISE_CUH
+#include <cuda_bf16.h>
 
 // 모델 독립 elementwise 커널. residual add 등에 사용.
 // y[i] += x[i]  (in-place 누적). n은 런타임 인자.
@@ -60,6 +61,18 @@ static __global__ void moe_shared_add_kernel(float *out, const float *so, const 
 static inline void launch_moe_shared_add(float *out, const float *so, const float *glog, int S, int H, cudaStream_t st = 0) {
     int block = 256, grid = (S * H + block - 1) / block;
     moe_shared_add_kernel<<<grid, block, 0, st>>>(out, so, glog, S, H);
+}
+
+// fp32 → bf16 변환 (KV cache 저장용). out[i] = __float2bfloat16(in[i]).
+//   bf16=모델 dtype과 일치 → 정밀도 동일(변환 시점만 저장 쪽으로 이동, 결과 같음).
+static __global__ void f32_to_bf16_kernel(const float *in, __nv_bfloat16 *out, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(in[i]);
+}
+static inline void launch_f32_to_bf16(const float *in, __nv_bfloat16 *out, size_t n, cudaStream_t s = 0) {
+    int block = 256;
+    size_t grid = (n + block - 1) / block;
+    f32_to_bf16_kernel<<<grid, block, 0, s>>>(in, out, n);
 }
 
 #endif // DGX_ELEMENTWISE_CUH

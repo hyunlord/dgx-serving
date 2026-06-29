@@ -17,16 +17,17 @@
 
 #define BK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 static float *dmb(size_t n){ float*p; BK(cudaMalloc(&p,n*4)); return p; }
+static __nv_bfloat16 *dmbh(size_t n){ __nv_bfloat16*p; BK(cudaMalloc(&p,n*sizeof(__nv_bfloat16))); return p; }  // bf16 KV cache (메모리 절반)
 
 // ---- batch state alloc/free ----
 BatchDecodeState alloc_batch_decode_state(const ModelConfig &c, int B, int max_len){
     BatchDecodeState s{}; s.B=B; s.max_len=max_len; s.n_past=0; s.L=c.num_layers;
     int L=c.num_layers; const int HD=c.head_dim, NKV=c.num_kv_heads;
     const int nh=c.gdn_num_v_heads, D=c.gdn_head_v_dim, convd=cfg_gdn_conv_dim(&c), K=c.gdn_conv_kernel;
-    s.Kc=(float**)calloc(L,sizeof(float*)); s.Vc=(float**)calloc(L,sizeof(float*));
+    s.Kc=(__nv_bfloat16**)calloc(L,sizeof(__nv_bfloat16*)); s.Vc=(__nv_bfloat16**)calloc(L,sizeof(__nv_bfloat16*));
     s.S=(float**)calloc(L,sizeof(float*)); s.convctx=(float**)calloc(L,sizeof(float*));
     for(int l=0;l<L;l++){
-        if(c.layer_is_full[l]){ s.Kc[l]=dmb((size_t)B*max_len*NKV*HD); s.Vc[l]=dmb((size_t)B*max_len*NKV*HD); }
+        if(c.layer_is_full[l]){ s.Kc[l]=dmbh((size_t)B*max_len*NKV*HD); s.Vc[l]=dmbh((size_t)B*max_len*NKV*HD); }  // bf16
         else { s.S[l]=dmb((size_t)B*nh*D*D); s.convctx[l]=dmb((size_t)B*(K-1)*convd); }
     }
     reset_batch_decode_state(c,s); return s;
@@ -36,9 +37,9 @@ void reset_batch_decode_state(const ModelConfig &c, BatchDecodeState &s){
     for(int l=0;l<L;l++) if(!c.layer_is_full[l]){ BK(cudaMemset(s.S[l],0,(size_t)s.B*nh*D*D*4)); BK(cudaMemset(s.convctx[l],0,(size_t)s.B*(K-1)*convd*4)); }
 }
 void free_batch_decode_state(BatchDecodeState &s){
-    auto F=[](float*p){ if(p)cudaFree(p); };
+    auto F=[](void*p){ if(p)cudaFree(p); };
     for(int l=0;l<s.L;l++){ F(s.Kc[l]);F(s.Vc[l]);F(s.S[l]);F(s.convctx[l]); }
-    free(s.Kc);free(s.Vc);free(s.S);free(s.convctx); s.Kc=s.Vc=s.S=s.convctx=nullptr;
+    free(s.Kc);free(s.Vc);free(s.S);free(s.convctx); s.Kc=s.Vc=nullptr; s.S=s.convctx=nullptr;
 }
 
 // persistent batch scratch
@@ -97,9 +98,11 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             mmb(L.v,norm,vb,H,kvdim);
             launch_rope_partial_batch(qn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,B,NQ,HD,rot);
             launch_rope_partial_batch(kn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,B,NKV,HD,rot);
-            // 각 시퀀스 b: K[b]/V[b]를 cache[b]의 위치 base에 append (시퀀스별 stride)
-            BK(cudaMemcpy2D(st.Kc[l]+(size_t)base*kvdim, kvstride*4, kn, kvdim*4, kvdim*4, B, cudaMemcpyDeviceToDevice));
-            BK(cudaMemcpy2D(st.Vc[l]+(size_t)base*kvdim, kvstride*4, vb, kvdim*4, kvdim*4, B, cudaMemcpyDeviceToDevice));
+            // 각 시퀀스 b: K[b]/V[b]를 cache[b]의 위치 base에 append (시퀀스별 stride, fp32→bf16 변환)
+            for (int b=0; b<B; b++) {
+                launch_f32_to_bf16(kn+(size_t)b*kvdim, st.Kc[l]+(size_t)b*kvstride+(size_t)base*kvdim, (size_t)kvdim);
+                launch_f32_to_bf16(vb+(size_t)b*kvdim, st.Vc[l]+(size_t)b*kvstride+(size_t)base*kvdim, (size_t)kvdim);
+            }
             // FA.2 통일: 시퀀스별 KV(kvstride 간격)에 FA.2(single과 동일 attention). decode Sq=1.
             for (int b=0; b<B; b++)
                 launch_flash_attn(qn+(size_t)b*qdim, st.Kc[l]+(size_t)b*kvstride, st.Vc[l]+(size_t)b*kvstride,

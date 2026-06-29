@@ -24,7 +24,7 @@ __device__ __forceinline__ unsigned fa_pkbf(const __nv_bfloat16 &x, const __nv_b
 //   패스1: flash_attn2b를 split 구간[s·SPLIT, (s+1)·SPLIT)만 + O 대신 중간버퍼(부분 m/l/acc). 패스2: 결정적 결합.
 //   B_SPLIT은 BC 배수(타일 정렬). FD_SPLIT_KV(512=32·BC16) 재사용.
 template<int HD, int BR, int BC, int NW>
-static __global__ void flash_attn2bs_p1_kernel(const float *Q, const float *Kc, const float *Vc,
+static __global__ void flash_attn2bs_p1_kernel(const float *Q, const __nv_bfloat16 *Kc, const __nv_bfloat16 *Vc,
                                                float *pm, float *pl, float *pacc, int Sq, int NQ, int NKV, int base, int NS) {
     int q0 = blockIdx.x * BR, h = blockIdx.y, sp = blockIdx.z;
     int GRP = NQ / NKV, kv = h / GRP;
@@ -46,8 +46,8 @@ static __global__ void flash_attn2bs_p1_kernel(const float *Q, const float *Kc, 
     int wcol = warp * HW;
     for (int j0 = j_lo; j0 < j_hi; j0 += BC) {       // split 구간만 순회
         for (int i = tid; i < BC*HD; i += 32*NW) { int r=i/HD,c=i%HD,gk=j0+r; bool v=gk<maxlen;
-            sK[r][c]=v?__float2bfloat16(Kc[((size_t)gk*NKV+kv)*HD+c]):(__nv_bfloat16)0;
-            sV[r][c]=v?__float2bfloat16(Vc[((size_t)gk*NKV+kv)*HD+c]):(__nv_bfloat16)0; }
+            sK[r][c]=v?Kc[((size_t)gk*NKV+kv)*HD+c]:(__nv_bfloat16)0;   // KV는 이미 bf16(저장 시 변환) — 적재 변환 제거
+            sV[r][c]=v?Vc[((size_t)gk*NKV+kv)*HD+c]:(__nv_bfloat16)0; }
         __syncthreads();
         if (warp==0) {
             #pragma unroll
@@ -109,7 +109,7 @@ static __global__ void flash_attn2bs_p2_kernel(const float *pm, const float *pl,
 }
 static float *g_bs_m=nullptr, *g_bs_l=nullptr, *g_bs_acc=nullptr; static size_t g_bs_cap=0;
 template<int HD, int BC, int NW>
-static inline void launch_flash_attn2bs(const float *Q, const float *Kc, const float *Vc, float *O,
+static inline void launch_flash_attn2bs(const float *Q, const __nv_bfloat16 *Kc, const __nv_bfloat16 *Vc, float *O,
                                         int Sq, int NQ, int NKV, int base, cudaStream_t st = 0) {
     int maxlen = base + Sq, NS = (maxlen + FD_SPLIT_KV - 1)/FD_SPLIT_KV;
     size_t need = (size_t)Sq*NQ*NS;
@@ -120,7 +120,7 @@ static inline void launch_flash_attn2bs(const float *Q, const float *Kc, const f
     flash_attn2bs_p2_kernel<HD><<<Sq*NQ, HD, 0, st>>>(g_bs_m,g_bs_l,g_bs_acc,O,Sq,NQ,NS);
 }
 
-static inline void launch_flash_attn(const float *Q, const float *Kc, const float *Vc, float *O,
+static inline void launch_flash_attn(const float *Q, const __nv_bfloat16 *Kc, const __nv_bfloat16 *Vc, float *O,
                                      int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
     // ★ B: MMA 단일 커널 + KV split(split=f(attendlen), Sq·split 독립 → 완전 일관). prefill split=1(FA.2b.1
     //   멀티워프 MMA, 빠름) + decode split>1(MMA + KV 분할, GPU 채움). 검증된 두 조각(FA.2b.1 + flash_decode 2-패스) 결합.

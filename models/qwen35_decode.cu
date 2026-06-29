@@ -23,6 +23,7 @@
     fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 
 static float *dm(size_t n){ float*p; DK(cudaMalloc(&p,n*4)); return p; }
+static __nv_bfloat16 *dmh(size_t n){ __nv_bfloat16*p; DK(cudaMalloc(&p,n*sizeof(__nv_bfloat16))); return p; }  // bf16 KV cache (메모리 절반)
 
 // persistent scratch workspace: 호출 순서가 결정적이라 idx별 버퍼가 일관됨. 첫 호출시 할당, 이후 재사용
 // (capacity 부족하면 grow). per-call cudaMalloc/Free churn 제거 (2d 성능).
@@ -60,11 +61,11 @@ DecodeState alloc_decode_state(const ModelConfig &c, int max_len) {
     DecodeState s{}; s.max_len = max_len; s.n_past = 0; s.L = c.num_layers;
     int L = c.num_layers; const int HD = c.head_dim, NKV = c.num_kv_heads;
     const int nh = c.gdn_num_v_heads, D = c.gdn_head_v_dim, convd = cfg_gdn_conv_dim(&c), K = c.gdn_conv_kernel;
-    s.Kc = (float**)calloc(L,sizeof(float*)); s.Vc = (float**)calloc(L,sizeof(float*));
+    s.Kc = (__nv_bfloat16**)calloc(L,sizeof(__nv_bfloat16*)); s.Vc = (__nv_bfloat16**)calloc(L,sizeof(__nv_bfloat16*));
     s.S = (float**)calloc(L,sizeof(float*)); s.convctx = (float**)calloc(L,sizeof(float*));
     for (int l=0;l<L;l++){
         if (c.layer_is_full[l]) {
-            s.Kc[l] = dm((size_t)max_len*NKV*HD); s.Vc[l] = dm((size_t)max_len*NKV*HD);
+            s.Kc[l] = dmh((size_t)max_len*NKV*HD); s.Vc[l] = dmh((size_t)max_len*NKV*HD);  // bf16
         } else {
             s.S[l] = dm((size_t)nh*D*D); s.convctx[l] = dm((size_t)(K-1)*convd);
         }
@@ -78,10 +79,10 @@ void reset_decode_state(const ModelConfig &c, DecodeState &s) {
     for(int l=0;l<L;l++) if(!c.layer_is_full[l]){ DK(cudaMemset(s.S[l],0,(size_t)nh*D*D*4)); DK(cudaMemset(s.convctx[l],0,(size_t)(K-1)*convd*4)); }
 }
 void free_decode_state(DecodeState &s) {
-    auto F=[](float*p){ if(p) cudaFree(p); };
+    auto F=[](void*p){ if(p) cudaFree(p); };
     for(int l=0;l<s.L;l++){ F(s.Kc[l]); F(s.Vc[l]); F(s.S[l]); F(s.convctx[l]); }
     free(s.Kc); free(s.Vc); free(s.S); free(s.convctx);
-    s.Kc=s.Vc=s.S=s.convctx=nullptr;
+    s.Kc=s.Vc=nullptr; s.S=s.convctx=nullptr;
 }
 
 VerifyArtifacts alloc_verify_artifacts(const ModelConfig &c, int max_Sq) {
@@ -148,9 +149,9 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             // rope (위치 base..base+Sq-1) on q and on k (k는 저장 전 roped)
             launch_rope_partial(qn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,Sq,NQ,HD,rot);
             launch_rope_partial(kn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,Sq,NKV,HD,rot);
-            // append roped K, V to cache at slot base..
-            DK(cudaMemcpy(st.Kc[l]+(size_t)base*kvdim, kn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
-            DK(cudaMemcpy(st.Vc[l]+(size_t)base*kvdim, vb, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
+            // append roped K, V to cache at slot base.. (fp32 kn/vb → bf16 cache 변환 저장)
+            launch_f32_to_bf16(kn, st.Kc[l]+(size_t)base*kvdim, (size_t)Sq*kvdim);
+            launch_f32_to_bf16(vb, st.Vc[l]+(size_t)base*kvdim, (size_t)Sq*kvdim);
             launch_flash_attn(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, NKV, HD, base);  // FA.1a: tiled online-softmax (상수 shared, 12K 벽 없음)
             launch_gate_sigmoid(attn, gate, (int)((size_t)Sq*qdim));
             mm(L.o,attn,ob,qdim,H,Sq,use_q4);
