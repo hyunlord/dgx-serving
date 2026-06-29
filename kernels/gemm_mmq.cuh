@@ -3,13 +3,14 @@
 #include "../runtime/config.h"   // QBLK
 #include "gemv_w4a8.cuh"         // S=1 fallback (gemm_mma와 동일 인터페이스 정신)
 
-// 챕터7 STEP 0i: full-MMQ W4A8 GEMM. 128×128 타일 + 큰 K-tile + ldmatrix-A → L1/TEX 84→37%(de-risk 프로브 검증, =llama 39%).
+// 챕터7 STEP 0i/1: full-MMQ W4A8 GEMM. 128×128 타일 + 큰 K-tile + ldmatrix-A → L1/TEX 84→40%(=llama 39%).
 //   Y[M,N] = (X int8 · (Wq int4-8) int8) ×(xs·sw). MMA m16n8k32.s8.s8.s32. A=ldmatrix.x4, B=scalar 4B-unpack.
-//   8 warp(2×4): wm∈{0,1} 각 64행(ms 0..3), wn∈{0,3} 각 32열(ns 0..3). KTILE=64=2 QBLK(ks 0..1), cp.async 더블버퍼.
+//   8 warp(2×4): wm∈{0,1} 각 64행(ms 0..3), wn∈{0,3} 각 32열(ns 0..3). KT=K-tile(KS=KT/QBLK substep), cp.async 더블버퍼.
+//   STEP 1: KT 템플릿(64/128…) — sync↓ vs shared↑ 트레이드 측정용. KT은 16배수(ldmatrix 16B 정렬).
 #define MMQ_BM 128
 #define MMQ_BN 128
-#define MMQ_KT 64           // K-tile(2 QBLK). KTILE↑ = sync↓
-#define MMQ_AP 0            // sA K-stride = KT(64) = 16배수 → ldmatrix 16B 정렬
+#define MMQ_KT 64           // 엔진 기본 K-tile(2 QBLK). KTILE↑ = sync↓ (단 shared↑)
+#define MMQ_AP 0            // sA K-stride = KT = 16배수 → ldmatrix 16B 정렬
 #define MMQ_BPAD 4
 
 // 정렬 4-byte read의 하위 16bit(4 nibble) → (q-8) int8 4개 (bank conflict 회피).
@@ -22,13 +23,16 @@ __device__ __forceinline__ void mmq_cpa4(void*s,const void*g,bool pred){
     asm volatile("cp.async.ca.shared.global [%0],[%1],4,%2;\n"::"r"(a),"l"(g),"r"(ss));
 }
 
-static __global__ void gemm_mmq_kernel(const int8_t*X,const float*xs,const uint8_t*Wq,
+// __launch_bounds__(256,2): reg≤128 강제 → 2 CTA/SM 목표(llama occ 29%=2CTA, 우리 reg137=1CTA 17% 매칭 시도).
+//   de-risk: occupancy↑가 lever인지(KT/sync 아님 — Warp Cycles 5.64 낮음). spill 역효과면 순효과 ncu로.
+template<int KT>
+static __global__ void __launch_bounds__(256,2) gemm_mmq_kernel(const int8_t*X,const float*xs,const uint8_t*Wq,
                                        const float*sw,float*Y,int M,int N,int K){
-    constexpr int MS=MMQ_BM/32, NS=MMQ_BN/32, KS=MMQ_KT/QBLK;  // 4,4,2
-    __shared__ int8_t  sA[2][MMQ_BM][MMQ_KT+MMQ_AP];     // [buf][m][k] int8
-    __shared__ uint8_t sB[2][MMQ_BN][MMQ_KT/2+MMQ_BPAD]; // [buf][n][k/2] int4 packed
-    __shared__ float   sXs[MMQ_BM][MMQ_KT/QBLK];         // 행 스케일(QBLK별) — coalesced 1회 적재
-    __shared__ float   sSw[MMQ_BN][MMQ_KT/QBLK];         // 열 스케일
+    constexpr int MS=MMQ_BM/32, NS=MMQ_BN/32, KS=KT/QBLK;       // 4,4, KT/32
+    __shared__ int8_t  sA[2][MMQ_BM][KT+MMQ_AP];     // [buf][m][k] int8
+    __shared__ uint8_t sB[2][MMQ_BN][KT/2+MMQ_BPAD]; // [buf][n][k/2] int4 packed
+    __shared__ float   sXs[MMQ_BM][KS];              // 행 스케일(QBLK별) — coalesced 1회 적재
+    __shared__ float   sSw[MMQ_BN][KS];              // 열 스케일
     int tid=threadIdx.x, warp=tid>>5, lane=tid&31, g=lane>>2, t=lane&3, wm=warp>>2, wn=warp&3;
     int m0=blockIdx.y*MMQ_BM, n0=blockIdx.x*MMQ_BN, nblk=K/QBLK, K2=K/2, niter=(nblk+KS-1)/KS;
     int arow=lane&15, ahalf=lane>>4;
@@ -37,12 +41,12 @@ static __global__ void gemm_mmq_kernel(const int8_t*X,const float*xs,const uint8
     for(int a=0;a<MS;a++)for(int b=0;b<NS;b++)for(int c=0;c<4;c++)acc[a][b][c]=0.f;
 
     auto load=[&](int buf,int it){
-        int k0=it*MMQ_KT;
+        int k0=it*KT;
         #pragma unroll
-        for(int i=tid;i<MMQ_BM*MMQ_KT/4;i+=256){int m=i/(MMQ_KT/4),kw=(i%(MMQ_KT/4))*4,gm=m0+m,gk=k0+kw;
+        for(int i=tid;i<MMQ_BM*KT/4;i+=256){int m=i/(KT/4),kw=(i%(KT/4))*4,gm=m0+m,gk=k0+kw;
             mmq_cpa4(&sA[buf][m][kw],&X[(size_t)gm*K+gk], gm<M && gk<K);}
         #pragma unroll
-        for(int i=tid;i<MMQ_BN*(MMQ_KT/2)/4;i+=256){int n=i/(MMQ_KT/2/4),kw=(i%(MMQ_KT/2/4))*4,gn=n0+n,gk=k0+kw*2;
+        for(int i=tid;i<MMQ_BN*(KT/2)/4;i+=256){int n=i/(KT/2/4),kw=(i%(KT/2/4))*4,gn=n0+n,gk=k0+kw*2;
             mmq_cpa4(&sB[buf][n][kw],&Wq[(size_t)gn*K2+k0/2+kw], gn<N && gk<K);}
         asm volatile("cp.async.commit_group;\n");
     };
@@ -74,8 +78,8 @@ static __global__ void gemm_mmq_kernel(const int8_t*X,const float*xs,const uint8
                 unsigned w0=*(const unsigned*)&sB[cur][nb+g][kb+(t>>1)*4], w1=*(const unsigned*)&sB[cur][nb+g][kb+8+(t>>1)*4];
                 bf[ns][0]=mmq_unpack4v((t&1)?(w0>>16):w0); bf[ns][1]=mmq_unpack4v((t&1)?(w1>>16):w1);
             }
-            // 스케일 hoist: QBLK(blk)별 행/열 스케일을 MMA loop 밖에서 1회씩 read(레지스터 재사용). per-MMA global read는 reg 폭발(255 spill)→ 16 read로.
-            float xr[MS][2], scl[NS][2];     // shared에서 read(staging됨, bounds는 0-fill로 반영)
+            // 스케일 hoist: QBLK(blk)별 행/열 스케일을 MMA loop 밖에서 1회씩(shared read, staging됨). per-MMA global read는 reg 폭발(255 spill).
+            float xr[MS][2], scl[NS][2];
             #pragma unroll
             for(int ms=0;ms<MS;ms++){ int r=wm*64+ms*16+g; xr[ms][0]=sXs[r][ks]; xr[ms][1]=sXs[r+8][ks]; }
             #pragma unroll
@@ -105,8 +109,15 @@ static __global__ void gemm_mmq_kernel(const int8_t*X,const float*xs,const uint8
     }
 }
 
+// KT 스윕 진입점(de-risk/측정). KT은 16배수(ldmatrix 정렬) + shared 예산(KT=128 더블버퍼 ~53KB OK, 256은 ~106KB 불가).
+template<int KT>
+static inline void launch_gemm_mmq_w4a8_kt(const int8_t*X,const float*xs,const uint8_t*Wq,
+                                           const float*sw,float*Y,int M,int N,int K,cudaStream_t st=0){
+    dim3 grid((N+MMQ_BN-1)/MMQ_BN, (M+MMQ_BM-1)/MMQ_BM);
+    gemm_mmq_kernel<KT><<<grid,256,0,st>>>(X,xs,Wq,sw,Y,M,N,K);
+}
+// 엔진 경로: KT=64 기본(c7f8ada 검증값). 측정 우월 확인+합의 후에만 KT 교체.
 static inline void launch_gemm_mmq_w4a8(const int8_t*X,const float*xs,const uint8_t*Wq,
                                         const float*sw,float*Y,int M,int N,int K,cudaStream_t st=0){
-    dim3 grid((N+MMQ_BN-1)/MMQ_BN, (M+MMQ_BM-1)/MMQ_BM);
-    gemm_mmq_kernel<<<grid,256,0,st>>>(X,xs,Wq,sw,Y,M,N,K);
+    launch_gemm_mmq_w4a8_kt<MMQ_KT>(X,xs,Wq,sw,Y,M,N,K,st);
 }
