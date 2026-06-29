@@ -276,4 +276,62 @@ static inline void launch_flash_attn2b_t(const float *Q, const float *Kc, const 
     flash_attn2b_kernel<HD, 16, BC, NW><<<grid, 32*NW, 0, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base);
 }
 
+// ── FA.2c: 2-패스 Flash-Decoding (KV 분할, decode 병렬성) ─────────────────────────────────────
+//   ncu: decode(Sq=1) grid 24 CTA, Waves 0.17(GPU 83% 놂). → KV를 NS split로 나눠 여러 CTA 병렬.
+//   패스1: split별 부분 online softmax(m_s, l_s, unnormalized acc_s=Σ exp(s-m_s)·V). 패스2: 결정적 결합.
+//   결정성: 2-패스(atomic 없음)라 race 없음. split=ceil(attendlen/SPLIT_KV) = attendlen만 의존(Sq 독립 — Sq 일관).
+//   FA.2c.0: decode Sq=1 정확성+GPU채움. 정밀도 일관(FA.2b)/verify 통합은 FA.2c.1.
+#define FD_SPLIT_KV 512
+// 패스1: grid(NS, NQ), block=HD. CTA(split s, head h) → 부분 m/l/acc. attendlen=base+1(decode).
+template<int HD>
+static __global__ void flash_decode_p1_kernel(const float *Q, const float *Kc, const float *Vc,
+                                              float *pm, float *pl, float *pacc, int NQ, int NKV, int attendlen, int NS) {
+    int s = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    int GRP = NQ / NKV, kv = h / GRP;
+    int j0 = s * FD_SPLIT_KV, j1 = j0 + FD_SPLIT_KV; if (j1 > attendlen) j1 = attendlen;
+    int oi = h * NS + s;
+    if (j0 >= attendlen) { if (d==0){ pm[oi]=-FLT_MAX; pl[oi]=0.f; } pacc[(size_t)oi*HD+d]=0.f; return; }
+    extern __shared__ float sfd[];                 // sq[HD] + sc[FD_SPLIT_KV]
+    float *sq = sfd, *sc = sfd + HD;
+    float scale = 1.0f/sqrtf((float)HD);
+    sq[d] = Q[(size_t)h*HD+d];                      // Sq=1
+    __syncthreads();
+    for (int j = j0+d; j < j1; j += HD) {           // thread d = key index(strided), 각 full dot
+        const float *kp = Kc + (size_t)(j*NKV+kv)*HD;
+        float dot=0.f; for (int t=0;t<HD;t++) dot += sq[t]*kp[t];
+        sc[j-j0] = dot*scale;
+    }
+    __syncthreads();
+    __shared__ float s_m, s_l;
+    if (d==0) { int n=j1-j0; float m=-FLT_MAX; for(int j=0;j<n;j++)m=fmaxf(m,sc[j]);
+        float l=0.f; for(int j=0;j<n;j++){ sc[j]=expf(sc[j]-m); l+=sc[j]; } s_m=m; s_l=l; }
+    __syncthreads();
+    float acc=0.f; for (int j=j0;j<j1;j++) acc += sc[j-j0]*Vc[(size_t)(j*NKV+kv)*HD+d];  // unnormalized
+    pacc[(size_t)oi*HD+d]=acc;
+    if (d==0) { pm[oi]=s_m; pl[oi]=s_l; }
+}
+// 패스2: grid(NQ), block=HD. split들 (m,l,acc) 결정적 결합 → O[h][d].
+template<int HD>
+static __global__ void flash_decode_p2_kernel(const float *pm, const float *pl, const float *pacc,
+                                              float *O, int NQ, int NS) {
+    int h = blockIdx.x, d = threadIdx.x;
+    float mg=-FLT_MAX; for (int s=0;s<NS;s++) mg=fmaxf(mg, pm[h*NS+s]);
+    float lg=0.f, acc=0.f;
+    for (int s=0;s<NS;s++){ float w=expf(pm[h*NS+s]-mg); lg+=pl[h*NS+s]*w; acc+=pacc[(size_t)(h*NS+s)*HD+d]*w; }
+    O[(size_t)h*HD+d] = acc/lg;
+}
+// decode Sq=1 진입. 중간버퍼는 static 재사용(O(NS·NQ·HD) 작음).
+static float *g_fd_m=nullptr, *g_fd_l=nullptr, *g_fd_acc=nullptr; static size_t g_fd_cap=0;
+template<int HD>
+static inline void launch_flash_decode(const float *Q, const float *Kc, const float *Vc, float *O,
+                                       int NQ, int NKV, int base, cudaStream_t st = 0) {
+    int attendlen = base + 1, NS = (attendlen + FD_SPLIT_KV - 1)/FD_SPLIT_KV;
+    size_t need = (size_t)NQ*NS;
+    if (g_fd_cap < need) { if(g_fd_m)cudaFree(g_fd_m); if(g_fd_l)cudaFree(g_fd_l); if(g_fd_acc)cudaFree(g_fd_acc);
+        cudaMalloc(&g_fd_m,need*4); cudaMalloc(&g_fd_l,need*4); cudaMalloc(&g_fd_acc,need*HD*4); g_fd_cap=need; }
+    size_t sh = ((size_t)HD + FD_SPLIT_KV)*sizeof(float);
+    flash_decode_p1_kernel<HD><<<dim3(NS,NQ), HD, sh, st>>>(Q,Kc,Vc,g_fd_m,g_fd_l,g_fd_acc,NQ,NKV,attendlen,NS);
+    flash_decode_p2_kernel<HD><<<NQ, HD, 0, st>>>(g_fd_m,g_fd_l,g_fd_acc,O,NQ,NS);
+}
+
 #endif // DGX_ATTENTION_FLASH_CUH
