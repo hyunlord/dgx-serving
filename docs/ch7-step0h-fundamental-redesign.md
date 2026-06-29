@@ -54,7 +54,24 @@ shared 24KB(sQ/sK/sV) + reg 72 동시 감축 방향:
 flash_attn2bs Kc/Vc bf16 입력(sK/sV 적재 변환 제거). 효과: KV 메모리 절반(독립 가치) + cp.async 전제.
 검증: make test + test_fa2bs rel<1e-2 + Sq·split 일관 + KV 메모리 확인. (진행 중.)
 
-**단계 2 — cp.async 더블버퍼 (shared 적재 38.5% stall 은닉):** KV가 bf16라 변환 없이 cp.async 가능(de-risk OK).
+**단계 2 — cp.async 기각(산수 역효과 확정, 2026-06-29):** cp.async는 더블버퍼(2-stage) 필수 → sK/sV `[2][BC][HD]`
+= 32KB(+16KB) → shared 42KB. **ncu 실측 SM shared 102KB ÷ 42 = 2 CTA → occupancy 50→33%**. warp 협력(+8KB→32%,
+측정 4.63ms 역효과)과 같은 shared↑ 메커니즘에 더 큰 +16KB. KV bf16이 fp32 변환은 풀었으나 더블버퍼 shared 벽 동일.
+→ 기각(occupancy 벽 공유, stall 은닉 < occupancy 33% 손실). KV bf16 단계1(메모리 절반)은 독립 가치로 유지(커밋 d202109).
+
+**단계 2′ — HD 2-pass (occupancy↑ 유일 근본):** occupancy 50% = shared 24KB + reg 72 동시 제한. HD=256을 128씩
+2-pass로 처리하면 sK/sV[BC][128]=4KB each(절반) + acc[BR][HD/2] 절반(reg↓) → **shared·reg 동시 감축**.
+- 흐름(KV 타일별): S=Q·Kᵀ 2-pass 부분합(HD[0:128]+HD[128:]) → softmax(S 완성) → P·V 2-pass(acc[:,0:128]/acc[:,128:]).
+- 산수(정정): shared 18KB(102/18≈5 CTA). 단 **reg = acc 16 + fragment/temp 56 = 72**. HD 2-pass로 acc만 절반(16→8)
+  → reg ~64 → Block Limit Reg 4. occupancy = min(shared 5, reg 4, warp 6)×8 = **~67%**(50→67, 부분). **fragment/temp 56은
+  못 줄임** — occupancy 50% 벽이 shared(24KB)뿐 아니라 **reg(MMA fragment 본질)로도 묶임**(둘 다 본질).
+- 트레이드: occupancy 67%(부분) + **KV·Q HD 절반 2번 read(트래픽 2배)** → 순효과 불확실(occupancy↑ < KV 2배일 수). 측정 필요.
+- **정직: HD 2-pass도 부분(67%)이고 KV 2배 트레이드라 추월 불확실.** occupancy 50%가 shared+reg(fragment) 둘 다 본질이라
+  깊은 벽. 진짜 추월은 완전 다른 알고리즘(CUTLASS FA / FlashAttention-3 warp-spec+TMA)이나 GB10 sm_120+우리 범위서 매우 큰 작업.
+- 정확성: S 2-pass 부분합 == 전체 S(자명, k-accumulate 분할). online softmax는 S 완성 후. CPU 오차0 + 결정성 + 직교성.
+- 별도 커널(flash_attn2bs_hd2)로 de-risk → 측정 → 우월하면 교체(B 롤백 가능).
+
+**참고 — cp.async 원본 단계(KV bf16 전제, 기각됨):** KV가 bf16라 변환 없이 cp.async 가능(de-risk OK).
 - flash_attn2bs_p1의 split 구간 KV 타일(BC=16) 순회를 2-stage 더블버퍼: 다음 BC 타일 prefetch ↔ 현재 MMA.
 - **★ canonical 순서(Phase C race 교훈 [[w4a8-chunk-prefill-divergence]]): wait_group→sync→prefetch→compute.**
   prefetch-먼저(Phase C 초기 버그)는 race — 정식 순서 재사용.
