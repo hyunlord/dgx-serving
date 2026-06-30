@@ -50,6 +50,38 @@ static inline void launch_gdn_conv1d_silu_decode(const float *in, const float *p
     gdn_conv1d_silu_decode_kernel<<<grid, block, 0, st>>>(in, prev, w, out, Sq, C, K);
 }
 
+// ---- 챕터9 STEP 2: tree-aware conv1d (노드별 ancestor-path window, parent fork) ----
+//   linear conv는 window가 선형 prev(t-1,t-2..); tree는 노드 t의 window = ancestor-path(t→parent→..→root→convctx).
+//   parent[t] = tree 부모(<t), root는 -1(convctx로 떨어짐). newest(node t)부터 parent 체인 walk, root 넘으면 convctx.
+//   parent[t]=t-1(chain)이면 선형 conv와 bit-identical(아래 검증). conv window 작은 버퍼라 walk K(=3~4)스텝.
+static __global__ void gdn_conv1d_silu_decode_tree_kernel(const float *in, const float *prev, const int *parent,
+                                              const float *w, float *out, int Sq, int C, int K) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)Sq * C) return;
+    int c = (int)(idx % C), t = (int)(idx / C);
+    // window 토큰 인덱스 수집(newest-first, parent 체인 walk): widx=인덱스, wsrc 0=in/1=prev/-1=zero. K<=8.
+    int widx[8], wsrc[8]; int node = t, p = K - 2;
+    for (int jj = 0; jj < K; jj++) {
+        if (node >= 0)            { widx[jj]=node; wsrc[jj]=0; node=parent[node]; }   // tree 노드, parent walk
+        else if (prev && p >= 0)  { widx[jj]=p;    wsrc[jj]=1; p--; }                 // root 넘음 → convctx(most-recent first)
+        else                      { wsrc[jj]=-1; }
+    }
+    // 합산은 oldest-first(j=0..K-1) — linear conv와 같은 순서 = bit-identical(float reorder 없음). jj=K-1-j가 oldest.
+    float acc = 0.f;
+    for (int j = 0; j < K; j++) {
+        int jj = K - 1 - j; float xv = 0.f;
+        if (wsrc[jj]==0) xv = in[(size_t)widx[jj]*C + c];
+        else if (wsrc[jj]==1) xv = prev[(size_t)widx[jj]*C + c];
+        acc += w[(size_t)c * K + j] * xv;
+    }
+    out[(size_t)t * C + c] = acc / (1.0f + expf(-acc));
+}
+static inline void launch_gdn_conv1d_silu_decode_tree(const float *in, const float *prev, const int *parent,
+                                                 const float *w, float *out, int Sq, int C, int K, cudaStream_t st = 0) {
+    int block = 256; long n = (long)Sq * C; int grid = (int)((n + block - 1) / block);
+    gdn_conv1d_silu_decode_tree_kernel<<<grid, block, 0, st>>>(in, prev, parent, w, out, Sq, C, K);
+}
+
 // ---- batch decode conv1d (챕터3): B 독립 시퀀스, 각 1토큰 + 자기 prev(convctx[b]) ----
 //   in: [B, C] (각 시퀀스 1토큰), prev: [B, K-1, C], out: [B, C]. Sq=1당 ti=j-(K-1): j<K-1→prev[b][j], j=K-1→in[b].
 static __global__ void gdn_conv1d_silu_decode_batch_kernel(const float *in, const float *prev, const float *w,
