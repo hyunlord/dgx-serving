@@ -14,6 +14,7 @@
 #include "../runtime/config.h"            // QBLK
 #include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/gemm_mmq.cuh"
+#include "../kernels/gemm_batch.cuh"   // 기존 batch decode W4A8 커널 (qwen35_decode_batch가 사용) — SB와 비교
 
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 
@@ -47,17 +48,18 @@ int main(int argc,char**argv){
     else    CK(cudaMemcpy(dSc,hScF.data(),nsc*4,cudaMemcpyHostToDevice));
     int8_t *dX; CK(cudaMalloc(&dX,(size_t)SMAX*IN)); CK(cudaMemcpy(dX,hX.data(),(size_t)SMAX*IN,cudaMemcpyHostToDevice));
     float *dXs; CK(cudaMalloc(&dXs,(size_t)SMAX*(IN/QBLK)*4)); CK(cudaMemcpy(dXs,hXs.data(),(size_t)SMAX*(IN/QBLK)*4,cudaMemcpyHostToDevice));
-    float *dYg,*dYm,*dYsb; CK(cudaMalloc(&dYg,(size_t)SMAX*OUT*4)); CK(cudaMalloc(&dYm,(size_t)SMAX*OUT*4)); CK(cudaMalloc(&dYsb,(size_t)SMAX*OUT*4));
+    float *dYg,*dYm,*dYsb,*dYgb; CK(cudaMalloc(&dYg,(size_t)SMAX*OUT*4)); CK(cudaMalloc(&dYm,(size_t)SMAX*OUT*4)); CK(cudaMalloc(&dYsb,(size_t)SMAX*OUT*4)); CK(cudaMalloc(&dYgb,(size_t)SMAX*OUT*4));
 
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     double wMB=(double)OUT*IN/2/1e9;   // GB
 
-    printf("# %-3s | %-22s %-22s %-22s | %-12s\n","S","naive-gemv(ms,GB/s)","MMQ(ms,GB/s)","SB(ms,GB/s)","SB==gemv?");
+    printf("# GB/s 높을수록 좋음. naive-gemv=S× weight 재적재, MMQ=prefill 128-tile, gemm_batch=기존 batch decode, SB=신규 소-batch\n");
     for(int S : {1,2,3,4,5,6,8}){
         // warmup
         launch_gemv_w4a8(dX,dXs,nullptr,dW,dSc,dYg,IN,OUT,S,sdt);
         if(S>1) launch_gemm_mmq_w4a8(dX,dXs,dW,dSc,dYm,S,OUT,IN,sdt);
         launch_gemv_w4a8_sb(dX,dXs,dW,dSc,dYsb,IN,OUT,S,sdt);
+        if(S>1) launch_gemm_batch_w4a8(dX,dXs,dW,dSc,dYgb,IN,OUT,S,sdt);
         CK(cudaDeviceSynchronize());
 
         // naive gemv (S× weight 재적재)
@@ -70,17 +72,21 @@ int main(int argc,char**argv){
         // SB (신규)
         CK(cudaEventRecord(t0)); for(int i=0;i<ITERS;i++) launch_gemv_w4a8_sb(dX,dXs,dW,dSc,dYsb,IN,OUT,S,sdt);
         CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1)); float tsb=ev(t0,t1)/ITERS;
+        // gemm_batch (기존 batch decode 경로)
+        float tgb=-1;
+        if(S>1){ CK(cudaEventRecord(t0)); for(int i=0;i<ITERS;i++) launch_gemm_batch_w4a8(dX,dXs,dW,dSc,dYgb,IN,OUT,S,sdt);
+                 CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1)); tgb=ev(t0,t1)/ITERS; }
 
-        // 정확성: SB vs naive-gemv
+        // 정확성: SB vs naive-gemv (bit-exact 기대)
         std::vector<float> Yg((size_t)S*OUT), Ysb((size_t)S*OUT);
         CK(cudaMemcpy(Yg.data(),dYg,(size_t)S*OUT*4,cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(Ysb.data(),dYsb,(size_t)S*OUT*4,cudaMemcpyDeviceToHost));
         double maxae=0,maxrel=0; for(size_t i=0;i<(size_t)S*OUT;i++){ double ae=fabs(Yg[i]-Ysb[i]); maxae=fmax(maxae,ae);
             double d=fabs(Yg[i]); if(d>1e-6) maxrel=fmax(maxrel,ae/d); }
 
-        char mmqs[48]; if(S>1) snprintf(mmqs,48,"%.3f %.0f",tm,wMB/(tm/1e3)); else snprintf(mmqs,48,"  (S=1 skip)");
-        printf("  %-3d | %.3f %5.0f          %-22s %.3f %5.0f          maxae=%.2e rel=%.1e\n",
-               S, tg, wMB/(tg/1e3), mmqs, tsb, wMB/(tsb/1e3), maxae, maxrel);
+        auto gbs=[&](float t){ return t<0?0.0:wMB/(t/1e3); };   // GB/s
+        printf("  %-3d | gemv %5.0f | MMQ %5.0f | gemm_batch %5.0f | SB %5.0f GB/s | SB==gemv ae=%.1e\n",
+               S, gbs(tg), gbs(tm), gbs(tgb), gbs(tsb), maxae);
     }
     printf("# 해석: SB GB/s가 S 무관 평탄(~plain Sq=1 대역폭)이면 amortize 성공. MMQ는 소-S서 낮음.\n");
     return 0;
