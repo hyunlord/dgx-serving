@@ -47,8 +47,10 @@ int main(int argc,char**argv){
     printf("# model=%s H=%d L=%d V=%d %s use_q4=%d (1=q4,2=W4A8)\n",
            WD.c_str(),H,L,V, moe?"MoE":"dense", use_q4);
 
-    std::vector<int> ctxs={2048,8192,16384,32768};   // 긴-context 스윕(GDN 이점 곡선)
-    std::vector<int> ngens={64};
+    // 포커스 프로파일: argv[3]=ctx, argv[4]=ngen → 단일 (ctx,ngen) + 배치 skip (decode nsys 차분용).
+    bool focus = argc>3;
+    std::vector<int> ctxs = focus ? std::vector<int>{atoi(argv[3])} : std::vector<int>{2048,8192,16384,32768};
+    std::vector<int> ngens = (argc>4) ? std::vector<int>{atoi(argv[4])} : std::vector<int>{64};
     int MAXLEN=32768+512+8;
 
     // rope 테이블 엔진 생성 (theta from config — 골든 의존 없음)
@@ -108,8 +110,8 @@ int main(int argc,char**argv){
                1,C,N,ttft, dec/N, N*1000.0/dec, C*1000.0/ttft);
         free_decode_state(st);
     }
-    // ---- B>1 throughput (dense만; batch 경로) ----
-    if(!moe){
+    // ---- B>1 throughput (dense만; batch 경로) ----  (focus 프로파일 모드선 skip)
+    if(!moe && !focus){
         std::vector<int> Bs={8};
         for(int B: Bs) for(int C: {2048}) for(int N: ngens){
             size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB);
