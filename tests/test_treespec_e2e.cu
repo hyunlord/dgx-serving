@@ -32,17 +32,39 @@ static std::vector<int> ri(const std::string&p){FILE*f=fopen((GD+p).c_str(),"rb"
 static float* up(const std::vector<float>&h){float*d;CK(cudaMalloc(&d,h.size()*4));CK(cudaMemcpy(d,h.data(),h.size()*4,cudaMemcpyHostToDevice));return d;}
 static int* upi(const std::vector<int>&h){int*d;CK(cudaMalloc(&d,h.size()*4));CK(cudaMemcpy(d,h.data(),h.size()*4,cudaMemcpyHostToDevice));return d;}
 
-struct MtpW { float *fc,*enorm,*hnorm,*norm,*iln,*pln,*qn,*kn,*Wq,*Wk,*Wv,*Wo,*Wg,*Wu,*Wd; };
-static MtpW load_mtp(const ModelConfig&c){
+struct MQ4 { uint8_t* wq=nullptr; float* sc=nullptr; };
+struct MtpW { float *fc,*enorm,*hnorm,*norm,*iln,*pln,*qn,*kn,*Wq,*Wk,*Wv,*Wo,*Wg,*Wu,*Wd;
+              int q4=0; MQ4 qfc,qWq,qWk,qWv,qWo,qWg,qWu,qWd; };
+// STEP5: q4 host 양자화 — extract_weights.quantize_int4 복제(QBLK=32, scale=maxabs/7, q=clip(round(w/s)+8,0,15), pack 2/byte).
+//   IN%32==0이라 블록이 row 내부 — gemv_q4(scale_dtype=0=fp32 scale)와 포맷 일치. body q4 경로와 동일 스킴.
+static MQ4 q4up(const std::vector<float>& w){
+    size_t n=w.size(), nblk=n/32; std::vector<uint8_t> q(n); std::vector<float> scale(nblk);
+    for(size_t b=0;b<nblk;b++){ float mx=0; for(int j=0;j<32;j++) mx=fmaxf(mx,fabsf(w[b*32+j]));
+        float s=mx/7.0f; if(s==0.f)s=1e-8f; scale[b]=s;
+        for(int j=0;j<32;j++){ long qq=lroundf(w[b*32+j]/s)+8; q[b*32+j]=(uint8_t)(qq<0?0:(qq>15?15:qq)); } }
+    std::vector<uint8_t> packed(n/2);
+    for(size_t i=0;i<n/2;i++) packed[i]=(uint8_t)(q[2*i] | (q[2*i+1]<<4));
+    MQ4 m; CK(cudaMalloc(&m.wq,n/2)); CK(cudaMemcpy(m.wq,packed.data(),n/2,cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&m.sc,nblk*4)); CK(cudaMemcpy(m.sc,scale.data(),nblk*4,cudaMemcpyHostToDevice)); return m;
+}
+static MtpW load_mtp(const ModelConfig&c, int mq4=0){
     int H=c.hidden_size,HD=c.head_dim,NQ=c.num_q_heads,NKV=c.num_kv_heads,FFN=c.intermediate_size;
     int qdim2=NQ*HD*2,kvdim=NKV*HD,adim=NQ*HD;
-    MtpW m;
-    m.fc=up(rfg("mtp_fc_f32.bin",(size_t)H*2*H)); m.enorm=up(rfg("mtp_enorm.bin",H)); m.hnorm=up(rfg("mtp_hnorm.bin",H));
+    MtpW m; m.q4=mq4;
+    m.enorm=up(rfg("mtp_enorm.bin",H)); m.hnorm=up(rfg("mtp_hnorm.bin",H));
     m.norm=up(rfg("mtp_norm.bin",H)); m.iln=up(rfg("mtp_input_layernorm.bin",H)); m.pln=up(rfg("mtp_post_attention_layernorm.bin",H));
     m.qn=up(rfg("mtp_q_norm.bin",HD)); m.kn=up(rfg("mtp_k_norm.bin",HD));
-    m.Wq=up(rfg("mtp_q_proj_f32.bin",(size_t)qdim2*H)); m.Wk=up(rfg("mtp_k_proj_f32.bin",(size_t)kvdim*H));
-    m.Wv=up(rfg("mtp_v_proj_f32.bin",(size_t)kvdim*H)); m.Wo=up(rfg("mtp_o_proj_f32.bin",(size_t)H*adim));
-    m.Wg=up(rfg("mtp_gate_proj_f32.bin",(size_t)FFN*H)); m.Wu=up(rfg("mtp_up_proj_f32.bin",(size_t)FFN*H)); m.Wd=up(rfg("mtp_down_proj_f32.bin",(size_t)H*FFN));
+    // 큰 matmul: mq4면 q4 양자화(draft 대역폭↓), 아니면 fp32
+    auto big=[&](const char* f, size_t OUT, size_t IN, float*& fp, MQ4& q){
+        auto wv=rfg(f, OUT*IN); if(mq4) q=q4up(wv); else fp=up(wv); };
+    big("mtp_fc_f32.bin",        H,     2*H,  m.fc, m.qfc);
+    big("mtp_q_proj_f32.bin",    qdim2, H,    m.Wq, m.qWq);
+    big("mtp_k_proj_f32.bin",    kvdim, H,    m.Wk, m.qWk);
+    big("mtp_v_proj_f32.bin",    kvdim, H,    m.Wv, m.qWv);
+    big("mtp_o_proj_f32.bin",    H,     adim, m.Wo, m.qWo);
+    big("mtp_gate_proj_f32.bin", FFN,   H,    m.Wg, m.qWg);
+    big("mtp_up_proj_f32.bin",   FFN,   H,    m.Wu, m.qWu);
+    big("mtp_down_proj_f32.bin", H,     FFN,  m.Wd, m.qWd);
     return m;
 }
 struct MtpKV { float *Kc,*Vc; int n; };
@@ -54,66 +76,72 @@ static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
                     const QMat* lmq=nullptr, int dq4=0, std::vector<int>* topk=nullptr, int topw=1){
     const int H=c.hidden_size,HD=c.head_dim,NQ=c.num_q_heads,NKV=c.num_kv_heads,FFN=c.intermediate_size,rot=c.rotary_dim,V=c.vocab_size;
     const int qdim2=NQ*HD*2,qdim=NQ*HD,kvdim=NKV*HD; const float eps=c.rms_norm_eps;
-    auto B=[&](size_t n){float*d;CK(cudaMalloc(&d,n*4));return d;};
+    // STEP5: persistent scratch — 호출당 ~48 cudaMalloc/free 제거(body qwen35_decode와 동일 패턴). 출력 불변(순수 perf).
+    static float* g_ws=nullptr; static size_t g_cap=0; static int* g_de=nullptr;
+    size_t need=(size_t)12*H + qdim2 + 4*(size_t)qdim + 3*(size_t)kvdim + 3*(size_t)FFN + V;
+    if(g_cap<need){ if(g_ws)cudaFree(g_ws); CK(cudaMalloc(&g_ws,need*4)); g_cap=need; }
+    if(!g_de) CK(cudaMalloc(&g_de,4));
+    size_t off=0; auto B=[&](size_t n){ float* p=g_ws+off; off+=n; return p; };
     float *e=B(H),*en=B(H),*hn=B(H),*cat=B(2*H),*x=B(H),*cur=B(H);
     float *qg=B(qdim2),*qb=B(qdim),*gate=B(qdim),*qn=B(qdim),*k=B(kvdim),*kn=B(kvdim),*v=B(kvdim),*attn=B(qdim),*ob=B(H);
     float *cur2=B(H),*ff=B(H),*gm=B(FFN),*um=B(FFN),*act=B(FFN),*dnb=B(H),*cur3=B(H),*logits=B(V);
-    int *de; CK(cudaMalloc(&de,4)); CK(cudaMemcpy(de,&e_tok,4,cudaMemcpyHostToDevice));
+    int *de=g_de; CK(cudaMemcpy(de,&e_tok,4,cudaMemcpyHostToDevice));
+    // STEP5: q4면 gemv_q4(draft 대역폭↓, MTP body 1.7GB→215MB), 아니면 fp32. scale_dtype=0(fp32 scale).
+    auto MM=[&](const float*X, float* fp, const MQ4& q, float*Y, int IN, int OUT){
+        if(m.q4) launch_gemv_q4(X,q.wq,q.sc,Y,IN,OUT,1,0); else launch_gemv_f32(X,fp,Y,IN,OUT,1); };
     launch_embedding(de,E,e,1,H);
     launch_rmsnorm_zc(e,m.enorm,en,1,H,eps); launch_rmsnorm_zc(h_post,m.hnorm,hn,1,H,eps);
     CK(cudaMemcpy(cat,en,H*4,cudaMemcpyDeviceToDevice)); CK(cudaMemcpy(cat+H,hn,H*4,cudaMemcpyDeviceToDevice));
-    launch_gemv_f32(cat,m.fc,x,2*H,H,1);
+    MM(cat,m.fc,m.qfc,x,2*H,H);
     launch_rmsnorm_zc(x,m.iln,cur,1,H,eps);
-    launch_gemv_f32(cur,m.Wq,qg,H,qdim2,1);
+    MM(cur,m.Wq,m.qWq,qg,H,qdim2);
     CK(cudaMemcpy2D(qb,HD*4,qg,2*HD*4,HD*4,NQ,cudaMemcpyDeviceToDevice));
     CK(cudaMemcpy2D(gate,HD*4,qg+HD,2*HD*4,HD*4,NQ,cudaMemcpyDeviceToDevice));
     launch_rmsnorm_zc(qb,m.qn,qn,NQ,HD,eps);
-    launch_gemv_f32(cur,m.Wk,k,H,kvdim,1); launch_rmsnorm_zc(k,m.kn,kn,NKV,HD,eps);
-    launch_gemv_f32(cur,m.Wv,v,H,kvdim,1);
+    MM(cur,m.Wk,m.qWk,k,H,kvdim); launch_rmsnorm_zc(k,m.kn,kn,NKV,HD,eps);
+    MM(cur,m.Wv,m.qWv,v,H,kvdim);
     launch_rope_partial(qn,d_cos+(size_t)rope_pos*rot,d_sin+(size_t)rope_pos*rot,1,NQ,HD,rot);
     launch_rope_partial(kn,d_cos+(size_t)rope_pos*rot,d_sin+(size_t)rope_pos*rot,1,NKV,HD,rot);
     CK(cudaMemcpy(kv.Kc+(size_t)kv.n*kvdim,kn,(size_t)kvdim*4,cudaMemcpyDeviceToDevice));
     CK(cudaMemcpy(kv.Vc+(size_t)kv.n*kvdim,v,(size_t)kvdim*4,cudaMemcpyDeviceToDevice));
     launch_attn_decode(qn,kv.Kc,kv.Vc,attn,1,NQ,NKV,HD,kv.n);
     launch_gate_sigmoid(attn,gate,qdim);
-    launch_gemv_f32(attn,m.Wo,ob,qdim,H,1); launch_add(cur2,x,ob,H);
+    MM(attn,m.Wo,m.qWo,ob,qdim,H); launch_add(cur2,x,ob,H);
     launch_rmsnorm_zc(cur2,m.pln,ff,1,H,eps);
-    launch_gemv_f32(ff,m.Wg,gm,H,FFN,1); launch_gemv_f32(ff,m.Wu,um,H,FFN,1);
-    launch_swiglu(gm,um,act,FFN); launch_gemv_f32(act,m.Wd,dnb,FFN,H,1); launch_add(cur3,cur2,dnb,H);
+    MM(ff,m.Wg,m.qWg,gm,H,FFN); MM(ff,m.Wu,m.qWu,um,H,FFN);
+    launch_swiglu(gm,um,act,FFN); MM(act,m.Wd,m.qWd,dnb,FFN,H); launch_add(cur3,cur2,dnb,H);
     launch_rmsnorm_zc(cur3,m.norm,d_own,1,H,eps);
     int best=-1;
     if(want_logits){
         if(dq4&&lmq) launch_gemv_q4(d_own,lmq->wq,lmq->sc,logits,H,V,1,c.scale_dtype);
         else         launch_gemv_f32(d_own,E,logits,H,V,1);
         CK(cudaDeviceSynchronize());
-        std::vector<float> hl(V); CK(cudaMemcpy(hl.data(),logits,(size_t)V*4,cudaMemcpyDeviceToHost));
+        static std::vector<float> hl; hl.resize(V); CK(cudaMemcpy(hl.data(),logits,(size_t)V*4,cudaMemcpyDeviceToHost));
         best=0; float bv=hl[0]; for(int j=1;j<V;j++) if(hl[j]>bv){bv=hl[j];best=j;}
-        if(topk){ std::vector<int> idx(V); for(int j=0;j<V;j++)idx[j]=j;
+        if(topk){ static std::vector<int> idx; idx.resize(V); for(int j=0;j<V;j++)idx[j]=j;
             int wv=std::min(topw,V);
             std::partial_sort(idx.begin(),idx.begin()+wv,idx.end(),[&](int a,int b){return hl[a]>hl[b];});
             topk->assign(idx.begin(),idx.begin()+wv); }
     } else CK(cudaDeviceSynchronize());
     if(append) kv.n++;
-    float* all[]={e,en,hn,cat,x,cur,qg,qb,gate,qn,k,kn,v,attn,ob,cur2,ff,gm,um,act,dnb,cur3,logits};
-    for(float*p:all)cudaFree(p); cudaFree(de);
-    return best;
+    return best;   // persistent scratch — free 불요(다음 호출 재사용)
 }
 
 int main(int argc,char**argv){
     WD=argc>1?argv[1]:"artifacts/qwen35-0.8b/weights"; GD=(argc>2?argv[2]:"artifacts/qwen35-0.8b/mtp_golden")+std::string("/");
-    int N=argc>3?atoi(argv[3]):40, K=argc>4?atoi(argv[4]):4, W=argc>5?atoi(argv[5]):3, bq4=argc>6?atoi(argv[6]):0, dq4=argc>7?atoi(argv[7]):0;
+    int N=argc>3?atoi(argv[3]):40, K=argc>4?atoi(argv[4]):4, W=argc>5?atoi(argv[5]):3, bq4=argc>6?atoi(argv[6]):0, dq4=argc>7?atoi(argv[7]):0, mq4=argc>8?atoi(argv[8]):0;
     ModelConfig c=load_config_qwen((WD+"/manifest.json").c_str());
     const int H=c.hidden_size,V=c.vocab_size,rot=c.rotary_dim,NKV=c.num_kv_heads,HD=c.head_dim;
     std::vector<int> prompt=ri("token_ids.bin"); int P=prompt.size();
     int Nnodes=K+W;                                  // root(1)+depth1(W)+chain(K-1) = K+W
     int maxlen=P+N+Nnodes+8;
-    printf("[treespec] prompt=%d gen=%d K(chain)=%d W(width)=%d nodes=%d body_q4=%d draft_q4=%d\n",P,N,K,W,Nnodes,bq4,dq4);
+    printf("[treespec] prompt=%d gen=%d K(chain)=%d W(width)=%d nodes=%d body_q4=%d draft_q4=%d mtp_q4=%d\n",P,N,K,W,Nnodes,bq4,dq4,mq4);
     if(Nnodes>8) printf("  ⚠ nodes=%d>8 → verify가 MMQ 경로(amortize 함정, STEP3.3). ≤8 권장.\n",Nnodes);
     std::vector<float> cl=rfg("rope_cos_long.bin",(size_t)128*rot), sl=rfg("rope_sin_long.bin",(size_t)128*rot);
     if(P+N+Nnodes>=128){printf("need longer rope table\n");return 1;}
     float *d_cos=up(cl),*d_sin=up(sl);
     QwenWeights w=load_weights_qwen(WD.c_str(),c,1, bq4==0?1:0);
-    MtpW mw=load_mtp(c); float*E=w.embed;
+    MtpW mw=load_mtp(c,mq4); float*E=w.embed;
     int *d_tok; CK(cudaMalloc(&d_tok,maxlen*4));
     auto argmaxV=[&](const std::vector<float>&lg,int p){int b=0;float bv=lg[(size_t)p*V];for(int j=1;j<V;j++){float z=lg[(size_t)p*V+j];if(z>bv){bv=z;b=j;}}return b;};
 
