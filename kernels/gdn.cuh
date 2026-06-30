@@ -288,6 +288,56 @@ static inline void launch_gdn_step_ksplit(const float *Qn, const float *Kn, cons
     gdn_step_ksplit_kernel<D,KSPLIT><<<NH, D*KSPLIT, shmem, st>>>(Qn,Kn,V,G,Bt,Sin,Ssnap,O,Sq,NH,NHk,snapshot_all);
 }
 
+// ---- 챕터9 tree-spec: tree-aware gdn_step (1-forward, 노드별 parent fork) ----
+//   선형 carry 대신 각 노드 t가 parent[t]의 snapshot서 state reload → tree 분기 1 forward 처리.
+//   parent[t] = tree 부모 노드 인덱스(<t, topo순), 또는 <0이면 root(Sin=committed state서).
+//   parent[t]==t-1(선형 chain)이면 Ssnap[t-1] reload = 기존 carry와 bit-identical(snapshot 검증, ch9 de-risk).
+//   Ssnap 항상 매-노드 기록(자식이 부모 읽음). matmul/attn amortize는 별도(SB 커널/tree mask); 여기선 GDN recurrence 정확성.
+template<int D, int KSPLIT>
+static __global__ void __launch_bounds__(D*KSPLIT, 1) gdn_step_ksplit_tree_kernel(
+        const float *Qn, const float *Kn, const float *V, const float *G, const float *Bt,
+        const float *Sin, const int *parent, float *Ssnap, float *O, int Sq, int NH, int NHk) {
+    constexpr int KL = D / KSPLIT;
+    int h = blockIdx.x, tid = threadIdx.x, v = tid & (D-1), grp = tid / D, kb = grp*KL, gq = h*NHk/NH;
+    extern __shared__ float sh[]; float *qs = sh, *ks = sh + D, *part = sh + 2*D;
+    float scol[KL];
+    for (int t=0;t<Sq;t++) {
+        int p = parent[t];                              // 부모 노드(또는 <0=root)
+        #pragma unroll
+        for (int j=0;j<KL;j++)                          // carry 대신 parent snapshot서 reload (root는 Sin)
+            scol[j] = (p>=0) ? Ssnap[((size_t)p*NH+h)*D*D + (size_t)(kb+j)*D + v]
+                             : (Sin ? Sin[((size_t)h*D + (kb+j))*D + v] : 0.f);
+        size_t base = ((size_t)t*NH+h)*D, base_qk = ((size_t)t*NHk+gq)*D;
+        if (grp==0) { qs[v]=Qn[base_qk+v]; ks[v]=Kn[base_qk+v]; }
+        __syncthreads();
+        float g_t=expf(G[(size_t)t*NH+h]), beta_t=Bt[(size_t)t*NH+h];
+        float kvp=0.f;
+        #pragma unroll
+        for (int j=0;j<KL;j++){ scol[j]*=g_t; kvp+=scol[j]*ks[kb+j]; }
+        part[grp*D+v]=kvp; __syncthreads();
+        float kv=0.f;
+        #pragma unroll
+        for (int gg=0;gg<KSPLIT;gg++) kv+=part[gg*D+v];
+        float delta=(V[base+v]-kv)*beta_t, outp=0.f;
+        #pragma unroll
+        for (int j=0;j<KL;j++){ scol[j]+=ks[kb+j]*delta; outp+=scol[j]*qs[kb+j]; }
+        __syncthreads();
+        part[grp*D+v]=outp; __syncthreads();
+        if (grp==0){ float o=0.f; for(int gg=0;gg<KSPLIT;gg++) o+=part[gg*D+v]; O[base+v]=o; }
+        { float*snap=Ssnap+(size_t)t*NH*D*D+(size_t)h*D*D;   // 매 노드 snapshot(자식이 읽음)
+          #pragma unroll
+          for (int j=0;j<KL;j++) snap[(size_t)(kb+j)*D+v]=scol[j]; }
+        __syncthreads();
+    }
+}
+template<int D, int KSPLIT>
+static inline void launch_gdn_step_ksplit_tree(const float *Qn, const float *Kn, const float *V,
+                                   const float *G, const float *Bt, const float *Sin, const int *parent,
+                                   float *Ssnap, float *O, int Sq, int NH, int NHk, cudaStream_t st = 0) {
+    size_t shmem = (size_t)(2*D + KSPLIT*D) * sizeof(float);
+    gdn_step_ksplit_tree_kernel<D,KSPLIT><<<NH, D*KSPLIT, shmem, st>>>(Qn,Kn,V,G,Bt,Sin,parent,Ssnap,O,Sq,NH,NHk);
+}
+
 // ---- batch decode GDN step (챕터3): B 독립 시퀀스, 각 1스텝(행 간 recurrence 없음 — 병렬) ----
 //   Q,K,V,O: [B, NH, D]. G,Bt: [B, NH]. Sin/Sout: [B, NH, D, D] (시퀀스별 committed state). 1 step씩.
 //   grid(NH, B): 블록(h,b)가 시퀀스 b·head h의 1스텝. Sout = 갱신된 state(commit). (snapshot 불요 — plain decode.)
