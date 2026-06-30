@@ -84,7 +84,7 @@ static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
     launch_rmsnorm_zc(cur3,m.norm,d_own,1,H,eps);      // own post-norm (다음 step h)
     int best=-1;
     if(want_logits){
-        if(dq4&&lmq) launch_gemv_q4(d_own,lmq->wq,lmq->sc,logits,H,V,1);  // draft lm_head q4 (tied=body lm_head q4, 2a 검증)
+        if(dq4&&lmq) launch_gemv_q4(d_own,lmq->wq,lmq->sc,logits,H,V,1,c.scale_dtype);  // draft lm_head q4 (tied=body lm_head q4); scale_dtype 전달(27B fp16 scale)
         else         launch_gemv_f32(d_own,E,logits,H,V,1);               // lm_head tie (fp32)
         // B1(device argmax) 측정 결과 역효과(-2%) — draft 비용은 lm_head gemv지 argmax 아님(nsys gemv 90%).
         // host argmax 유지 (DMA+CPU루프가 단일블록 GPU argmax보다 빠름).
@@ -109,7 +109,7 @@ int main(int argc,char**argv){
     std::vector<float> cl=rfg("rope_cos_long.bin",(size_t)128*rot), sl=rfg("rope_sin_long.bin",(size_t)128*rot);
     if(P+N+K>=128){printf("need longer rope table\n");return 1;}
     float *d_cos=up(cl),*d_sin=up(sl);
-    QwenWeights w=load_weights_qwen(WD.c_str(),c,1,1);  // q4+fp32 둘 다 (use_q4 토글)
+    QwenWeights w=load_weights_qwen(WD.c_str(),c,1, bq4==0?1:0);  // fp32 body는 bq4==0일 때만(27B fp32=54GB 회피); embed는 항상 fp32
     MtpW mw=load_mtp(c); float*E=w.embed;
     int *d_tok; CK(cudaMalloc(&d_tok,maxlen*4));
 
