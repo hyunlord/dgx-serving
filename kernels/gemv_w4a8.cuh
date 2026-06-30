@@ -47,6 +47,56 @@ static __global__ void gemv_w4a8_kernel(const int8_t *xq, const float *xs, const
     if (lane == 0) Y[(size_t)s * OUT + o] = acc;
 }
 
+// 챕터9 roofline 실험: MLP↑ 변형 — U청크 로드를 먼저 모두 issue 후 compute (long_scoreboard latency를 outstanding
+//   load U개로 숨김). acc 누적 순서가 baseline과 동일(같은 base 순열, u-순 누적) → bit-exact. U는 register 압력↑(occupancy
+//   trade) → 경험적 측정. baseline gemv_w4a8_kernel과 출력 0-diff 게이트.
+template<typename ST, int U>
+static __global__ void gemv_w4a8_mlp_kernel(const int8_t *xq, const float *xs, const int32_t *,
+                                        const uint8_t *Wq, const ST *sw,
+                                        float *Y, int IN, int OUT, int S) {
+    long gw = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (gw >= (long)S * OUT) return;
+    int s = (int)(gw / OUT), o = (int)(gw % OUT);
+    const int8_t  *xqr = xq + (size_t)s * IN;
+    const float   *xsr = xs + (size_t)s * (IN / QBLK);
+    const uint8_t *w   = Wq + (size_t)o * (IN / 2);
+    const ST      *swr = sw + (size_t)o * (IN / QBLK);
+    float acc = 0.f;
+    const int STRIDE = 32*8;
+    for (int g = lane * 8; g < IN; g += STRIDE * U) {
+        unsigned Wv[U]; int x0v[U], x1v[U]; float scb[U]; bool ok[U];
+        #pragma unroll
+        for (int u=0; u<U; u++) {                                  // load phase: U개 동시 발사(MLP↑)
+            int base = g + u*STRIDE;
+            ok[u] = base < IN;
+            if (ok[u]) {
+                int blk = base / QBLK;
+                scb[u] = xsr[blk] * sval(swr[blk]);
+                Wv[u]  = *reinterpret_cast<const unsigned*>(w + (base >> 1));
+                x0v[u] = *reinterpret_cast<const int*>(xqr + base);
+                x1v[u] = *reinterpret_cast<const int*>(xqr + base + 4);
+            }
+        }
+        #pragma unroll
+        for (int u=0; u<U; u++) if (ok[u]) {                       // compute phase: u-순 누적 = baseline과 동일 순서(bit-exact)
+            int dot = __dp4a(x0v[u], w4a8_pk( Wv[u] & 0xFF, (Wv[u] >> 8) & 0xFF), 0);
+            dot     = __dp4a(x1v[u], w4a8_pk((Wv[u] >> 16) & 0xFF, (Wv[u] >> 24) & 0xFF), dot);
+            acc += scb[u] * (float)dot;
+        }
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) Y[(size_t)s * OUT + o] = acc;
+}
+template<int U>
+static inline void launch_gemv_w4a8_mlp(const int8_t *xq, const float *xs, const int32_t *xsum,
+                                    const uint8_t *Wq, const void *sw, float *Y,
+                                    int IN, int OUT, int S, int scale_dtype = 0, cudaStream_t st = 0) {
+    long warps = (long)S * OUT; int block = 256; unsigned grid = (unsigned)((warps*32 + block-1)/block);
+    if (scale_dtype == 1) gemv_w4a8_mlp_kernel<__half,U><<<grid,block,0,st>>>(xq,xs,xsum,Wq,(const __half*)sw,Y,IN,OUT,S);
+    else                  gemv_w4a8_mlp_kernel<float,U><<<grid,block,0,st>>>(xq,xs,xsum,Wq,(const float*)sw,Y,IN,OUT,S);
+}
+
 // ── 소-batch W4A8 GEMV (verify Sq=2~8) ─────────────────────────────────────────
 // 챕터8 STEP D: warp 1개 = 출력 o 1개. weight를 1회만 적재(DRAM)하고 S개 활성화 컬럼에
 //   대해 S개 accumulator로 DP4A. weight DRAM 트래픽 = Sq=1 gemv와 동일(=1회) → 대역폭 최적.
@@ -87,6 +137,8 @@ static __global__ void gemv_w4a8_sb_kernel(const int8_t *xq, const float *xs,
         if (lane == 0) Y[(size_t)s * OUT + o] = r;
     }
 }
+
+// (챕터9 SB-MLP 실험 제거: SB는 S-accumulator로 이미 ILP 충분 — weight U-unroll이 occupancy만↓, spec 21.3→20.7 역효과.)
 
 static inline void launch_gemv_w4a8(const int8_t *xq, const float *xs, const int32_t *xsum,
                                     const uint8_t *Wq, const void *sw,

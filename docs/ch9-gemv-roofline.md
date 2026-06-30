@@ -44,3 +44,16 @@ base 천장 = bytes 14.4GB ÷ peak: @251(read-STREAM)=57.4ms=**17.4 t/s**, @273=
 ## 정직 정정
 "21 t/s = 커널 극한"(직전 결론)은 **상대 비교(llama 72%)+warm 측정 기반 = 미입증.** 절대 roofline은 1.58× 갭이 load-latency
 (unpack 아님). 극한 확정하려면 in-engine gemv-MLP 실험 필요. (2bit는 별개로 품질 NO-GO 유지.)
+
+## 실험 결과 — base lever 확인 (B 부분 입증, "21=극한" 반증)
+`gemv_w4a8_mlp_kernel<U>`(kernels/gemv_w4a8.cuh): U청크 weight/X 로드를 먼저 issue 후 compute — outstanding load U개로
+long_scoreboard latency 숨김. acc 순서 baseline과 동일 = **bit-exact 0-diff**(`tools/ncu_gemv_mlp.cu` + in-engine mism=0).
+- 격리(warm, FFN gate): baseline 70% → **mlp U=2 75%(+7%)**, U≥2 포화.
+- **in-engine base decode(bench, 27B fp16s): 11.0 → 11.9 t/s (+8%, TPOT 90.6→84.2ms).** Sq==1 gemv를 mlp<2>로.
+- **→ "21=극한" 반증: gemv는 latency-bound였고 MLP가 +8% 회복(bw 70→75%).** 단 75%서 포화 = 그 위는 실용 천장 근접.
+- **단 spec은 +2%만**(20.9→21.3): spec verify는 Sq=nodes로 `gemv_w4a8_sb`(SB) 경로 — SB는 S-accumulator로 이미 ILP
+  충분, MLP(weight U-unroll)가 occupancy만↓ → **SB-MLP 역효과(spec 21.3→20.7), 미적용/제거.** base(Sq=1)만 MLP 이득.
+- mism=0(0.8B·27B) + 결정성. 커밋.
+
+**정직 좌표 갱신:** base 11.0→11.9(+8%), spec 20.9→21.3. "21=극한"은 반증됐으나 gemv 75% 포화 = base 추가 여지는 작음.
+다음 큰 lever = **accept**(verify가 spec의 72% 지배 — accept↑가 직결). 90의 accept 항(별도 draft)을 우리도 측정.
