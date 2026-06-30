@@ -25,7 +25,8 @@ __device__ __forceinline__ unsigned fa_pkbf(const __nv_bfloat16 &x, const __nv_b
 //   B_SPLIT은 BC 배수(타일 정렬). FD_SPLIT_KV(512=32·BC16) 재사용.
 template<int HD, int BR, int BC, int NW>
 static __global__ void flash_attn2bs_p1_kernel(const float *Q, const __nv_bfloat16 *Kc, const __nv_bfloat16 *Vc,
-                                               float *pm, float *pl, float *pacc, int Sq, int NQ, int NKV, int base, int NS) {
+                                               float *pm, float *pl, float *pacc, int Sq, int NQ, int NKV, int base, int NS,
+                                               const unsigned *anc = nullptr) {  // 챕터9: anc[gq]=tree 조상 비트마스크(null=causal)
     int q0 = blockIdx.x * BR, h = blockIdx.y, sp = blockIdx.z;
     int GRP = NQ / NKV, kv = h / GRP;
     int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -66,7 +67,10 @@ static __global__ void flash_attn2bs_p1_kernel(const float *Q, const __nv_bfloat
         if (tid < BR) { int r=tid, gq=q0+r, qpos=base+gq;
             if (gq < Sq) {
                 float tm=-FLT_MAX;
-                for (int j=0;j<BC;j++){ int gk=j0+j; float s=(gk<=qpos)?sS[r][j]:-FLT_MAX; sS[r][j]=s; tm=fmaxf(tm,s); }
+                for (int j=0;j<BC;j++){ int gk=j0+j;
+                    // causal(anc=null) 또는 tree mask: prefix(gk<base) 항상, tree노드(gk>=base)는 anc[gq] 비트(조상-or-self)만.
+                    bool att = anc ? ((gk<base) || ((gk-base)<=gq && ((anc[gq]>>(gk-base))&1u))) : (gk<=qpos);
+                    float s=att?sS[r][j]:-FLT_MAX; sS[r][j]=s; tm=fmaxf(tm,s); }
                 float mnew=fmaxf(sm[r],tm), alpha=expf(sm[r]-mnew), tl=0.f;
                 for (int j=0;j<BC;j++){ float p=expf(sS[r][j]-mnew); sP[r][j]=__float2bfloat16(p); tl+=p; }
                 sl[r]=sl[r]*alpha+tl; sm[r]=mnew; salpha[r]=alpha;
@@ -110,22 +114,22 @@ static __global__ void flash_attn2bs_p2_kernel(const float *pm, const float *pl,
 static float *g_bs_m=nullptr, *g_bs_l=nullptr, *g_bs_acc=nullptr; static size_t g_bs_cap=0;
 template<int HD, int BC, int NW>
 static inline void launch_flash_attn2bs(const float *Q, const __nv_bfloat16 *Kc, const __nv_bfloat16 *Vc, float *O,
-                                        int Sq, int NQ, int NKV, int base, cudaStream_t st = 0) {
+                                        int Sq, int NQ, int NKV, int base, cudaStream_t st = 0, const unsigned *anc = nullptr) {
     int maxlen = base + Sq, NS = (maxlen + FD_SPLIT_KV - 1)/FD_SPLIT_KV;
     size_t need = (size_t)Sq*NQ*NS;
     if (g_bs_cap < need) { if(g_bs_m)cudaFree(g_bs_m); if(g_bs_l)cudaFree(g_bs_l); if(g_bs_acc)cudaFree(g_bs_acc);
         cudaMalloc(&g_bs_m,need*4); cudaMalloc(&g_bs_l,need*4); cudaMalloc(&g_bs_acc,need*HD*4); g_bs_cap=need; }
     dim3 g1((Sq + 15)/16, NQ, NS);
-    flash_attn2bs_p1_kernel<HD, 16, BC, NW><<<g1, 32*NW, 0, st>>>(Q,Kc,Vc,g_bs_m,g_bs_l,g_bs_acc,Sq,NQ,NKV,base,NS);
+    flash_attn2bs_p1_kernel<HD, 16, BC, NW><<<g1, 32*NW, 0, st>>>(Q,Kc,Vc,g_bs_m,g_bs_l,g_bs_acc,Sq,NQ,NKV,base,NS,anc);
     flash_attn2bs_p2_kernel<HD><<<Sq*NQ, HD, 0, st>>>(g_bs_m,g_bs_l,g_bs_acc,O,Sq,NQ,NS);
 }
 
 static inline void launch_flash_attn(const float *Q, const __nv_bfloat16 *Kc, const __nv_bfloat16 *Vc, float *O,
-                                     int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
+                                     int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0, const unsigned *anc = nullptr) {
     // ★ B: MMA 단일 커널 + KV split(split=f(attendlen), Sq·split 독립 → 완전 일관). prefill split=1(FA.2b.1
     //   멀티워프 MMA, 빠름) + decode split>1(MMA + KV 분할, GPU 채움). 검증된 두 조각(FA.2b.1 + flash_decode 2-패스) 결합.
-    if      (HD == 256) launch_flash_attn2bs<256, 16, 8>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
-    else if (HD == 128) launch_flash_attn2bs<128, 16, 8>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st);
+    if      (HD == 256) launch_flash_attn2bs<256, 16, 8>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st, anc);
+    else if (HD == 128) launch_flash_attn2bs<128, 16, 8>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st, anc);
     else {
         fprintf(stderr, "[flash_attn] 미지원 head_dim=%d (128/256만). 조용한 오답 대신 중단합니다.\n", HD);
         abort();

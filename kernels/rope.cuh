@@ -75,6 +75,32 @@ static inline void launch_rope_partial(float *T, const float *cos, const float *
     rope_partial_kernel<<<grid, block, 0, st>>>(T, cos, sin, S, NH, HD, rot_dim);
 }
 
+// 챕터9 tree rope: 행 s의 위치를 pos[s]로(=base+tree depth). cos/sin은 전체 테이블(offset 없음).
+//   tree 노드는 layout slot이 아니라 tree depth로 rope해야(branch 형제는 같은 depth=같은 위치). chain이면 pos[s]=base+s = 기존과 동일.
+static __global__ void rope_partial_pos_kernel(float *T, const float *cos, const float *sin, const int *pos,
+                                    int S, int NH, int HD, int rot_dim) {
+    int half = rot_dim >> 1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S * NH * half;
+    if (idx >= total) return;
+    int i = idx % half;
+    int h = (idx / half) % NH;
+    int s = idx / (half * NH);
+    float *base = T + ((size_t)s * NH + h) * HD;
+    float t1 = base[i], t2 = base[i + half];
+    size_t p = (size_t)pos[s];
+    float c = cos[p * rot_dim + i], sn = sin[p * rot_dim + i];
+    base[i]        = t1 * c - t2 * sn;
+    base[i + half] = t2 * c + t1 * sn;
+}
+static inline void launch_rope_partial_pos(float *T, const float *cos, const float *sin, const int *pos,
+                                       int S, int NH, int HD, int rot_dim, cudaStream_t st = 0) {
+    int block = 256;
+    int total = S * NH * (rot_dim >> 1);
+    int grid = (total + block - 1) / block;
+    rope_partial_pos_kernel<<<grid, block, 0, st>>>(T, cos, sin, pos, S, NH, HD, rot_dim);
+}
+
 // batch decode rope (챕터3): B 독립 시퀀스 모두 같은 position(same-length) → cos/sin은 그 position 행 1개 공유.
 //   cos/sin 포인터 = d_cos + base*rot (호출측 offset). s(=행=시퀀스)는 cos 인덱싱에 안 들어감.
 static __global__ void rope_partial_batch_kernel(float *T, const float *cos, const float *sin,

@@ -102,7 +102,8 @@ void free_verify_artifacts(VerifyArtifacts &v) { if(v.gdn_snap)cudaFree(v.gdn_sn
 void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                    const int *d_tokens, int Sq, const float *d_cos, const float *d_sin,
                    float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4,
-                   float *d_postnorm, int last_logits_only) {
+                   float *d_postnorm, int last_logits_only,
+                   const int *d_parent, const unsigned *d_anc, const int *d_pos) {
     g_sdtype = c.scale_dtype;
     const int H=c.hidden_size, FFN=c.intermediate_size, HD=c.head_dim, V=c.vocab_size;
     const int NQ=c.num_q_heads, NKV=c.num_kv_heads, rot=c.rotary_dim;
@@ -124,7 +125,7 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     float *gm=ws(wi,(size_t)Sq*FFN),*um=ws(wi,(size_t)Sq*FFN),*act=ws(wi,(size_t)Sq*FFN),*dbuf=ws(wi,SH),*fn=ws(wi,SH);
     // GDN snapshot scratch: verify(va)만 per-token([Sq,NH,D²]); plain prefill/decode는 최종 state 1개([NH,D²]).
     //   va 없을 때 Sq×NH×D² 폭발 방지(32K prefill에서 103GB→3MB — 시스템 크래시 근본 원인 제거).
-    float *snap=ws(wi,(size_t)(va?Sq:1)*nvh*hv*hv);
+    float *snap=ws(wi,(size_t)((va||d_parent)?Sq:1)*nvh*hv*hv);  // tree(d_parent)는 노드별 fork용 per-node snapshot 필수
     float *convfull=ws(wi,(size_t)(Kk-1+Sq)*convd);
 
     // W4A8 shared-X quantize 버퍼: norm/n2(IN=H)를 1회 양자화해 q/k/v(또는 in_qkv/in_z)·gate/up 재사용.
@@ -151,20 +152,23 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             launch_rmsnorm_zc(qb,L.q_norm,qn,Sq*NQ,HD,eps);
             MMs(L.k,norm,xqn,xsn,kb,H,kvdim); launch_rmsnorm_zc(kb,L.k_norm,kn,Sq*NKV,HD,eps);
             MMs(L.v,norm,xqn,xsn,vb,H,kvdim);
-            // rope (위치 base..base+Sq-1) on q and on k (k는 저장 전 roped)
-            launch_rope_partial(qn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,Sq,NQ,HD,rot);
-            launch_rope_partial(kn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,Sq,NKV,HD,rot);
+            // rope on q and on k (k는 저장 전 roped). tree(d_pos): 노드별 위치=base+depth, 아니면 contiguous base..base+Sq-1
+            if (d_pos) { launch_rope_partial_pos(qn,d_cos,d_sin,d_pos,Sq,NQ,HD,rot);
+                         launch_rope_partial_pos(kn,d_cos,d_sin,d_pos,Sq,NKV,HD,rot); }
+            else       { launch_rope_partial(qn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,Sq,NQ,HD,rot);
+                         launch_rope_partial(kn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,Sq,NKV,HD,rot); }
             // append roped K, V to cache at slot base.. (fp32 kn/vb → bf16 cache 변환 저장)
             launch_f32_to_bf16(kn, st.Kc[l]+(size_t)base*kvdim, (size_t)Sq*kvdim);
             launch_f32_to_bf16(vb, st.Vc[l]+(size_t)base*kvdim, (size_t)Sq*kvdim);
-            launch_flash_attn(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, NKV, HD, base);  // FA.1a: tiled online-softmax (상수 shared, 12K 벽 없음)
+            launch_flash_attn(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, NKV, HD, base, 0, d_anc);  // FA.1a + tree mask(d_anc=조상 비트마스크, null=causal)
             launch_gate_sigmoid(attn, gate, (int)((size_t)Sq*qdim));
             mm(L.o,attn,ob,qdim,H,Sq,use_q4);
             launch_add(after,x,ob,(int)SH);
         } else {
             MMs(L.in_qkv,norm,xqn,xsn,mixed,H,convd);
-            // conv: prev = convctx[l] (직전 K-1 토큰)
-            launch_gdn_conv1d_silu_decode(mixed, st.convctx[l], L.conv1d, mconv, Sq, convd, Kk);
+            // conv: prev = convctx[l] (직전 K-1 토큰). tree(d_parent): window를 조상-path로(STEP 2)
+            if (d_parent) launch_gdn_conv1d_silu_decode_tree(mixed, st.convctx[l], d_parent, L.conv1d, mconv, Sq, convd, Kk);
+            else          launch_gdn_conv1d_silu_decode(mixed, st.convctx[l], L.conv1d, mconv, Sq, convd, Kk);
             DK(cudaMemcpy2D(qg2,kdim*4,mconv,convd*4,kdim*4,Sq,cudaMemcpyDeviceToDevice));
             DK(cudaMemcpy2D(kg2,kdim*4,mconv+kdim,convd*4,kdim*4,Sq,cudaMemcpyDeviceToDevice));
             DK(cudaMemcpy2D(vg2,vdim*4,mconv+2*kdim,convd*4,vdim*4,Sq,cudaMemcpyDeviceToDevice));
@@ -174,9 +178,12 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
             // gdn_step from committed S, Sq steps, snapshot
             if (hv==128) {  // STEP1 GDN k-split(8.75×): qk l2norm in-place(안전,자기원소) + occupancy↑ ksplit. Sq일관 보존(결합순서 Sq-무관)
                 launch_gdn_qk_norm(qg2,kg2,qg2,kg2, Sq*c.gdn_num_k_heads, hv);
-                launch_gdn_step_ksplit<128,2>(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, c.gdn_num_k_heads, va?1:0);
-            } else
-            launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv, c.gdn_num_k_heads, va?1:0);  // fallback(D≠128)
+                if (d_parent) launch_gdn_step_ksplit_tree<128,2>(qg2,kg2,vg2,gg,beta, st.S[l], d_parent, snap, core, Sq, nvh, c.gdn_num_k_heads);  // STEP1 tree fork
+                else          launch_gdn_step_ksplit<128,2>(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, c.gdn_num_k_heads, va?1:0);
+            } else {
+                if (d_parent) { fprintf(stderr,"[qwen35_decode] tree-verify는 GDN head_v_dim=128만(현재 %d). 조용한 오답 대신 중단.\n",hv); abort(); }
+                launch_gdn_step(qg2,kg2,vg2,gg,beta, st.S[l], snap, core, Sq, nvh, hv, c.gdn_num_k_heads, va?1:0);  // fallback(D≠128)
+            }
             if (!commit && va) {  // verify: per-step GDN snapshot + conv mixed → va (승격용)
                 size_t ssz=(size_t)nvh*hv*hv;
                 for(int t=0;t<Sq;t++)
