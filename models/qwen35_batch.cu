@@ -6,6 +6,7 @@
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemm_batch.cuh"
+#include "../kernels/gemv_w4a8.cuh"   // 챕터9: B≤8 batch decode에 SB 커널(odd-B 1적재)
 #include "../kernels/gemv_f32.cuh"
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/rope.cuh"
@@ -81,7 +82,10 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             if(g_bxcap<n){ if(g_bxq)cudaFree(g_bxq);if(g_bxs)cudaFree(g_bxs);if(g_bxsum)cudaFree(g_bxsum);
                 BK(cudaMalloc(&g_bxq,n)); BK(cudaMalloc(&g_bxs,(n/QBLK)*4)); BK(cudaMalloc(&g_bxsum,(n/QBLK)*4)); g_bxcap=n; }
             launch_quantize_x_q8(X,g_bxq,g_bxs,g_bxsum,IN,B);          // B행 X 양자화(1 launch)
-            launch_gemm_batch_w4a8(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);   // 챕터4: W4A8은 lane-minor가 이미 최적(mw 무익)
+            // 챕터9 batch serving: B≤8은 SB 커널(런타임 S, 1적재 — gemm_batch의 odd-B default 루프[B× 재적재] 회피).
+            //   gemv_w4a8_sb<SMAX=8>와 gemm_batch_w4a8<B>는 동일 구조·누적순서 → bit-exact. B>8은 기존 gemm_batch.
+            if(B<=8) launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
+            else     launch_gemm_batch_w4a8(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);   // 챕터4: W4A8 lane-minor 최적
         } else if(use_q4){ if(!launch_gemm_mw_q4(X,m.wq,m.sc,Y,IN,OUT,B,sdtype)) launch_gemm_batch_q4(X,m.wq,m.sc,Y,IN,OUT,B,sdtype); }  // q4만 mw 이득(B≥4)
         else              launch_gemm_batch_f32(X,m.wf,Y,IN,OUT,B);      // fp32: bandwidth-bound, mw 무익
     };
