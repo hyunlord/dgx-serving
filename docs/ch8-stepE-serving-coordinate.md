@@ -3,6 +3,16 @@
 > 목적: 지금까지 비교는 llama.cpp(B=1)뿐. 진짜 "서빙 엔진" 좌표는 **llama(B=1 latency) + vLLM(batch
 > throughput)** 둘 다 필요. 강점 축이 다르므로 혼동 없이 분리 측정한다. (측정-우선·정직.)
 
+> ## ⚠ 정정 (2026-06-30, 사용자 지적 — 반드시 먼저 읽을 것)
+> 아래 본문의 **"vLLM 양 축 압도"는 과장**이다. 측정한 vLLM 4.4 t/s는 **튜닝 안 된 vLLM**(speculative 없음 +
+> NVFP4 없음 + GB10×GDN fla 미최적)이다. 같은 DGX Spark·Qwen3.5-27B에서 **제대로 튜닝된 speculative 계열은
+> 우리보다 빠르다**(포럼): **DFlash+int4 code 65~94**(우리 spec 24.6의 2.6~3.8×) / Q&A 45~65, **NVFP4-MTP 19.7**
+> (우리 fact 19.8과 ~동급). 즉 경쟁자를 미튜닝 상태로 재고 우리 최적(spec)과 비교한 사과-오렌지였다.
+> **정확한 좌표: 우리는 llama.cpp 13.7(non-spec baseline)을 추월 + mism=0 bit-identical 정확성 보장 — 이게 사실.
+> speculative+FP4 계열(DFlash/NVFP4)에선 뒤지거나 동급. "서빙/범용 추월"은 전혀 아니다.**
+> 차별점(구제 아님): DFlash int4 품질 문제(출력 꼬임, FP8만 coherent — 65~94가 정확성 검증된 건지 불명) vs 우리
+> mism=0. 속도 따라잡기 lever = NVFP4(GB10 네이티브 FP4 텐서코어 — 우리는 int4+DP4A로 미사용). [[honest-perf-coordinates-not-overtake]] ③
+
 ## 두 축 (혼동 금지)
 
 | 축 | 의미 | 일반적 강자 | 우리 무기 |
@@ -65,11 +75,15 @@ vLLM의 batch 강점이 이 niche서 완전 무력화. (우리 batch도 B=16 pla
 
 ## 정직한 결론
 
-**GB10 × Qwen3.5(GDN) 이 niche에서 우리 특화 엔진이 양 축 모두 vLLM을 크게 앞선다** — 축1(latency) 우리 spec
-16.9~24.6 vs vLLM 4.4 (3.8~5.6×), 축2(throughput) 우리 B=1 12 이미 vLLM B=8 4.7 초과. **단 이는 "범용 프레임워크
-추월"이 아니라 vLLM이 이 특정 조합(GB10 sm_121 × GDN)에 미튜닝됐기 때문** — 바로 CLAUDE.md 정체성("단일 장비 ×
-특정 모델군 최적화")이 빛나는 지점이다. llama.cpp(B=1 13.7, 동일 niche에 잘 튜닝됨)가 vLLM보다 우리의 진짜
-경쟁자이며, 우리 MTP spec(16.9~24.6)가 그 llama를 1.25~1.80× 추월한 것이 핵심 성과(STEP D).
+**[정정된 결론]** 우리가 측정한 vLLM(4.4)은 **미튜닝 baseline**(spec/NVFP4 없음 + GDN fla 미최적)이라, 그걸 우리
+spec(16.9~24.6)과 비교한 "양 축 압도"는 **사과-오렌지 과장**이었다(⚠ 상단). **정확한 좌표:**
+- ✓ **사실**: 우리는 **llama.cpp 13.7(non-spec baseline)을 추월**(spec 16.9~24.6, 1.25~1.80×) + **mism=0
+  bit-identical 정확성 보장**. 미튜닝 vLLM(4.4)보다도 빠름(단 그건 약한 비교군).
+- ✗ **거짓(과장)**: "서빙 엔진/vLLM 압도." 같은 HW·모델서 **튜닝된 speculative 계열이 우리보다 빠름** —
+  DFlash+int4 code 65~94(우리 24.6의 2.6~3.8×), NVFP4-MTP 19.7(≈우리 fact). speculative+FP4 계열선 뒤지거나 동급.
+- **우리 위치**: "llama baseline 추월 + 검증된 정확성(bit-identical)"이 정직한 차별점. 단 속도 SOTA는 아님
+  (NVFP4/FP4 텐서코어 미사용 + 손수 MTP가 DFlash 대비 격차). CLAUDE.md 정체성(특화 엔진)은 llama 대비 유효하나,
+  같은 niche의 다른 특화 접근(DFlash/NVFP4)이 더 빠르므로 "우리가 최적"은 아님.
 
 **판정 보류(다음 결정):**
 - 우리 batch 경로 스케일링 약함(per-seq attention 루프) → continuous batching/paged-KV + SB 커널 통합으로 축2
