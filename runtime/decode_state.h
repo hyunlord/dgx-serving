@@ -51,4 +51,8 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
 //   KV/cache 의 [n_past..n_past+m-1] 은 verify 중 이미 기록됨 → 길이 포인터만 전진.
 void promote_prefix(const ModelConfig &c, DecodeState &st, const VerifyArtifacts &va, int m);
 
+// 챕터9 STEP4: tree verify 후 accept된 path(노드 인덱스 path[0..plen-1], path[0]=root, strictly increasing) 승격.
+//   GDN S=snap[path末], conv ctx=path mixed 마지막 K-1, KV(full-attn)=path 노드를 contiguous slot으로 compaction. n_past+=plen.
+void promote_tree_path(const ModelConfig &c, DecodeState &st, const VerifyArtifacts &va, const int *path, int plen);
+
 #endif // DGX_DECODE_STATE_H

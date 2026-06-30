@@ -14,7 +14,7 @@ ENGINE_SRCS := models/smollm3.cu runtime/weights.cu
 # *_27b/*_35b/moe 테스트는 대형모델 artifacts 필요, test_gemv_q4_scale 는 측정 도구 → 기본 스위트 제외(수동).
 TEST_SRCS := $(filter-out tests/test_27b.cu tests/test_gdn_27b.cu tests/test_attn_27b.cu tests/test_gemv_q4_scale.cu \
              tests/test_35b.cu tests/test_gdn_35b.cu tests/test_moe_expert.cu tests/test_rope_gen.cu tests/test_chunk_prefill.cu \
-             tests/test_long_ctx.cu tests/test_treeamort.cu, $(wildcard tests/*.cu))
+             tests/test_long_ctx.cu tests/test_treeamort.cu tests/test_treespec.cu, $(wildcard tests/*.cu))
 TEST_BINS := $(TEST_SRCS:.cu=)
 
 HEADERS := $(wildcard kernels/*.cuh) $(wildcard runtime/*.h) $(wildcard models/*.h)
@@ -46,6 +46,12 @@ tests/test_treefork: tests/test_treefork.cu models/qwen35.cu models/qwen35_decod
 
 tests/test_treeverify: tests/test_treeverify.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_treeverify.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu -o $@
+
+tests/test_treepromote: tests/test_treepromote.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_treepromote.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu -o $@
+
+tests/test_treespec_e2e: tests/test_treespec_e2e.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_treespec_e2e.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu -o $@
 
 # 수동(27B 필요, 느림): tree 1-forward amortize 속도 de-risk. 사용법: ./tests/test_treeamort [weights] [golden] [bq4]
 tests/test_treeamort: tests/test_treeamort.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu $(HEADERS)

@@ -252,3 +252,36 @@ void promote_prefix(const ModelConfig &c, DecodeState &st, const VerifyArtifacts
     st.n_past += m;
     cudaFree(cf);
 }
+
+// 챕터9 STEP4: tree verify 후 accept된 path(노드 인덱스 path[0..plen-1], path[0]=root) 승격.
+//   path는 strictly increasing(BFS layout parent<child) — KV compaction 안전(src=base+path[i]≥dst=base+i, 증가 i서 미리 읽음).
+//   GDN: S[l]=snap[path末]. conv ctx: old(K-1) ++ mixed[path[0..plen-1]] 의 마지막 K-1. KV(full): slot base+path[i]→base+i.
+void promote_tree_path(const ModelConfig &c, DecodeState &st, const VerifyArtifacts &va, const int *path, int plen) {
+    const int nvh=c.gdn_num_v_heads, hv=c.gdn_head_v_dim, convd=cfg_gdn_conv_dim(&c), Kk=c.gdn_conv_kernel;
+    const int NKV=c.num_kv_heads, HD=c.head_dim, kvdim=NKV*HD;
+    const size_t ssz=(size_t)nvh*hv*hv;
+    const int base=st.n_past, last=path[plen-1];
+    float *cf=dm((size_t)(Kk-1+plen)*convd);
+    int j=0;
+    for(int l=0;l<c.num_layers;l++){
+        if(c.layer_is_full[l]){
+            // KV compaction: accept된 path 노드를 contiguous base..base+plen-1로. (path 증가 → src≥dst, 안전)
+            for(int i=1;i<plen;i++) if(path[i]!=i){
+                DK(cudaMemcpy(st.Kc[l]+(size_t)(base+i)*kvdim, st.Kc[l]+(size_t)(base+path[i])*kvdim, (size_t)kvdim*sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+                DK(cudaMemcpy(st.Vc[l]+(size_t)(base+i)*kvdim, st.Vc[l]+(size_t)(base+path[i])*kvdim, (size_t)kvdim*sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+            }
+            continue;
+        }
+        // GDN state = path末 노드 snapshot (tree fork된 누적 state)
+        DK(cudaMemcpy(st.S[l], va.gdn_snap + ((size_t)last*va.n_linear + j)*ssz, ssz*4, cudaMemcpyDeviceToDevice));
+        // conv ctx: old(K-1) ++ mixed[path[0..plen-1]][j] 의 마지막 K-1
+        DK(cudaMemcpy(cf, st.convctx[l], (size_t)(Kk-1)*convd*4, cudaMemcpyDeviceToDevice));
+        for(int t=0;t<plen;t++)
+            DK(cudaMemcpy(cf+(size_t)(Kk-1+t)*convd, va.conv_mixed + ((size_t)path[t]*va.n_linear + j)*convd,
+                          (size_t)convd*4, cudaMemcpyDeviceToDevice));
+        DK(cudaMemcpy(st.convctx[l], cf+(size_t)plen*convd, (size_t)(Kk-1)*convd*4, cudaMemcpyDeviceToDevice));
+        j++;
+    }
+    st.n_past += plen;
+    cudaFree(cf);
+}
