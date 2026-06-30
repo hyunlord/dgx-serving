@@ -41,6 +41,8 @@ typedef struct ModelConfig {
     int gdn_num_k_heads, gdn_num_v_heads, gdn_head_k_dim, gdn_head_v_dim, gdn_conv_kernel;
     // MoE dims (num_experts==0 → dense 모델). qwen3_5_moe: experts/top-k/shared.
     int num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, norm_topk_prob;
+    // weight-scale dtype: 0=fp32, 1=fp16. xs(activation scale)는 항상 fp32.
+    int scale_dtype;
 } ModelConfig;
 
 // GDN 파생값

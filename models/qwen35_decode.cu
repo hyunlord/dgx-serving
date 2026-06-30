@@ -45,15 +45,16 @@ static int8_t *wsi8(int &idx, size_t n){
 // W4A8 per-call quantize 임시버퍼 (persistent, grow). STEP2b: 호출당 X 양자화(최악 호출수) — 측정용.
 //   STEP2c에서 shared-X(norm/n2)는 1회 양자화로 호출수↓ 예정.
 static int8_t *g_xq=nullptr; static float *g_xs=nullptr; static int32_t *g_xsum=nullptr; static size_t g_xqcap=0;
+static int g_sdtype;  // scale_dtype cached from ModelConfig
 static void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4) {
     if (use_q4==2) {                                   // W4A8: activation int8 per-block-32 + int4 weight
         size_t n=(size_t)S*IN;
         if (g_xqcap < n) { if(g_xq)cudaFree(g_xq); if(g_xs)cudaFree(g_xs); if(g_xsum)cudaFree(g_xsum);
             DK(cudaMalloc(&g_xq,n)); DK(cudaMalloc(&g_xs,(n/QBLK)*4)); DK(cudaMalloc(&g_xsum,(n/QBLK)*4)); g_xqcap=n; }
         launch_quantize_x_q8(X, g_xq, g_xs, g_xsum, IN, S);
-        if (S > 1) launch_gemm_mmq_w4a8(g_xq, g_xs, m.wq, m.sc, Y, S, OUT, IN);   // prefill: full-MMQ(STEP 0i, e2e 1.51× vs gemm_mma)
-        else       launch_gemv_w4a8(g_xq, g_xs, g_xsum, m.wq, m.sc, Y, IN, OUT, S);
-    } else if (use_q4) launch_gemm_tiled_q4(X, m.wq, m.sc, Y, S, OUT, IN);   // prefill tiled GEMM(Phase A); S=1은 gemv
+        if (S > 1) launch_gemm_mmq_w4a8(g_xq, g_xs, m.wq, m.sc, Y, S, OUT, IN, g_sdtype);   // prefill: full-MMQ(STEP 0i, e2e 1.51× vs gemm_mma)
+        else       launch_gemv_w4a8(g_xq, g_xs, g_xsum, m.wq, m.sc, Y, IN, OUT, S, g_sdtype);
+    } else if (use_q4) launch_gemm_tiled_q4(X, m.wq, m.sc, Y, S, OUT, IN, g_sdtype);   // prefill tiled GEMM(Phase A); S=1은 gemv
     else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
 }
 
@@ -101,6 +102,7 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                    const int *d_tokens, int Sq, const float *d_cos, const float *d_sin,
                    float *d_logits, float *d_prenorm, int commit, VerifyArtifacts *va, int use_q4,
                    float *d_postnorm, int last_logits_only) {
+    g_sdtype = c.scale_dtype;
     const int H=c.hidden_size, FFN=c.intermediate_size, HD=c.head_dim, V=c.vocab_size;
     const int NQ=c.num_q_heads, NKV=c.num_kv_heads, rot=c.rotary_dim;
     const float eps=c.rms_norm_eps;
@@ -129,8 +131,8 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     if (use_q4==2) { xqn=wsi8(bi,SH); xq2=wsi8(bi,SH); xsn=ws(wi,SH/QBLK); xs2=ws(wi,SH/QBLK); xsmN=ws(wi,SH/QBLK); }
     // shared-X gemv: use_q4==2면 미리 양자화한 (xq,xs) 사용(재양자화 안 함), 아니면 mm() 경로.
     auto MMs=[&](const QMat&m,const float*X,const int8_t*xqs,const float*xss,float*Y,int IN,int OUT){
-        if (use_q4==2) { if (Sq>1) launch_gemm_mmq_w4a8(xqs,xss,m.wq,m.sc,Y,Sq,OUT,IN);   // prefill full-MMQ(STEP 0i)
-                         else      launch_gemv_w4a8(xqs,xss,nullptr,m.wq,m.sc,Y,IN,OUT,Sq); }
+        if (use_q4==2) { if (Sq>1) launch_gemm_mmq_w4a8(xqs,xss,m.wq,m.sc,Y,Sq,OUT,IN,g_sdtype);   // prefill full-MMQ(STEP 0i)
+                         else      launch_gemv_w4a8(xqs,xss,nullptr,m.wq,m.sc,Y,IN,OUT,Sq,g_sdtype); }
         else           mm(m,X,Y,IN,OUT,Sq,use_q4);
     };
 

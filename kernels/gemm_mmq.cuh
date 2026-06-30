@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "qscale.cuh"
 #include "../runtime/config.h"   // QBLK
 #include "gemv_w4a8.cuh"         // S=1 fallback (gemm_mma와 동일 인터페이스 정신)
 
@@ -25,9 +26,9 @@ __device__ __forceinline__ void mmq_cpa4(void*s,const void*g,bool pred){
 
 // __launch_bounds__(256,2): reg≤128 강제 → 2 CTA/SM 목표(llama occ 29%=2CTA, 우리 reg137=1CTA 17% 매칭 시도).
 //   de-risk: occupancy↑가 lever인지(KT/sync 아님 — Warp Cycles 5.64 낮음). spill 역효과면 순효과 ncu로.
-template<int KT>
+template<int KT, typename ST>
 static __global__ void __launch_bounds__(256,2) gemm_mmq_kernel(const int8_t*X,const float*xs,const uint8_t*Wq,
-                                       const float*sw,float*Y,int M,int N,int K){
+                                       const ST*sw,float*Y,int M,int N,int K){
     constexpr int MS=MMQ_BM/32, NS=MMQ_BN/32, KS=KT/QBLK;       // 4,4, KT/32
     __shared__ int8_t  sA[2][MMQ_BM][KT+MMQ_AP];     // [buf][m][k] int8
     __shared__ uint8_t sB[2][MMQ_BN][KT/2+MMQ_BPAD]; // [buf][n][k/2] int4 packed
@@ -59,7 +60,7 @@ static __global__ void __launch_bounds__(256,2) gemm_mmq_kernel(const int8_t*X,c
             sXs[m][b]=(gm<M&&bk<nblk)?xs[(size_t)gm*nblk+bk]:0.f;}
         #pragma unroll
         for(int i=tid;i<MMQ_BN*KS;i+=256){int n=i/KS,b=i%KS,bk=it*KS+b,gn=n0+n;
-            sSw[n][b]=(gn<N&&bk<nblk)?sw[(size_t)gn*nblk+bk]:0.f;}
+            sSw[n][b]=(gn<N&&bk<nblk)?sval(sw[(size_t)gn*nblk+bk]):0.f;}
         __syncthreads();
         if(it+1<niter) load((it+1)&1,it+1);
         int cur=it&1;
@@ -112,12 +113,13 @@ static __global__ void __launch_bounds__(256,2) gemm_mmq_kernel(const int8_t*X,c
 // KT 스윕 진입점(de-risk/측정). KT은 16배수(ldmatrix 정렬) + shared 예산(KT=128 더블버퍼 ~53KB OK, 256은 ~106KB 불가).
 template<int KT>
 static inline void launch_gemm_mmq_w4a8_kt(const int8_t*X,const float*xs,const uint8_t*Wq,
-                                           const float*sw,float*Y,int M,int N,int K,cudaStream_t st=0){
+                                           const void*sw,float*Y,int M,int N,int K,int scale_dtype=0,cudaStream_t st=0){
     dim3 grid((N+MMQ_BN-1)/MMQ_BN, (M+MMQ_BM-1)/MMQ_BM);
-    gemm_mmq_kernel<KT><<<grid,256,0,st>>>(X,xs,Wq,sw,Y,M,N,K);
+    if(scale_dtype==1) gemm_mmq_kernel<KT,__half><<<grid,256,0,st>>>(X,xs,Wq,(const __half*)sw,Y,M,N,K);
+    else               gemm_mmq_kernel<KT,float ><<<grid,256,0,st>>>(X,xs,Wq,(const float*)sw,Y,M,N,K);
 }
 // 엔진 경로: KT=64 기본(c7f8ada 검증값). 측정 우월 확인+합의 후에만 KT 교체.
 static inline void launch_gemm_mmq_w4a8(const int8_t*X,const float*xs,const uint8_t*Wq,
-                                        const float*sw,float*Y,int M,int N,int K,cudaStream_t st=0){
-    launch_gemm_mmq_w4a8_kt<MMQ_KT>(X,xs,Wq,sw,Y,M,N,K,st);
+                                        const void*sw,float*Y,int M,int N,int K,int scale_dtype=0,cudaStream_t st=0){
+    launch_gemm_mmq_w4a8_kt<MMQ_KT>(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);
 }

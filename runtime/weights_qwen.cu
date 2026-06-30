@@ -18,14 +18,14 @@ static void *load_dev(const std::string &path, size_t bytes) {
 }
 
 namespace {
-std::string R; int QB; int LQ4, LF32;
+std::string R; int QB; int LQ4, LF32; int SD;
 float *f32(const std::string &n, size_t cnt) { return (float *)load_dev(R + n + ".bin", cnt * 4); }
 // matmul weight [OUT,IN]: q4 경로(wq + sc) / fp32 경로(wf), 플래그에 따라 로드.
 QMat mat(const std::string &n, size_t OUT, size_t IN) {
     QMat m;
     if (LQ4) {
         m.wq = (uint8_t *)load_dev(R + n + "_q4.bin", OUT * IN / 2);
-        m.sc = (float *)load_dev(R + n + "_scale.bin", (OUT * IN / QB) * 4);
+        m.sc = (void *)load_dev(R + n + "_scale.bin", (OUT * IN / QB) * (SD == 1 ? 2 : 4));
     }
     if (LF32) m.wf = (float *)load_dev(R + n + "_f32.bin", OUT * IN * 4);
     return m;
@@ -33,7 +33,7 @@ QMat mat(const std::string &n, size_t OUT, size_t IN) {
 }
 
 QwenWeights load_weights_qwen(const char *dir, const ModelConfig &c, int load_q4, int load_fp32) {
-    R = std::string(dir) + "/"; QB = QBLK; LQ4 = load_q4; LF32 = load_fp32;
+    R = std::string(dir) + "/"; QB = QBLK; LQ4 = load_q4; LF32 = load_fp32; SD = c.scale_dtype;
     const size_t H = c.hidden_size, FFN = c.intermediate_size, V = c.vocab_size, HD = c.head_dim;
     const size_t qdim2 = (size_t)c.num_q_heads * HD * (c.attn_output_gate ? 2 : 1);
     const size_t kvdim = (size_t)c.num_kv_heads * HD;

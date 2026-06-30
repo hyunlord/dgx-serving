@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "qscale.cuh"
 #include "../runtime/config.h"   // QBLK
 #include "gemv_w4a8.cuh"         // S=1 fallback
 
@@ -37,9 +38,9 @@ __device__ __forceinline__ void gm_cpa4(void *smem, const void *gmem, bool pred)
 // 챕터7 C.2: BM 템플릿화(weight 재read = M/BM회 → BM↑면 weight DRAM 트래픽↓, memory-bound 천장 돌파).
 //   8 warp 고정. wm∈{0,1} 2 m-그룹이 각 BM/2행을 (BM/32)개 m16 청크로. ns/wn(BN=64)은 불변.
 //   MMA·스케일 산수는 BM 무관 동일 → 정확성 보존(BM=64는 기존과 bitwise 동일).
-template<int BM>
+template<int BM, typename ST>
 static __global__ void gemm_mma_w4a8_pipe_kernel(const int8_t *X, const float *xs, const uint8_t *Wq,
-                                                 const float *sw, float *Y, int M, int N, int K) {
+                                                 const ST *sw, float *Y, int M, int N, int K) {
     constexpr int MS = BM/32;          // wm 그룹당 m16 청크 수 (BM=64→2, 128→4, 256→8)
     constexpr int MHALF = BM/2;        // wm 그룹당 행 수
     __shared__ int8_t  sX[2][BM][QBLK + MMA_PAD];       // [buf][m][k] X int8
@@ -98,7 +99,7 @@ static __global__ void gemm_mma_w4a8_pipe_kernel(const int8_t *X, const float *x
                   :"+r"(c0),"+r"(c1),"+r"(c2),"+r"(c3):"r"(af[ms][0]),"r"(af[ms][1]),"r"(af[ms][2]),"r"(af[ms][3]),"r"(bf[ns][0]),"r"(bf[ns][1]));
                 int rm0=m0+mb+g, rm1=m0+mb+g+8, cn0=n0+nb+t*2, cn1=n0+nb+t*2+1;
                 float xm0=(rm0<M)?xs[(size_t)rm0*nblk+blk]:0.f, xm1=(rm1<M)?xs[(size_t)rm1*nblk+blk]:0.f;
-                float sn0=(cn0<N)?sw[(size_t)cn0*nblk+blk]:0.f, sn1=(cn1<N)?sw[(size_t)cn1*nblk+blk]:0.f;
+                float sn0=(cn0<N)?sval(sw[(size_t)cn0*nblk+blk]):0.f, sn1=(cn1<N)?sval(sw[(size_t)cn1*nblk+blk]):0.f;
                 acc[ms][ns][0]+=c0*xm0*sn0; acc[ms][ns][1]+=c1*xm0*sn1; acc[ms][ns][2]+=c2*xm1*sn0; acc[ms][ns][3]+=c3*xm1*sn1;
             }
         }
@@ -118,13 +119,14 @@ static __global__ void gemm_mma_w4a8_pipe_kernel(const int8_t *X, const float *x
 // BM 스윕용 진입점(ncu/test). BM은 32의 배수(BM/2가 16배수 정렬).
 template<int BM>
 static inline void launch_gemm_mma_w4a8_bm(const int8_t *X, const float *xs, const uint8_t *Wq,
-                                           const float *sw, float *Y, int M, int N, int K, cudaStream_t st = 0) {
+                                           const void *sw, float *Y, int M, int N, int K, int scale_dtype = 0, cudaStream_t st = 0) {
     dim3 grid((N + MMA_BN - 1) / MMA_BN, (M + BM - 1) / BM);
-    gemm_mma_w4a8_pipe_kernel<BM><<<grid, 256, 0, st>>>(X, xs, Wq, sw, Y, M, N, K);    // Phase C cp.async 2-stage
+    if (scale_dtype == 1) gemm_mma_w4a8_pipe_kernel<BM,__half><<<grid, 256, 0, st>>>(X, xs, Wq, (const __half*)sw, Y, M, N, K);
+    else                  gemm_mma_w4a8_pipe_kernel<BM,float ><<<grid, 256, 0, st>>>(X, xs, Wq, (const float*)sw, Y, M, N, K);
 }
 
 // 엔진 경로: BM=64 고정(기존과 bitwise 동일, de-risk). 측정 우월 확인+합의 후에만 BM 교체.
 static inline void launch_gemm_mma_w4a8(const int8_t *X, const float *xs, const uint8_t *Wq,
-                                        const float *sw, float *Y, int M, int N, int K, cudaStream_t st = 0) {
-    launch_gemm_mma_w4a8_bm<MMA_BM>(X, xs, Wq, sw, Y, M, N, K, st);
+                                        const void *sw, float *Y, int M, int N, int K, int scale_dtype = 0, cudaStream_t st = 0) {
+    launch_gemm_mma_w4a8_bm<MMA_BM>(X, xs, Wq, sw, Y, M, N, K, scale_dtype, st);
 }

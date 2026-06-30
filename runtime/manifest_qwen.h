@@ -32,6 +32,7 @@ static inline ModelConfig load_config_qwen(const char *manifest_path) {
     c.moe_intermediate_size           = mf_int_opt(s, "moe_intermediate_size", 0);
     c.shared_expert_intermediate_size = mf_int_opt(s, "shared_expert_intermediate_size", 0);
     c.norm_topk_prob                  = mf_int_opt(s, "norm_topk_prob", 1);  // Qwen-MoE renorm 함
+    c.scale_dtype                     = mf_int_opt(s, "scale_dtype", 0);     // 0=fp32, 1=fp16 (기존 fp32 회귀안전)
 
     // layer_types: ["linear_attention","full_attention",...] → layer_is_full[i] (1/0)
     int *lf = (int *)malloc(sizeof(int) * c.num_layers);

@@ -54,6 +54,8 @@ def main():
                     help="로드 dtype. 큰 모델(27B+)은 bfloat16로 OOM 회피 (q4 양자화는 source dtype에 거의 무관).")
     ap.add_argument("--q4-only", action="store_true",
                     help="big matmul의 fp32 복사본 생략(27B+ fp32 108GB는 엔진 OOM이라 불필요). q4+small-fp32만.")
+    ap.add_argument("--scale-dtype", default="fp32", choices=["fp32", "fp16"],
+                    help="weight scale dtype. fp16: scale fp32→fp16 변환 저장 (트래픽↓, rel 9.3e-4 안전).")
     args = ap.parse_args()
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -111,6 +113,7 @@ def main():
             "norm_topk_prob": int(bool(g("norm_topk_prob", True))),  # int (C mf_int_opt 파싱)
         })
 
+    scale_fp16 = (args.scale_dtype == "fp16")
     def save_f32(fname, t):
         a = t.detach().cpu().float().contiguous().numpy().astype(np.float32)
         a.tofile(os.path.join(args.out, fname + ".bin"))
@@ -118,7 +121,10 @@ def main():
         w = t.detach().cpu().float().contiguous().numpy().astype(np.float32)
         packed, scale = quantize_int4(w)
         packed.tofile(os.path.join(args.out, fname + "_q4.bin"))
-        scale.tofile(os.path.join(args.out, fname + "_scale.bin"))
+        if scale_fp16:
+            scale.astype(np.float16).tofile(os.path.join(args.out, fname + "_scale.bin"))
+        else:
+            scale.tofile(os.path.join(args.out, fname + "_scale.bin"))
         return dequant_relerr(w, packed, scale)
 
     def fname_of(rel):  # 상대키 → 파일 basename
@@ -166,6 +172,7 @@ def main():
             save_f32(fn, t); n_f32 += 1
 
     manifest["quant_mean_relerr"] = float(np.mean(errs)) if errs else 0.0
+    manifest["scale_dtype"] = 1 if scale_fp16 else 0
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"[extract] done. layers={L} ({layer_types.count('full_attention')} full / "

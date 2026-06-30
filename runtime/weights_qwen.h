@@ -5,7 +5,7 @@
 
 // 행렬곱 weight (q4 또는 fp32, precision 토글로 선택). 둘 다 로드하면 한 엔진이 두 경로 모두 실행 가능.
 //   q4 경로: wq(int4 packed) + sc(scale). fp32 경로: wf.  미로드 포인터는 NULL.
-struct QMat { uint8_t *wq = nullptr; float *sc = nullptr; float *wf = nullptr; };
+struct QMat { uint8_t *wq = nullptr; void *sc = nullptr; float *wf = nullptr; };
 
 struct QLayer {
     int      is_full;

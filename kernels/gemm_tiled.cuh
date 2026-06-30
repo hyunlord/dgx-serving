@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "qscale.cuh"
 #include "../runtime/config.h"   // QBLK
 #include "gemv_q4.cuh"           // S=1 fallback (launch_gemv_q4)
 
@@ -15,7 +16,8 @@
 #define GT_TK 32        // = QBLK (스케일 슬라이스당 1값)
 #define GT_PAD 4
 
-static __global__ void gemm_tiled_q4_kernel(const float *X, const uint8_t *Wq, const float *sc,
+template<typename ST>
+static __global__ void gemm_tiled_q4_kernel(const float *X, const uint8_t *Wq, const ST *sc,
                                             float *Y, int M, int N, int K) {
     __shared__ float sX[GT_TK][GT_TM + GT_PAD];   // K-major: sX[k][m]
     __shared__ float sW[GT_TK][GT_TN + GT_PAD];   // K-major: sW[k][n] (dequant)
@@ -45,7 +47,7 @@ static __global__ void gemm_tiled_q4_kernel(const float *X, const uint8_t *Wq, c
                 int gk = k0 + c;
                 uint8_t by = wrow[gk >> 1];
                 int q = (gk & 1) ? (by >> 4) : (by & 0x0F);
-                sW[c][r] = ((float)q - 8.0f) * sc[(size_t)gn * KB + slice];
+                sW[c][r] = ((float)q - 8.0f) * sval(sc[(size_t)gn * KB + slice]);
             } else sW[c][r] = 0.f;
         }
         __syncthreads();
@@ -75,10 +77,11 @@ static __global__ void gemm_tiled_q4_kernel(const float *X, const uint8_t *Wq, c
     }
 }
 
-static inline void launch_gemm_tiled_q4(const float *X, const uint8_t *Wq, const float *sc,
-                                        float *Y, int M, int N, int K, cudaStream_t st = 0) {
-    if (M == 1) { launch_gemv_q4(X, Wq, sc, Y, K, N, 1, st); return; }
+static inline void launch_gemm_tiled_q4(const float *X, const uint8_t *Wq, const void *sc,
+                                        float *Y, int M, int N, int K, int scale_dtype = 0, cudaStream_t st = 0) {
+    if (M == 1) { launch_gemv_q4(X, Wq, sc, Y, K, N, 1, scale_dtype, st); return; }
     dim3 block(256);
     dim3 grid((N + GT_TN - 1) / GT_TN, (M + GT_TM - 1) / GT_TM);
-    gemm_tiled_q4_kernel<<<grid, block, 0, st>>>(X, Wq, sc, Y, M, N, K);
+    if (scale_dtype == 1) gemm_tiled_q4_kernel<__half><<<grid, block, 0, st>>>(X, Wq, (const __half*)sc, Y, M, N, K);
+    else                  gemm_tiled_q4_kernel<float ><<<grid, block, 0, st>>>(X, Wq, (const float*)sc, Y, M, N, K);
 }

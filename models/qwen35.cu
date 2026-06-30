@@ -33,14 +33,15 @@ static void dbg_dump(const char *name, const float *d, size_t n) {
 
 // 행렬곱 dispatch: q4(int4 dequant) / fp32 / W4A8(int8 act × int4 weight) 경로.
 static int8_t *gf_xq=nullptr; static float *gf_xs=nullptr; static int32_t *gf_xsum=nullptr; static size_t gf_xqcap=0;
+static int gf_sdtype;  // scale_dtype cached from ModelConfig
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4) {
     if (use_q4==2) {
         size_t n=(size_t)S*IN;
         if (gf_xqcap < n) { if(gf_xq)cudaFree(gf_xq); if(gf_xs)cudaFree(gf_xs); if(gf_xsum)cudaFree(gf_xsum);
             QK(cudaMalloc(&gf_xq,n)); QK(cudaMalloc(&gf_xs,(n/QBLK)*4)); QK(cudaMalloc(&gf_xsum,(n/QBLK)*4)); gf_xqcap=n; }
         launch_quantize_x_q8(X, gf_xq, gf_xs, gf_xsum, IN, S);
-        launch_gemv_w4a8(gf_xq, gf_xs, gf_xsum, m.wq, m.sc, Y, IN, OUT, S);
-    } else if (use_q4) launch_gemm_tiled_q4(X, m.wq, m.sc, Y, S, OUT, IN);   // prefill tiled GEMM(Phase A); S=1은 gemv
+        launch_gemv_w4a8(gf_xq, gf_xs, gf_xsum, m.wq, m.sc, Y, IN, OUT, S, gf_sdtype);
+    } else if (use_q4) launch_gemm_tiled_q4(X, m.wq, m.sc, Y, S, OUT, IN, gf_sdtype);   // prefill tiled GEMM(Phase A); S=1은 gemv
     else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
 }
 
@@ -48,6 +49,7 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
 void qwen35_forward(const ModelConfig &c, const QwenWeights &w,
                     const int *d_ids, int S, const float *d_cos, const float *d_sin,
                     float *d_logits, float *hidden_dump, float *prenorm_out, int use_q4) {
+    gf_sdtype = c.scale_dtype;
     const int H = c.hidden_size, FFN = c.intermediate_size, HD = c.head_dim, V = c.vocab_size;
     const int NQ = c.num_q_heads, NKV = c.num_kv_heads, rot = c.rotary_dim;
     const float eps = c.rms_norm_eps;
