@@ -83,6 +83,10 @@ tests/test_sb16_iso: tests/test_sb16_iso.cu models/qwen35.cu models/qwen35_decod
 tests/test_chunkprefill: tests/test_chunkprefill.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_chunkprefill.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
+# long-rope pos>=128: ext 테이블(gen_rope_long.py 먼저)로 P>128 chunked==1토큰 prefill. 사용법: ./tests/test_longrope [w] [g] [uq] [P] [N] [chunk]
+tests/test_longrope: tests/test_longrope.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_longrope.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
+
 tests/test_engine: tests/test_engine.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_engine.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 

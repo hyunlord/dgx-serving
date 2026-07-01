@@ -171,7 +171,16 @@ int main(int argc,char**argv){
     V=c.vocab_size; NKV=c.num_kv_heads; HD=c.head_dim; int rot=c.rotary_dim; maxlen=(g_pmax+224>256)?g_pmax+224:256;  // P+gen(≤192) 커버
     int nh=c.gdn_num_v_heads,D=c.gdn_head_v_dim,convd=cfg_gdn_conv_dim(&c),Kk=c.gdn_conv_kernel;
     static std::vector<int> ids=ri("token_ids.bin"); IDS=&ids;
-    std::vector<float> cl=rf("rope_cos_long.bin",(size_t)128*rot), sl=rf("rope_sin_long.bin",(size_t)128*rot);
+    // rope: ext 테이블(gen_rope_long.py, pos>=128 정확) 있으면 maxlen행 로드, 없으면 long(128 타일=pos>128 근사).
+    std::vector<float> cl, sl;
+    { FILE*e=fopen((GD+"rope_cos_ext.bin").c_str(),"rb");
+      if(e){ fseek(e,0,SEEK_END); long er=ftell(e)/4/rot; fclose(e);
+             int use=(er>=maxlen)?maxlen:(int)er; cl=rf("rope_cos_ext.bin",(size_t)use*rot); sl=rf("rope_sin_ext.bin",(size_t)use*rot);
+             printf("  rope: ext 테이블 %d행(pos>=128 정확)\n",use); }
+      else { auto c0=rf("rope_cos_long.bin",(size_t)128*rot), s0=rf("rope_sin_long.bin",(size_t)128*rot);
+             cl.resize((size_t)maxlen*rot); sl.resize((size_t)maxlen*rot);
+             for(int i=0;i<maxlen;i++)for(int j=0;j<rot;j++){cl[(size_t)i*rot+j]=c0[(size_t)(i%128)*rot+j];sl[(size_t)i*rot+j]=s0[(size_t)(i%128)*rot+j];}
+             printf("  rope: long 128행 타일(ext 없음 — pos>128 근사, gen_rope_long.py 권장)\n"); } }
     d_cos=up(cl); d_sin=up(sl);
     w=load_weights_qwen(WD.c_str(),c,1,uq==0?1:0);
     int lgrows = Bmax>512?Bmax:512;  // prefill_batch_slot이 [Sq≤chunk_max,V] 씀 → d_logit 충분히 크게
