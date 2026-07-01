@@ -206,10 +206,13 @@ int main(int argc,char**argv){
     printf("  %s\n",std::string(96,'-').c_str());
     auto row=[&](const char*nm,double lam,Stats&s){ printf("  %-6s %-4g | %8.3f %8.1f | %7.3f %7.3f %7.3f | %7.3f %7.4f | %5.2f %5.0f\n",
            nm,lam,s.thru_req,s.thru_tok,s.e2e50,s.e2e95,s.e2e99,s.ttft95,s.tpot95,s.avgB,s.maxq); };
+    bool run1tok = !getenv("SKIP1TOK");  // 긴 context서 1토큰 prefill=P스텝(재앙) → SKIP1TOK=1로 스킵
+    bool runstat = !getenv("SKIPSTAT");  // static도 1토큰 prefill(run_static) → 긴 context SKIPSTAT=1(c-ch 절대좌표만)
     for(double lam:lambdas){
-        auto t1=gen_trace(lam,nreq,seed); auto t2=t1; auto t3=t1; // 같은 trace 3부
-        Stats C1=run_continuous(t1,Bmax,false); Stats Cc=run_continuous(t2,Bmax,true); Stats T=run_static(t3,Bmax);
-        row("c1tok",lam,C1); row("c-ch",lam,Cc); row("stat",lam,T);
+        auto t2=gen_trace(lam,nreq,seed); Stats Cc=run_continuous(t2,Bmax,true);   // c-ch = 모든 lever(chunked+SMAX16+long-rope)
+        if(run1tok){ auto t1=gen_trace(lam,nreq,seed); Stats C1=run_continuous(t1,Bmax,false); row("c1tok",lam,C1); }
+        row("c-ch",lam,Cc);
+        if(runstat){ auto t3=gen_trace(lam,nreq,seed); Stats T=run_static(t3,Bmax); row("stat",lam,T); }
     }
     printf("\n  (latency 초 단위. 토큰선택/logit readout 제외=forward 지배. avgB=평균 active 배치=활용 proxy. maxQ=최대 큐깊이=부하.)\n");
     free_weights_qwen(w); free_config_qwen(c); return 0;
