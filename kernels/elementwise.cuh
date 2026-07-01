@@ -75,4 +75,12 @@ static inline void launch_f32_to_bf16(const float *in, __nv_bfloat16 *out, size_
     f32_to_bf16_kernel<<<grid, block, 0, s>>>(in, out, n);
 }
 
+// 챕터9 bf16 GDN state: fp32 소스(예: spec snapshot) → state dst(fp32면 D2D memcpy, bf16면 변환).
+//   ST로 템플릿(GdnStateT 타입 몰라도 dst에서 추론). GDN spec rollback(snap→committed state) 복구용.
+template<typename ST>
+static inline void state_from_f32(ST *dst, const float *src, size_t n, cudaStream_t s = 0) {
+    if (sizeof(ST) == 4) cudaMemcpy(dst, src, n * 4, cudaMemcpyDeviceToDevice);
+    else launch_f32_to_bf16(src, (__nv_bfloat16*)dst, n, s);
+}
+
 #endif // DGX_ELEMENTWISE_CUH

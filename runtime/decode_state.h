@@ -4,6 +4,14 @@
 #include "config.h"
 #include "weights_qwen.h"
 
+// 챕터9 bf16 GDN state: state I/O 대역폭 반감(de-risk GO: recurrence contractive g_t<1 → 오차 감쇠 <2% plateau, 커널 1.94×).
+//   기본 fp32(회귀 0). -DGDN_BF16_STATE 로 bf16(mixed: 저장 bf16, 계산 fp32). snapshot(gdn_snap)은 fp32 유지(spec 정확성).
+#ifdef GDN_BF16_STATE
+typedef __nv_bfloat16 GdnStateT;
+#else
+typedef float GdnStateT;
+#endif
+
 // speculative decode 상태 3종 (docs/02c-speculative-blueprint.md).
 //   full-attn KV: full 레이어만 [max_len, NKV, HD] (roped K 저장). 위치독립 → 길이 포인터 rollback.
 //   GDN committed state S: linear 레이어만 [NH, D, D]. 순차누적 → 임시승격.
@@ -14,7 +22,7 @@ struct DecodeState {
     int   max_len;
     int   L;          // 레이어 수 (free 시 사용)
     __nv_bfloat16 **Kc, **Vc;  // [L], full 레이어만 (roped K, V; bf16=모델 dtype, 메모리 절반)
-    float **S;              // [L], linear 레이어만 (committed GDN state)
+    GdnStateT **S;          // [L], linear 레이어만 (committed GDN state; fp32 or bf16 by GDN_BF16_STATE)
     float **convctx;        // [L], linear 레이어만 ([K-1, conv_dim])
 };
 

@@ -25,6 +25,7 @@
 
 static float *dm(size_t n){ float*p; DK(cudaMalloc(&p,n*4)); return p; }
 static __nv_bfloat16 *dmh(size_t n){ __nv_bfloat16*p; DK(cudaMalloc(&p,n*sizeof(__nv_bfloat16))); return p; }  // bf16 KV cache (메모리 절반)
+static GdnStateT *dms(size_t n){ GdnStateT*p; DK(cudaMalloc(&p,n*sizeof(GdnStateT))); return p; }  // GDN state (fp32/bf16 by GDN_BF16_STATE)
 
 // persistent scratch workspace: 호출 순서가 결정적이라 idx별 버퍼가 일관됨. 첫 호출시 할당, 이후 재사용
 // (capacity 부족하면 grow). per-call cudaMalloc/Free churn 제거 (2d 성능).
@@ -65,12 +66,12 @@ DecodeState alloc_decode_state(const ModelConfig &c, int max_len) {
     int L = c.num_layers; const int HD = c.head_dim, NKV = c.num_kv_heads;
     const int nh = c.gdn_num_v_heads, D = c.gdn_head_v_dim, convd = cfg_gdn_conv_dim(&c), K = c.gdn_conv_kernel;
     s.Kc = (__nv_bfloat16**)calloc(L,sizeof(__nv_bfloat16*)); s.Vc = (__nv_bfloat16**)calloc(L,sizeof(__nv_bfloat16*));
-    s.S = (float**)calloc(L,sizeof(float*)); s.convctx = (float**)calloc(L,sizeof(float*));
+    s.S = (GdnStateT**)calloc(L,sizeof(GdnStateT*)); s.convctx = (float**)calloc(L,sizeof(float*));
     for (int l=0;l<L;l++){
         if (c.layer_is_full[l]) {
             s.Kc[l] = dmh((size_t)max_len*NKV*HD); s.Vc[l] = dmh((size_t)max_len*NKV*HD);  // bf16
         } else {
-            s.S[l] = dm((size_t)nh*D*D); s.convctx[l] = dm((size_t)(K-1)*convd);
+            s.S[l] = dms((size_t)nh*D*D); s.convctx[l] = dm((size_t)(K-1)*convd);  // S=GdnStateT
         }
     }
     reset_decode_state(c, s);
@@ -79,13 +80,13 @@ DecodeState alloc_decode_state(const ModelConfig &c, int max_len) {
 void reset_decode_state(const ModelConfig &c, DecodeState &s) {
     s.n_past = 0;
     int L=c.num_layers; const int nh=c.gdn_num_v_heads, D=c.gdn_head_v_dim, convd=cfg_gdn_conv_dim(&c), K=c.gdn_conv_kernel;
-    for(int l=0;l<L;l++) if(!c.layer_is_full[l]){ DK(cudaMemset(s.S[l],0,(size_t)nh*D*D*4)); DK(cudaMemset(s.convctx[l],0,(size_t)(K-1)*convd*4)); }
+    for(int l=0;l<L;l++) if(!c.layer_is_full[l]){ DK(cudaMemset(s.S[l],0,(size_t)nh*D*D*sizeof(GdnStateT))); DK(cudaMemset(s.convctx[l],0,(size_t)(K-1)*convd*4)); }
 }
 void free_decode_state(DecodeState &s) {
     auto F=[](void*p){ if(p) cudaFree(p); };
     for(int l=0;l<s.L;l++){ F(s.Kc[l]); F(s.Vc[l]); F(s.S[l]); F(s.convctx[l]); }
     free(s.Kc); free(s.Vc); free(s.S); free(s.convctx);
-    s.Kc=s.Vc=nullptr; s.S=s.convctx=nullptr;
+    s.Kc=s.Vc=nullptr; s.S=nullptr; s.convctx=nullptr;   // S/convctx 타입 다를 수(GdnStateT vs float) → 체인 대입 X
 }
 
 VerifyArtifacts alloc_verify_artifacts(const ModelConfig &c, int max_Sq) {
@@ -194,8 +195,8 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
                                   mixed + (size_t)t*convd, (size_t)convd*4, cudaMemcpyDeviceToDevice));
             }
             if (commit) {
-                // 최종 state: va면 snap[Sq-1](per-token), 아니면 snap[0](snapshot_all=0 → 최종만 기록됨)
-                DK(cudaMemcpy(st.S[l], snap+(size_t)(va?(Sq-1):0)*nvh*hv*hv, (size_t)nvh*hv*hv*4, cudaMemcpyDeviceToDevice));
+                // 최종 state: va면 snap[Sq-1](per-token), 아니면 snap[0](snapshot_all=0 → 최종만 기록됨). snap=fp32→state(GdnStateT) 변환.
+                state_from_f32(st.S[l], snap+(size_t)(va?(Sq-1):0)*nvh*hv*hv, (size_t)nvh*hv*hv);
                 // conv ctx 갱신 = [convctx ; mixed] 의 마지막 K-1 토큰
                 DK(cudaMemcpy(convfull, st.convctx[l], (size_t)(Kk-1)*convd*4, cudaMemcpyDeviceToDevice));
                 DK(cudaMemcpy(convfull+(size_t)(Kk-1)*convd, mixed, (size_t)Sq*convd*4, cudaMemcpyDeviceToDevice));
@@ -239,8 +240,8 @@ void promote_prefix(const ModelConfig &c, DecodeState &st, const VerifyArtifacts
     int j=0;
     for(int l=0;l<c.num_layers;l++){
         if(c.layer_is_full[l]) continue;
-        // GDN state 승격
-        DK(cudaMemcpy(st.S[l], va.gdn_snap + ((size_t)(m-1)*va.n_linear + j)*ssz, ssz*4, cudaMemcpyDeviceToDevice));
+        // GDN state 승격 (gdn_snap=fp32 → state GdnStateT 변환)
+        state_from_f32(st.S[l], va.gdn_snap + ((size_t)(m-1)*va.n_linear + j)*ssz, ssz);
         // conv ctx 승격: old(K-1) ++ mixed[0..m-1][j]
         DK(cudaMemcpy(cf, st.convctx[l], (size_t)(Kk-1)*convd*4, cudaMemcpyDeviceToDevice));
         for(int t=0;t<m;t++)
@@ -272,8 +273,8 @@ void promote_tree_path(const ModelConfig &c, DecodeState &st, const VerifyArtifa
             }
             continue;
         }
-        // GDN state = path末 노드 snapshot (tree fork된 누적 state)
-        DK(cudaMemcpy(st.S[l], va.gdn_snap + ((size_t)last*va.n_linear + j)*ssz, ssz*4, cudaMemcpyDeviceToDevice));
+        // GDN state = path末 노드 snapshot (tree fork된 누적 state; gdn_snap=fp32 → state GdnStateT 변환)
+        state_from_f32(st.S[l], va.gdn_snap + ((size_t)last*va.n_linear + j)*ssz, ssz);
         // conv ctx: old(K-1) ++ mixed[path[0..plen-1]][j] 의 마지막 K-1
         DK(cudaMemcpy(cf, st.convctx[l], (size_t)(Kk-1)*convd*4, cudaMemcpyDeviceToDevice));
         for(int t=0;t<plen;t++)

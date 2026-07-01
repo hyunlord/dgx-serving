@@ -1,6 +1,7 @@
 #ifndef DGX_GDN_CUH
 #define DGX_GDN_CUH
 #include "reduce.cuh"
+#include "../runtime/decode_state.h"
 
 // Gated Delta Net (Qwen3.5 linear attention) 커널. 모델 독립(차원은 인자).
 // 사양: docs/02a-qwen35-blueprint.md §7.5 (modeling_qwen3_5.py 직접 정독).
@@ -175,7 +176,7 @@ static inline void launch_gdn_delta_rule(const float *Q, const float *K, const f
 //   block=head, thread=v. (delta rule 수식은 gdn_delta_rule 과 동일 — docs §7.5)
 static __global__ void gdn_step_kernel(const float *Q, const float *K, const float *V,
                                 const float *G, const float *Bt,
-                                const float *Sin, float *Ssnap, float *O,
+                                const GdnStateT *Sin, float *Ssnap, float *O,
                                 int Sq, int NH, int D, int NHk, int snapshot_all) {
     int h = blockIdx.x, v = threadIdx.x;
     if (v >= D) return;
@@ -183,7 +184,7 @@ static __global__ void gdn_step_kernel(const float *Q, const float *K, const flo
     extern __shared__ float sh[];
     float *qs = sh, *ks = sh + D, *red = sh + 2 * D;
     float scol[128];
-    for (int k = 0; k < D; k++) scol[k] = Sin ? Sin[((size_t)h * D + k) * D + v] : 0.f;
+    for (int k = 0; k < D; k++) scol[k] = Sin ? (float)Sin[((size_t)h * D + k) * D + v] : 0.f;
     const float invsD = rsqrtf((float)D);
 
     for (int t = 0; t < Sq; t++) {
@@ -217,7 +218,7 @@ static __global__ void gdn_step_kernel(const float *Q, const float *K, const flo
 //   snapshot_all=1(기본): 매 스텝 state 스냅샷(verify 승격용, Ssnap=[Sq,NH,D,D]).
 //   snapshot_all=0: 최종 state만 Ssnap[0](plain prefill/decode — Ssnap=[NH,D,D] 1개면 충분, 긴 Sq 안전).
 static inline void launch_gdn_step(const float *Q, const float *K, const float *V,
-                                   const float *G, const float *Bt, const float *Sin,
+                                   const float *G, const float *Bt, const GdnStateT *Sin,
                                    float *Ssnap, float *O, int Sq, int NH, int D, int NHk,
                                    int snapshot_all = 1, cudaStream_t st = 0) {
     size_t shmem = (size_t)(2 * D + 32) * sizeof(float);
@@ -241,13 +242,13 @@ static inline void launch_gdn_qk_norm(const float *Q, const float *K, float *Qn,
 }
 // prenorm 버전 gdn_step: Qn/Kn(사전정규화) 입력 → in-loop block_reduce 제거. recurrence(t순차) 동일 → Sq일관·오차0 보존.
 static __global__ void gdn_step_prenorm_kernel(const float *Qn, const float *Kn, const float *V,
-                                const float *G, const float *Bt, const float *Sin, float *Ssnap, float *O,
+                                const float *G, const float *Bt, const GdnStateT *Sin, float *Ssnap, float *O,
                                 int Sq, int NH, int D, int NHk, int snapshot_all) {
     int h = blockIdx.x, v = threadIdx.x; if (v >= D) return;
     int g = h * NHk / NH;
     extern __shared__ float sh[]; float *qs = sh, *ks = sh + D;
     float scol[128];
-    for (int k = 0; k < D; k++) scol[k] = Sin ? Sin[((size_t)h * D + k) * D + v] : 0.f;
+    for (int k = 0; k < D; k++) scol[k] = Sin ? (float)Sin[((size_t)h * D + k) * D + v] : 0.f;
     for (int t = 0; t < Sq; t++) {
         size_t base = ((size_t)t * NH + h) * D, base_qk = ((size_t)t * NHk + g) * D;
         qs[v] = Qn[base_qk + v]; ks[v] = Kn[base_qk + v];
@@ -269,7 +270,7 @@ static __global__ void gdn_step_prenorm_kernel(const float *Qn, const float *Kn,
     }
 }
 static inline void launch_gdn_step_prenorm(const float *Qn, const float *Kn, const float *V,
-                                   const float *G, const float *Bt, const float *Sin,
+                                   const float *G, const float *Bt, const GdnStateT *Sin,
                                    float *Ssnap, float *O, int Sq, int NH, int D, int NHk,
                                    int snapshot_all = 1, cudaStream_t st = 0) {
     gdn_step_prenorm_kernel<<<NH, D, (size_t)2 * D * sizeof(float), st>>>(Qn, Kn, V, G, Bt, Sin, Ssnap, O, Sq, NH, D, NHk, snapshot_all);
@@ -280,13 +281,13 @@ static inline void launch_gdn_step_prenorm(const float *Qn, const float *Kn, con
 template<int D, int KSPLIT>
 static __global__ void __launch_bounds__(D*KSPLIT, 1) gdn_step_ksplit_kernel(
         const float *Qn, const float *Kn, const float *V, const float *G, const float *Bt,
-        const float *Sin, float *Ssnap, float *O, int Sq, int NH, int NHk, int snapshot_all) {
+        const GdnStateT *Sin, float *Ssnap, float *O, int Sq, int NH, int NHk, int snapshot_all) {
     constexpr int KL = D / KSPLIT;
     int h = blockIdx.x, tid = threadIdx.x, v = tid & (D-1), grp = tid / D, kb = grp*KL, gq = h*NHk/NH;
     extern __shared__ float sh[]; float *qs = sh, *ks = sh + D, *part = sh + 2*D;  // qs[D],ks[D],part[KSPLIT*D]
     float scol[KL];
     #pragma unroll
-    for (int j=0;j<KL;j++) scol[j] = Sin ? Sin[((size_t)h*D + (kb+j))*D + v] : 0.f;
+    for (int j=0;j<KL;j++) scol[j] = Sin ? (float)Sin[((size_t)h*D + (kb+j))*D + v] : 0.f;
     for (int t=0;t<Sq;t++) {
         size_t base = ((size_t)t*NH+h)*D, base_qk = ((size_t)t*NHk+gq)*D;
         if (grp==0) { qs[v]=Qn[base_qk+v]; ks[v]=Kn[base_qk+v]; }
@@ -313,7 +314,7 @@ static __global__ void __launch_bounds__(D*KSPLIT, 1) gdn_step_ksplit_kernel(
 }
 template<int D, int KSPLIT>
 static inline void launch_gdn_step_ksplit(const float *Qn, const float *Kn, const float *V,
-                                   const float *G, const float *Bt, const float *Sin,
+                                   const float *G, const float *Bt, const GdnStateT *Sin,
                                    float *Ssnap, float *O, int Sq, int NH, int NHk,
                                    int snapshot_all = 1, cudaStream_t st = 0) {
     size_t shmem = (size_t)(2*D + KSPLIT*D) * sizeof(float);
@@ -328,7 +329,7 @@ static inline void launch_gdn_step_ksplit(const float *Qn, const float *Kn, cons
 template<int D, int KSPLIT>
 static __global__ void __launch_bounds__(D*KSPLIT, 1) gdn_step_ksplit_tree_kernel(
         const float *Qn, const float *Kn, const float *V, const float *G, const float *Bt,
-        const float *Sin, const int *parent, float *Ssnap, float *O, int Sq, int NH, int NHk) {
+        const GdnStateT *Sin, const int *parent, float *Ssnap, float *O, int Sq, int NH, int NHk) {
     constexpr int KL = D / KSPLIT;
     int h = blockIdx.x, tid = threadIdx.x, v = tid & (D-1), grp = tid / D, kb = grp*KL, gq = h*NHk/NH;
     extern __shared__ float sh[]; float *qs = sh, *ks = sh + D, *part = sh + 2*D;
@@ -338,7 +339,7 @@ static __global__ void __launch_bounds__(D*KSPLIT, 1) gdn_step_ksplit_tree_kerne
         #pragma unroll
         for (int j=0;j<KL;j++)                          // carry 대신 parent snapshot서 reload (root는 Sin)
             scol[j] = (p>=0) ? Ssnap[((size_t)p*NH+h)*D*D + (size_t)(kb+j)*D + v]
-                             : (Sin ? Sin[((size_t)h*D + (kb+j))*D + v] : 0.f);
+                             : (Sin ? (float)Sin[((size_t)h*D + (kb+j))*D + v] : 0.f);
         size_t base = ((size_t)t*NH+h)*D, base_qk = ((size_t)t*NHk+gq)*D;
         if (grp==0) { qs[v]=Qn[base_qk+v]; ks[v]=Kn[base_qk+v]; }
         __syncthreads();
@@ -364,7 +365,7 @@ static __global__ void __launch_bounds__(D*KSPLIT, 1) gdn_step_ksplit_tree_kerne
 }
 template<int D, int KSPLIT>
 static inline void launch_gdn_step_ksplit_tree(const float *Qn, const float *Kn, const float *V,
-                                   const float *G, const float *Bt, const float *Sin, const int *parent,
+                                   const float *G, const float *Bt, const GdnStateT *Sin, const int *parent,
                                    float *Ssnap, float *O, int Sq, int NH, int NHk, cudaStream_t st = 0) {
     size_t shmem = (size_t)(2*D + KSPLIT*D) * sizeof(float);
     gdn_step_ksplit_tree_kernel<D,KSPLIT><<<NH, D*KSPLIT, shmem, st>>>(Qn,Kn,V,G,Bt,Sin,parent,Ssnap,O,Sq,NH,NHk);
@@ -440,17 +441,20 @@ static __global__ void gdn_step_batch_kernel_t(const float *Q, const float *K, c
     for (int k = 0; k < D; k++) Sout[stb + (size_t)k * D + v] = (ST)scol[k];
 }
 static inline void launch_gdn_step_batch(const float *Q, const float *K, const float *V,
-                                         const float *G, const float *Bt, const float *Sin,
-                                         float *Sout, float *O, int B, int NH, int D, int NHk, cudaStream_t st = 0) {
+                                         const float *G, const float *Bt, const GdnStateT *Sin,
+                                         GdnStateT *Sout, float *O, int B, int NH, int D, int NHk, cudaStream_t st = 0) {
     dim3 grid(NH, B);
     size_t shmem = (size_t)(2 * D + 32) * sizeof(float);
-    // D compile-time 특수화(scol 레지스터화). 흔한 head_dim만; 그 외 런타임 fallback.
-#ifndef GDN_FORCE_RUNTIME   // A/B용: -DGDN_FORCE_RUNTIME로 런타임(local-mem) 버전 강제
-    if      (D==128) gdn_step_batch_kernel_t<128><<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, NHk);
-    else if (D==256) gdn_step_batch_kernel_t<256><<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, NHk);
-    else
+    // D compile-time 특수화(scol 레지스터화) + ST=GdnStateT(state I/O 대역폭). 흔한 head_dim만; 그 외 fp32 런타임 fallback.
+#if defined(GDN_FORCE_RUNTIME) && !defined(GDN_BF16_STATE)   // A/B: 런타임(local-mem) 강제 — fp32 전용
+    gdn_step_batch_kernel<<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, D, NHk);
+#else
+    if      (D==128) gdn_step_batch_kernel_t<128,GdnStateT><<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, NHk);
+    else if (D==256) gdn_step_batch_kernel_t<256,GdnStateT><<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, NHk);
+  #ifndef GDN_BF16_STATE
+    else             gdn_step_batch_kernel<<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, D, NHk);  // fp32 fallback(D≠128/256)
+  #endif
 #endif
-                     gdn_step_batch_kernel<<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, D, NHk);
 }
 
 // ---- (4) gated RMSNorm (Qwen3_5RMSNormGated) ----

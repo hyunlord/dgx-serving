@@ -21,6 +21,7 @@
 #define BK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 static float *dmb(size_t n){ float*p; BK(cudaMalloc(&p,n*4)); return p; }
 static __nv_bfloat16 *dmbh(size_t n){ __nv_bfloat16*p; BK(cudaMalloc(&p,n*sizeof(__nv_bfloat16))); return p; }  // bf16 KV cache (메모리 절반)
+static GdnStateT *dmbs(size_t n){ GdnStateT*p; BK(cudaMalloc(&p,n*sizeof(GdnStateT))); return p; }  // GDN state (fp32/bf16 by GDN_BF16_STATE)
 
 // ---- batch state alloc/free ----
 BatchDecodeState alloc_batch_decode_state(const ModelConfig &c, int B, int max_len){
@@ -28,16 +29,16 @@ BatchDecodeState alloc_batch_decode_state(const ModelConfig &c, int B, int max_l
     int L=c.num_layers; const int HD=c.head_dim, NKV=c.num_kv_heads;
     const int nh=c.gdn_num_v_heads, D=c.gdn_head_v_dim, convd=cfg_gdn_conv_dim(&c), K=c.gdn_conv_kernel;
     s.Kc=(__nv_bfloat16**)calloc(L,sizeof(__nv_bfloat16*)); s.Vc=(__nv_bfloat16**)calloc(L,sizeof(__nv_bfloat16*));
-    s.S=(float**)calloc(L,sizeof(float*)); s.convctx=(float**)calloc(L,sizeof(float*));
+    s.S=(GdnStateT**)calloc(L,sizeof(GdnStateT*)); s.convctx=(float**)calloc(L,sizeof(float*));
     for(int l=0;l<L;l++){
         if(c.layer_is_full[l]){ s.Kc[l]=dmbh((size_t)B*max_len*NKV*HD); s.Vc[l]=dmbh((size_t)B*max_len*NKV*HD); }  // bf16
-        else { s.S[l]=dmb((size_t)B*nh*D*D); s.convctx[l]=dmb((size_t)B*(K-1)*convd); }
+        else { s.S[l]=dmbs((size_t)B*nh*D*D); s.convctx[l]=dmb((size_t)B*(K-1)*convd); }  // S=GdnStateT
     }
     reset_batch_decode_state(c,s); return s;
 }
 void reset_batch_decode_state(const ModelConfig &c, BatchDecodeState &s){
     s.n_past=0; int L=c.num_layers; const int nh=c.gdn_num_v_heads,D=c.gdn_head_v_dim,convd=cfg_gdn_conv_dim(&c),K=c.gdn_conv_kernel;
-    for(int l=0;l<L;l++) if(!c.layer_is_full[l]){ BK(cudaMemset(s.S[l],0,(size_t)s.B*nh*D*D*4)); BK(cudaMemset(s.convctx[l],0,(size_t)s.B*(K-1)*convd*4)); }
+    for(int l=0;l<L;l++) if(!c.layer_is_full[l]){ BK(cudaMemset(s.S[l],0,(size_t)s.B*nh*D*D*sizeof(GdnStateT))); BK(cudaMemset(s.convctx[l],0,(size_t)s.B*(K-1)*convd*4)); }
 }
 // 챕터9 연속배칭: slot 재사용 시 그 물리 slot의 GDN 잔재만 clear(새 요청이 이전 요청 state 안 읽음 — compaction 버그 교훈).
 //   KV는 clear 불요(새 요청이 pos0부터 덮고 attention은 [0..pos]만 읽음). GDN S/convctx는 recurrence라 반드시 zero.
@@ -45,7 +46,7 @@ void reset_batch_slot(const ModelConfig &c, BatchDecodeState &s, int b){
     int L=c.num_layers; const int nh=c.gdn_num_v_heads,D=c.gdn_head_v_dim,convd=cfg_gdn_conv_dim(&c),K=c.gdn_conv_kernel;
     const size_t ssz=(size_t)nh*D*D, csz=(size_t)(K-1)*convd;
     for(int l=0;l<L;l++) if(!c.layer_is_full[l]){
-        BK(cudaMemset(s.S[l]+(size_t)b*ssz,0,ssz*4)); BK(cudaMemset(s.convctx[l]+(size_t)b*csz,0,csz*4)); }
+        BK(cudaMemset(s.S[l]+(size_t)b*ssz,0,ssz*sizeof(GdnStateT))); BK(cudaMemset(s.convctx[l]+(size_t)b*csz,0,csz*4)); }
 }
 // 챕터9 chunked prefill: slot b에 프롬프트 P토큰을 청크(≤chunk_max)로 병렬 prefill(1토큰/step 대신 — probe_chunked_prefill 62×).
 //   batch slot b의 KV/GDN 서브영역([B,...]의 b번째=single과 동일 연속 레이아웃)에 alias한 DecodeState view로 기존
@@ -57,7 +58,7 @@ void prefill_batch_slot(const ModelConfig &c, const QwenWeights &w, BatchDecodeS
                         float *d_logit_out, int use_q4, int chunk_max) {
     int L=c.num_layers; const int HD=c.head_dim, NKV=c.num_kv_heads;
     const int nh=c.gdn_num_v_heads, D=c.gdn_head_v_dim, convd=cfg_gdn_conv_dim(&c), K=c.gdn_conv_kernel;
-    std::vector<__nv_bfloat16*> Kc(L,nullptr),Vc(L,nullptr); std::vector<float*> S(L,nullptr),Cx(L,nullptr);
+    std::vector<__nv_bfloat16*> Kc(L,nullptr),Vc(L,nullptr); std::vector<GdnStateT*> S(L,nullptr); std::vector<float*> Cx(L,nullptr);
     for(int l=0;l<L;l++){
         if(c.layer_is_full[l]){ Kc[l]=st.Kc[l]+(size_t)b*st.max_len*NKV*HD; Vc[l]=st.Vc[l]+(size_t)b*st.max_len*NKV*HD; }
         else { S[l]=st.S[l]+(size_t)b*nh*D*D; Cx[l]=st.convctx[l]+(size_t)b*(K-1)*convd; }
@@ -71,7 +72,7 @@ void prefill_batch_slot(const ModelConfig &c, const QwenWeights &w, BatchDecodeS
 void free_batch_decode_state(BatchDecodeState &s){
     auto F=[](void*p){ if(p)cudaFree(p); };
     for(int l=0;l<s.L;l++){ F(s.Kc[l]);F(s.Vc[l]);F(s.S[l]);F(s.convctx[l]); }
-    free(s.Kc);free(s.Vc);free(s.S);free(s.convctx); s.Kc=s.Vc=nullptr; s.S=s.convctx=nullptr;
+    free(s.Kc);free(s.Vc);free(s.S);free(s.convctx); s.Kc=s.Vc=nullptr; s.S=nullptr; s.convctx=nullptr;
 }
 
 // persistent batch scratch

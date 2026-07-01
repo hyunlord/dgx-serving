@@ -3,13 +3,14 @@
 #include <cuda_bf16.h>
 #include "../runtime/config.h"
 #include "../runtime/weights_qwen.h"
+#include "../runtime/decode_state.h"   // GdnStateT (fp32/bf16 by GDN_BF16_STATE)
 
 // 챕터3 batch decode: B개 독립 시퀀스(same-length), 각 1토큰을 한 forward로. (multi-sequence batch, plain, fp32.)
 //   per-sequence KV/state. gemm_batch(weight 재사용) + batch attn/gdn/conv. == B개 single decode 시퀀스별 오차0.
 struct BatchDecodeState {
     int B, n_past, max_len, L;
     __nv_bfloat16 **Kc, **Vc;  // [L], full 레이어: [B, max_len, NKV*HD] (bf16=모델 dtype, 메모리 절반)
-    float **S, **convctx; // [L], gdn 레이어: S=[B, NH*Dv*Dv], convctx=[B, (K-1)*conv_dim]
+    GdnStateT **S; float **convctx; // [L], gdn: S=[B,NH*Dv*Dv](fp32/bf16), convctx=[B,(K-1)*conv_dim]
 };
 BatchDecodeState alloc_batch_decode_state(const ModelConfig &c, int B, int max_len);
 void free_batch_decode_state(BatchDecodeState &s);
