@@ -13,6 +13,7 @@ build/
 /tools/bench_w4a8_sb
 /tools/memdiag
 /tools/ncu_*
+/tools/probe_*
 /tools/prefill_prof
 !/tools/*.cu
 !/tools/*.cuh

@@ -150,14 +150,21 @@ static inline void launch_gemv_w4a8(const int8_t *xq, const float *xs, const int
     else                  gemv_w4a8_kernel<float ><<<(unsigned)grid, block, 0, st>>>(xq, xs, xsum, Wq, (const float*)sw, Y, IN, OUT, S);
 }
 
-// 소-batch(Sq 2~8) W4A8 GEMV 런처. grid = OUT warps (S 무관 — weight 1회 적재). S<=8 전제.
+// 소-batch W4A8 GEMV 런처. grid = OUT warps (S 무관 — weight 1회 적재). S<=16 전제.
+//   SMAX dispatch(de-risk tools/probe_sb16): S≤8=SMAX8(regs40, occ100%, 최적) / 9~16=SMAX16(regs48, occ83%, 그래도
+//   gemm_batch B×reload 대비 S=12 5.85×). B≤8 회귀 0(구조적). B=16은 호출측이 gemm_batch<16> 특수화로 보냄(더 빠름).
 static inline void launch_gemv_w4a8_sb(const int8_t *xq, const float *xs,
                                        const uint8_t *Wq, const void *sw,
                                        float *Y, int IN, int OUT, int S, int scale_dtype = 0, cudaStream_t st = 0) {
     int block = 256;
     long grid = ((long)OUT * 32 + block - 1) / block;
-    if (scale_dtype == 1) gemv_w4a8_sb_kernel<__half,8><<<(unsigned)grid, block, 0, st>>>(xq, xs, Wq, (const __half*)sw, Y, IN, OUT, S);
-    else                  gemv_w4a8_sb_kernel<float, 8><<<(unsigned)grid, block, 0, st>>>(xq, xs, Wq, (const float*)sw, Y, IN, OUT, S);
+    if (S <= 8) {
+        if (scale_dtype == 1) gemv_w4a8_sb_kernel<__half,8><<<(unsigned)grid, block, 0, st>>>(xq, xs, Wq, (const __half*)sw, Y, IN, OUT, S);
+        else                  gemv_w4a8_sb_kernel<float, 8><<<(unsigned)grid, block, 0, st>>>(xq, xs, Wq, (const float*)sw, Y, IN, OUT, S);
+    } else {  // 9~16: SMAX16(1적재로 gemm_batch 9~15 collapse 제거)
+        if (scale_dtype == 1) gemv_w4a8_sb_kernel<__half,16><<<(unsigned)grid, block, 0, st>>>(xq, xs, Wq, (const __half*)sw, Y, IN, OUT, S);
+        else                  gemv_w4a8_sb_kernel<float, 16><<<(unsigned)grid, block, 0, st>>>(xq, xs, Wq, (const float*)sw, Y, IN, OUT, S);
+    }
 }
 
 #endif // DGX_GEMV_W4A8_CUH
