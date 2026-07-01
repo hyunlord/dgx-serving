@@ -61,7 +61,8 @@ int main(int argc,char**argv){
         lastlog.assign(all.begin()+(size_t)(rows-1)*V, all.end());
         return best;
     };
-    std::vector<int> chunks={1,64,128,256,512}; std::vector<std::vector<float>> logs(chunks.size()); std::vector<double> times(chunks.size());
+    std::vector<int> chunks = getenv("FULLONLY")? std::vector<int>{512} : std::vector<int>{1,64,128,256,512};
+    std::vector<std::vector<float>> logs(chunks.size()); std::vector<double> times(chunks.size());
     for(size_t i=0;i<chunks.size();i++){ if(chunks[i]>P)continue; times[i]=run(chunks[i],logs[i]); }
     // mism: chunk=1(현행) 기준 argmax + max-abs
     auto amax=[&](const std::vector<float>&l){int bi=0;float bv=l[0];for(int j=1;j<V;j++)if(l[j]>bv){bv=l[j];bi=j;}return bi;};
