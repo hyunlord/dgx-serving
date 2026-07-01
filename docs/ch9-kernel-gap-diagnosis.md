@@ -110,7 +110,16 @@ batch matmul occupancy 46%가 진짜 병목인가 규명(파느냐 마느냐 근
 - **limiter(ncu)**: Registers/thread **80** → Block Limit Registers **3**(min) = 확정 limiter=**REGISTER**. Theoretical occ **50%**(launch_bounds(256,2)). Achieved 28%(o/down grid80=**0.56 waves**)~46%(gate/up grid136) « 50% = **wave quantization**(BM=16 few M-tiles → 블록 부족).
 - **★payoff 측정(launch_bounds 2→4→6, regs 80→64→40, spill 0)**: 이론 occ 50→66→100% 올려도 **achieved occ 28% 불변**(mb2·mb4 동일 28%!), **throughput 68.7→68.4→67.9(미세 감소)**. **occupancy 올려도 throughput 안 오름 = occupancy는 lever 아님(measured).**
 - **근본**: achieved occ 낮음은 register 제한이 아니라 **wave quantization**(BM=16 M-타일 1개 → 블록 부족, 이론 상한 올려도 채울 블록 없음). matmul은 대역폭 35%(비포화)·long_scoreboard 11-15(latency-bound 아님)·occupancy 무관 → **grid-level wave-quant + B=16 저 arithmetic-intensity가 구조적 제약.** 블록↑ 유일 수단=split-K인데 auto 넘으면 reduce 오버헤드로 악화(측정).
-- **결론(정직 니치, 도망 아님)**: raw batch matmul은 **GB10 BM=16 구조 천장 근접**(occupancy measured NO-GO, split-K +3.5%가 이 스킴 천장). 남은 1.38× 갭은 (a)다른 타일링(BN 쪼개 wave-fill — major, matmul이 latency-bound 아니라 payoff 불확실) or (b)llama broad 커널 성숙도(honest-perf ⑦). **occupancy는 팠고 lever 아님을 measured — 우리 우위는 niche(spec/서빙/정확성).** 별도 lever 후보 = **GDN(36%)** — matmul 아닌 recurrence 커널(미탐색, 추후).
+- **결론(정직 니치, 도망 아님)**: raw batch matmul은 **GB10 BM=16 구조 천장 근접**(occupancy measured NO-GO, split-K +3.5%가 이 스킴 천장). 남은 1.38× 갭은 (a)다른 타일링(BN 쪼개 wave-fill — major, matmul이 latency-bound 아니라 payoff 불확실) or (b)llama broad 커널 성숙도(honest-perf ⑦). **occupancy는 팠고 lever 아님을 measured — 우리 우위는 niche(spec/서빙/정확성).** 별도 lever 후보 = **GDN(36%)** — matmul 아닌 recurrence 커널(미탐색 → 아래).
+
+## ★GDN de-risk — arc 최대 WIN (서빙 +27.5%, `kernels/gdn.cuh`)
+matmul occupancy NO-GO 후, nsys 시간분해가 가리킨 **미탐색 GDN(gdn_step_batch 36.3%)** 팜.
+- **병목(ncu)**: Compute **2.62%**·Memory **13.7%**·occ **87%**(높음!)·**long_scoreboard 601**(천문) = 심각한 memory-latency-bound인데 대역폭·compute 둘 다 극저. 
+- **근본**: 런타임 D → 루프 `for(k<D)` unroll 불가 → `float scol[128]`(512B, state 열)이 **local memory(stack)** → scol[k] 512회/thread 접근이 601 stall. (-Xptxas -v: 512B stack frame 확인.) 대조: `gdn_step_ksplit_tree_kernel<D>`(spec)는 이미 template.
+- **수정**: `gdn_step_batch_kernel_t<D>` template(compile-time D) → unroll → scol 레지스터화(stack 512→56B, 255 regs). 연산 동일.
+- **★controlled A/B(back-to-back, seed42)**: 커널 1665→468us(**3.5×**, long_scoreboard 601→37). raw B=16 68.8→92.1(**+33.9%**). **서빙(Bmax16 λ8 avgB14.6) 43.3→55.2 tok/s(+27.5%)·tpot95 −19.7%·e2e50 −23%.** B=1 +0.8%(weight-load 지배 — GDN 이득은 고배치서, state I/O가 B배).
+- **정확성**: **mism=0 gate PASS**(test_cbatch_prod got==iso), tree-spec 커널 미변경(정확성 자산 무관). iso-vs-solo 11→13(FMA contraction from unroll — golden tolerance 내, 중간 반올림↓로 오히려 더 정확). **split-K(mism gate FAIL→opt-in)와 달리 gate 통과 → default-on.** escape: `-DGDN_FORCE_RUNTIME`.
+- **의미**: matmul occupancy(measured NO-GO)와 정반대 — **미탐색 GDN(niche)이 진짜 lever였음.** "안 판 영역 파기"가 옳았음. GDN이 우리 차별점(Qwen3.5 하이브리드 네이티브)이라 niche 강화. 갭 좌표: 서빙 aggregate 43→55는 llama 대비 재측정 필요(다음). 남은 GDN 여지: bf16 state(9.7GB→4.8GB I/O 반감, 추가 lever 후보).
 
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
