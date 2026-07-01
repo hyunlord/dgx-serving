@@ -19,8 +19,11 @@ vLLM/SGLang 설치는 sm_121서 깊은 rabbit hole(경쟁엔진 설정=우리 �
 | **단일 decode (non-spec)** | 11.9 t/s (base, gemv-MLP) | **13.83 t/s** (tg128) | **llama 1.16× 빠름** |
 | **단일 decode (spec)** | **21.3 t/s** (tree+MTP q4) | 13.83 (non-spec) | ours 1.54× — 단 spec-vs-nonspec* |
 | **prefill** | 656 t/s (chunk512) | **901 t/s** (pp512) | **llama 1.37× 빠름** |
-| **batch decode B=16** | 65.9 t/s (bench_batch, 문서) | **93.56 t/s** (S_TG) | **llama 1.42× 빠름** |
+| **batch decode B=16** (GDN template 전) | 65.9 t/s | **93.56 t/s** (S_TG) | llama 1.42× |
+| **batch decode B=16** (GDN template 후, cda5ea9) | **84.9 shipping / 88.5 +split-K** (N=128) | **95.30 t/s** (재측정) | **llama 1.08~1.12× (near-parity!)** |
 | **batch B=8** | ~53 t/s | 68.6 t/s | llama 1.3× |
+
+**★GDN template 재좌표(cda5ea9 이후)**: gdn_step_batch D-template화(커널 3.5×)로 **batch B=16 갭 1.42×→~1.1×(near-parity)**. 우리 84.9(shipping)/88.5(+split-K opt-in) vs llama 재측정 95.30(≈이전 93.56). GDN이 batch decode의 36.3%였고 그걸 3.5× 줄임 → batch 축 거의 따라잡음. caveat: W4A8 vs Q4_0(activation int8 vs fp16), 우리 context(4-132)<llama(128-256)라 약간 유리(실제 ~1.08-1.15×). single(1.16×)·prefill(1.38×)은 불변(GDN 무관 축). **서빙(연속배칭) llama-server 공정 매칭은 out-of-scope(Poisson/admission 차) — batch 축이 공정 비교.**
 
 \* llama.cpp-mtp도 MTP spec 가능성(미측정) — 켜면 llama 단일도↑. 우리 21.3은 spec, llama 13.83은 표준 non-spec 기준선.
 
