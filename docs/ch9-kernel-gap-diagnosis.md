@@ -138,6 +138,14 @@ GdnStateT typedef(기본 float, -DGDN_BF16_STATE=bf16), DecodeState.S·BatchDeco
 - **서빙(bf16, controlled A/B 27B λ8)**: fp32 55.2→**bf16 58.3 tok/s(+5.6%)**·tpot95 0.2489→0.2367. 전체 GDN arc 서빙 **43.3(pre-GDN)→55.2(template)→58.3(bf16) = +34.6%.**
 - **opt-in(default fp32)**: -DGDN_BF16_STATE로 활성(회귀 0 = fp32-exactness 테스트 보존). 배포 빌드=플래그. arc batch 갭 1.42→1.1(GDN template)→**1.02×(bf16 state)**.
 
+## prefill(1.38×) de-risk — 구조 천장 재확인(measured, chapter-7 이후 도구)
+남은 raw 갭 prefill 656~704 vs llama 903. chapter-7 이미 판 벽을 batch-arc 도구(nsys 분해·occupancy A/B·SpeedOfLight)로 재규명.
+- **nsys 분해(prefill C=512, 27B)**: gemm_mmq(matmul) **78.7%** 지배 / gdn_ksplit 4.7% / swiglu 3.9% / 나머지<3%. **prefill=matmul-bound**(GDN 같은 숨은 덩어리 없음 — 병렬이라 GDN 4.7%만; batch와 정반대).
+- **ncu gemm_mmq**: regs **128**/thread → Block Limit Reg 2 = occ **33%**(chapter-7 50%아님, full-MMQ register-blocking이 72→128). SpeedOfLight Compute 28.5%·Memory 31.7%·long_scoreboard **2.0**(전부 ~30% 저활용, latency-bound 아님). waves 1.67.
+- **★occupancy A/B(measured NO-GO)**: launch_bounds 2→3→4(regs 128→80→64) → spill 16→460→828B → prefill **728→1202→1756ms(−65/−140% 악화)**. **occupancy 올리면 register-blocking 깨져 극적으로 느려짐 = occ는 prefill lever 아님, 33%가 최적**(register-blocked 필수). batch(wave-quant)와 다른 이유지만 결론 동일(occ NO-GO).
+- **stream-K N/A**: prefill grid 160+(1.67 waves)=블록 충분 → few-blocks 문제 없음(batch grid 40과 다름). split-K 무의미. chapter-7 기각 재확인.
+- **판정(정직 천장)**: prefill은 register-blocked 128×128이 최적, occ/stream-K 둘 다 non-lever(measured). 남은 1.28~1.38× 갭 = **llama 타일/파이프 성숙도**(KTILE/deep cp.async — chapter-7 major NO-GO, instruction overhead). = GDN(미탐색 WIN)과 대조 — prefill은 이미 판 벽, 새 도구로도 구조 천장 재확인. single 1.16×도 memory-bound 구조. **정직 인정(도망 아님, measured 재확인).**
+
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
 - **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.

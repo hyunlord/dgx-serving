@@ -26,6 +26,8 @@ __device__ __forceinline__ void mmq_cpa4(void*s,const void*g,bool pred){
 
 // __launch_bounds__(256,2): reg≤128 강제 → 2 CTA/SM 목표(llama occ 29%=2CTA, 우리 reg137=1CTA 17% 매칭 시도).
 //   de-risk: occupancy↑가 lever인지(KT/sync 아님 — Warp Cycles 5.64 낮음). spill 역효과면 순효과 ncu로.
+// launch_bounds(256,2)=128 regs(register-blocking), occ 33%. occupancy de-risk(측정): minblk 3(80reg)/4(64reg)로 occ 50/66%
+// 올리면 spill(460/828B)로 prefill 728→1202→1756ms(−65/−140% 느려짐) — register-blocking 필수, occ는 prefill lever 아님(33% 최적).
 template<int KT, typename ST>
 static __global__ void __launch_bounds__(256,2) gemm_mmq_kernel(const int8_t*X,const float*xs,const uint8_t*Wq,
                                        const ST*sw,float*Y,int M,int N,int K){
