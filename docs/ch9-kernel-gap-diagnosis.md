@@ -31,6 +31,18 @@ file:line 회수 실패, 툴링 한계; 챕터7 진단 + 원리로 이 방향 �
 - **타일/register 블로킹 재튜닝** — occupancy 50%의 shared+reg 동시 제약 완화(챕터7서 부분 시도, 벽).
 - **판정**: 이건 챕터7 근본 재구조(이미 벽)의 재도전 = **큰 불확실 작업**. 자율 강행 대신 **방향 확인 후 착수**(rule #5).
 
+### STEP 3 de-risk 결과 — GO (int8 MMA가 occupancy 벽 완화 확정, `tools/probe_mma_occ.cu`)
+int8 WMMA(tensor core s8) 최소 GEMM 커널 측정:
+| 커널 | regs | shared | occupancy |
+|---|---|---|---|
+| 우리 gemm_mmq (DP4A) | 72 | 26.3KB | **50%** (Block Limit Shared AND Reg) |
+| int8 WMMA 32×32~64×64 | **39-40** | **2-8KB** | **100%** |
+
+- **occupancy 50→100% 완화.** regs **72→40**(사용자 우려[MMA가 reg 더]와 정반대 — tensor core가 누적 담당), shared **26.3→2-8KB**(WMMA는 DP4A의 큰 X-shared staging 불필요). → **occupancy 벽이 int8 MMA로 완화됨 = 갭의 근본 원인 표적 적중.**
+- **correctness 0 mismatch**(int8 MMA == scalar, sm_120 ✓).
+- **bit-exact by construction**: int8·int8→int32 누적은 정수=순서무관 정확 → MMA와 DP4A 같은 정수 dot → dequant 동일 적용 시 **MMA W4A8 == DP4A W4A8 bit-exact**(드롭인, 정확성 보존).
+- **→ GO: 정식 int8-MMA W4A8 GEMM 재작성 정당**(occupancy 벽 완화 measured, bit-exact 보장). caveat: 100% occ는 필요조건 — 실 speedup은 tensor core util·int4 unpack·memory feed에 의존(정식 구현서 측정).
+
 ## 정직 좌표 (이번 결론)
 - **STEP 1 블록**: llama fair spec 측정 불가(자산 — MTP-GGUF/vocab-matched draft 부재). 우리 spec vs llama non-spec(불공정)만 측정됨.
 - **STEP 2 진단**: 갭은 **compute 실행 효율/occupancy**(캐시 아님, 챕터7서 L1/TEX 맞춤). llama = int8 MMA+튜닝 타일 추정.
