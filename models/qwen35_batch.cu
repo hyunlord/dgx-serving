@@ -122,7 +122,9 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             // 챕터9 batch serving: B≤15는 SB 커널(런타임 S, 1적재 — gemm_batch의 비특수화 default 루프[B× 재적재] 회피).
             //   SB는 SMAX dispatch(S≤8=SMAX8 occ100% / 9~15=SMAX16 occ83%, de-risk probe_sb16: S=12 gemm_batch 대비 5.85×).
             //   B=16은 gemm_batch<16> 특수화가 SB16보다 빠름(340 vs 398us) → 유지. bit-exact(SB16==gemm_batch 모든 S).
-            // 챕터9 stream-K: B=9~16을 BM=16 split-K(few-blocks 해결)로 — env BM16(기본 off, in-engine A/B). B≤8 sb8.
+            // 챕터9 stream-K BM=16 split-K(few-blocks 해결): in-engine WIN(27B +13.9% tok/s·TPOT −34%, 0.8b +4.6%, argmax==single).
+            //   단 opt-in(기본 off): split-K(MMA)는 sb(DP4A)와 다른 커널 → W4A8 borderline flip으로 SB 계열의 bit-identical-across-B
+            //   속성 깸(test_cbatch_prod got==iso). argmax는 정확. env BM16=1로 켜서 throughput↑(borderline flip trade 감수). B≤8 sb8.
             static int USE_BM16 = getenv("BM16") ? atoi(getenv("BM16")) : 0;
             if(B<=8)                   launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
             else if(USE_BM16 && B<=16) launch_gemm_bm16_splitk(g_bxq,g_bxs,m.wq,m.sc,Y,B,OUT,IN,sdtype);  // M=B rows, split-K
