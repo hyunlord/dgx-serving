@@ -85,6 +85,14 @@ long_scoreboard 72.8% 직접 공격. 우리 batch/decode = cp.async 0, 완전 �
 - **함정 = empty-row뿐(근본 아님)** → **BM=16(=M, MMA m16 1타일, empty 0)** 으로 고침. gemm_mmq의 cp.async 더블버퍼+MMA+scale 재사용, warp 레이아웃만 재배치(8 warp 전부 col 방향, A-tile 16행). few-blocks(BM=16→OUT/BN 블록=40 vs 48 SM)는 더블버퍼가 intra-block 숨겨 minor(BN 튜닝 가능). **stream-K 전면 재구현 불필요.**
 - **판정: GO — 지을 만함(bounded 빌드).** BM=16 배치 GEMM = gemm_mmq 리타일. 더블버퍼 latency-hiding은 measured(7.23), 함정(empty-row)은 BM=16이 제거. 기대: 배치 raw wall(SB 72.8% long_scoreboard) 제거, throughput↑(정확 이득은 빌드서 측정). bit-exact 게이트(정수 dot + 동일 dequant).
 
+## BM=16 배치 GEMM 빌드 → in-engine NO-GO (격리 오도 재발, few-blocks)
+실현성 GO 후 BM=16 커널 빌드(gemm_mmq 리타일, tools/probe_bm16.cu): MS=1, 8 warp 전부 col(wn 0..7, 16 cols씩), cp.async 더블버퍼/MMA/scale 재사용.
+- **correctness**: argmax ALL match(vs sb, fp dequant 순서차 2e-5), **in-engine iso 게이트 PASS**(B=12·16, fp32·W4A8 batch==single argmax). 정확성 완벽.
+- **격리 타이밍**: BM=16 vs sb S=16 **1.60×**·S=12 1.35× 빠름(매우 유망).
+- **★ in-engine 타이밍(test_batch_decode 0.8b W4A8): B=12 sb 753 vs BM16 711(−5.6%), B=16 gemm_batch 776 vs BM16 762(−1.9%) = 더 느림!** 격리(1.60×)와 정반대 = **격리 오도 재발**(CLAUDE.md #3, 이번 세션 3번째: register-prefetch·U-sweep·BM=16).
+- **근본**: BM=16 grid = N/128 × M/16 = **few blocks(~40 이하)**. GB10 SM=48. 격리선 GPU 독점이라 40블록 OK지만, **in-engine선 다른 레이어 커널과 경쟁 + few-blocks가 GPU 못 채움**. SB는 grid=OUT warps=**many blocks**로 GPU 채워 latency를 block-간 숨김(per-warp long_scoreboard 72.8%여도 many-block로 극복). **de-risk의 "few-blocks minor" 판단이 오류** — in-engine dominant.
+- **→ NO-GO(bounded 리타일). 진짜 해결 = stream-K(split-K로 소-M서 블록 생성, 회피하려던 major)** — llama mmq의 실제 설계. big-tile 리타일만으론 few-blocks로 불가. **batch wall 닫기 = stream-K major 빌드 확정(더 이상 추측 아님, 측정).**
+
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
 - **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.
