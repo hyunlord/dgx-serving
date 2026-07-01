@@ -58,6 +58,25 @@ int8 WMMA(tensor core s8) 최소 GEMM 커널 측정:
 
 **→ 재초점: int8-MMA 기회 = 배치 경로(B=8-16), prefill 아님(이미 MMA)·decode 아님(GEMV).** 단 caveat: 배치가 부분 memory-bound(weight 대역폭 1적재)면 MMA(compute) 이득 제한 — llama B=1→16 스케일 6.97×(≠16×)=부분 compute-bound라 MMA 여지 있으나 불확실. **정식 대상 = MMA 배치 GEMM(gemm_batch DP4A 대체), payoff 불확실 → 착수 전 방향 확인.**
 
+### batch compute/memory-bound de-risk — NO-GO for MMA (`tools/ncu_sb16.cu`)
+MMA 빌드 전 ncu로 배치(gemv_w4a8_sb, B=16, 27B shape) 병목 판별:
+| 지표 | 값 | 해석 |
+|---|---|---|
+| Compute (SM) Throughput | **32%** | compute 병목 아님 |
+| Memory Throughput | **32%** | 대역폭 포화도 아님 |
+| Achieved Occupancy | **80%** | occupancy 이미 높음(lever 아님) |
+| stall long_scoreboard | **72.8%** | **L1TEX load 지연 = memory-latency-bound** |
+
+- **NO-GO for MMA**: compute 32%(병목 아님) → **MMA(compute 가속)는 이득 없음**. occupancy 80%(이미 높음) → occupancy도 lever 아님. 병목 = **load-latency**(우리 decode gemv와 동일 계열, [[mtp-spec-decode-verify-bandwidth]] long_scoreboard 67). throughput 32%만 = 지연 미은닉.
+- **latency-hiding도 소진**: SB-MLP(outstanding load U-unroll) 이미 시도→역효과(SB는 S-accumulator로 ILP 충분, U-unroll이 occupancy만↓, 챕터9). → 배치 latency wall은 하드.
+- **결론 = ③ 정직 수용**(브리프 결정규칙: memory-bound→③). **de-risk-first가 헛빌드 방지** — MMA 배치 커널 지었어도 compute 병목 아니라 무이득이었을 것.
+
+## 최종 정직 좌표 (커널 갭 3-축 종합)
+- **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
+- **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.
+- **batch B=8-16(93.56 vs 65.9, 1.42×)**: DP4A지만 **memory-latency-bound(de-risk 확정)** — MMA·occupancy·latency-hiding 다 소진/무관.
+- **종합**: 우리 raw 커널은 3축 다 **구조적 한계 근접**(prefill MMA+타일, decode/batch load-latency). **llama ~1.4× 우위 = 단일 미보유 기법(MMA 등)이 아니라 broad 커널 성숙도**(latency-hiding·스케줄링, llama가 년단위 튜닝). 우리 차별점 = niche(bit-identical 정확성·GDN 네이티브·연속배칭 서빙 스택·spec), 범용 raw throughput 아님. **honest-perf ⑦ 확정.**
+
 ## 정직 좌표 (이번 결론)
 - **STEP 1 블록**: llama fair spec 측정 불가(자산 — MTP-GGUF/vocab-matched draft 부재). 우리 spec vs llama non-spec(불공정)만 측정됨.
 - **STEP 2 진단**: 갭은 **compute 실행 효율/occupancy**(캐시 아님, 챕터7서 L1/TEX 맞춤). llama = int8 MMA+튜닝 타일 추정.
