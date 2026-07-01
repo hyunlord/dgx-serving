@@ -248,12 +248,19 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
     //   xqs/xss: 미리 양자화한 [M,H] 버퍼(use_q4==2). X: fp32 소스.
     auto MMrow=[&](const QMat&m,const float*X,const int8_t*xqs,const float*xss,float*Y,int IN,int OUT){
         if(use_q4==2){
-            for(int b=0;b<B;b++){
-                const int8_t *xb=xqs+(size_t)b*Nnodes*IN; const float *sb=xss+(size_t)b*Nnodes*IN/QBLK;
-                float *Yb=Y+(size_t)b*Nnodes*OUT;
-                if      (Nnodes==1) launch_gemv_w4a8_mlp<2>(xb,sb,nullptr,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
-                else if (Nnodes<=8) launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
-                else                launch_gemm_mmq_w4a8(xb,sb,m.wq,m.sc,Yb,Nnodes,OUT,IN,sdtype);
+            if(Nnodes>8){
+                // ★곱: Nnodes>8이면 단독 spec(S=Nnodes)도 mmq → concat mmq(M=B*Nnodes) 1콜이 bit-identical
+                //   (mmq row-독립: tools/probe_mmq_rowdep + in-context golden dump로 concat[slot]==solo max|d|=0.0 확정).
+                //   weight 1운반이 B슬롯 전부 서빙(현 per-slot은 슬롯마다 weight 재적재). matmul 배칭 이득 = 곱의 원천.
+                launch_gemm_mmq_w4a8(xqs,xss,m.wq,m.sc,Y,M,OUT,IN,sdtype);
+            } else {
+                // Nnodes≤8: 단독 spec이 sb(또는 mlp) → concat mmq는 borderline flip. per-slot로 커널 일치(bit-identical). 곱은 Phase3(단독 mmq 정렬 필요).
+                for(int b=0;b<B;b++){
+                    const int8_t *xb=xqs+(size_t)b*Nnodes*IN; const float *sb=xss+(size_t)b*Nnodes*IN/QBLK;
+                    float *Yb=Y+(size_t)b*Nnodes*OUT;
+                    if      (Nnodes==1) launch_gemv_w4a8_mlp<2>(xb,sb,nullptr,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                    else                launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                }
             }
         } else if(use_q4){ launch_gemm_tiled_q4(X,m.wq,m.sc,Y,M,OUT,IN,sdtype); }
         else             { launch_gemv_f32(X,m.wf,Y,IN,OUT,M); }
@@ -263,12 +270,15 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
         if(use_q4==2){
             int8_t *xq=vbwsi8(bi,(size_t)M*IN); float *xs=vbws(wi,(size_t)M*IN/QBLK); int32_t*xsm=(int32_t*)vbws(wi,(size_t)M*IN/QBLK);
             launch_quantize_x_q8(X,xq,xs,xsm,IN,M);            // per-row 양자화(M행) — 슬롯별 offset과 bit-identical
-            for(int b=0;b<B;b++){
-                const int8_t *xb=xq+(size_t)b*Nnodes*IN; const float *sb=xs+(size_t)b*Nnodes*IN/QBLK;
-                float *Yb=Y+(size_t)b*Nnodes*OUT;
-                if      (Nnodes==1) launch_gemv_w4a8_mlp<2>(xb,sb,xsm+(size_t)b*Nnodes*IN/QBLK,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
-                else if (Nnodes<=8) launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
-                else                launch_gemm_mmq_w4a8(xb,sb,m.wq,m.sc,Yb,Nnodes,OUT,IN,sdtype);
+            if(Nnodes>8){
+                launch_gemm_mmq_w4a8(xq,xs,m.wq,m.sc,Y,M,OUT,IN,sdtype);   // ★곱: concat mmq(M) — 단독 mmq(Nnodes)와 row-독립 bit-identical
+            } else {
+                for(int b=0;b<B;b++){
+                    const int8_t *xb=xq+(size_t)b*Nnodes*IN; const float *sb=xs+(size_t)b*Nnodes*IN/QBLK;
+                    float *Yb=Y+(size_t)b*Nnodes*OUT;
+                    if      (Nnodes==1) launch_gemv_w4a8_mlp<2>(xb,sb,xsm+(size_t)b*Nnodes*IN/QBLK,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                    else                launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                }
             }
         } else if(use_q4){ launch_gemm_tiled_q4(X,m.wq,m.sc,Y,M,OUT,IN,sdtype); }
         else             { launch_gemv_f32(X,m.wf,Y,IN,OUT,M); }

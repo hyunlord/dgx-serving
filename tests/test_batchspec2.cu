@@ -130,6 +130,13 @@ static float *d_cos,*d_sin;
 static int H,V,rot,NKV,HD, N,K,W,Nnodes, bq4,dq4, maxlen;
 static int argmaxV(const std::vector<float>&lg,int p){int b=0;float bv=lg[(size_t)p*V];for(int j=1;j<V;j++){float z=lg[(size_t)p*V+j];if(z>bv){bv=z;b=j;}}return b;}
 
+// [곱 측정] verify forward 시간 누적(TIME=1). single(M=Nnodes 1슬롯)×2 vs batched(M=B*Nnodes) — matmul weight-load 배칭 이득.
+//   warmup 첫 호출은 스킵(JIT/alloc). controlled A/B: 같은 시나리오·같은 사이클수(mism=0 보장)로 공정 비교.
+static double g_t_single=0,g_t_batch=0; static long g_n_single=0,g_n_batch=0; static int g_time=0;
+static cudaEvent_t g_e0,g_e1; static int g_ev_init=0;
+static inline void tstart(){ if(!g_ev_init){cudaEventCreate(&g_e0);cudaEventCreate(&g_e1);g_ev_init=1;} cudaEventRecord(g_e0); }
+static inline float tstop(){ cudaEventRecord(g_e1); cudaEventSynchronize(g_e1); float ms=0; cudaEventElapsedTime(&ms,g_e0,g_e1); return ms; }
+
 // 슬롯의 draft tree(root=cur, h_cur, base) → tok/par/pos/anc(슬롯-로컬) + owns hidden. (solo/batch 공용, 동일 로직)
 static void draft_tree(MtpKV& kv, int cur, float* h_cur, int base,
                        std::vector<int>&tok, std::vector<int>&par, std::vector<int>&pos, std::vector<unsigned>&anc,
@@ -193,7 +200,10 @@ static std::vector<int> solo_spec(const std::vector<int>& prompt){
         draft_tree(kv,cur,h_cur,base,tok,par,pos,anc,owns);
         CK(cudaMemcpy(d_tok,tok.data(),(size_t)Nnodes*4,cudaMemcpyHostToDevice));
         int*dpar=upi(par); int*dpos=upi(pos); unsigned*danc; CK(cudaMalloc(&danc,Nnodes*4)); CK(cudaMemcpy(danc,anc.data(),Nnodes*4,cudaMemcpyHostToDevice));
+        static int wsingle=0;
+        if(g_time) tstart();
         qwen35_decode(c,w,st,d_tok,Nnodes,d_cos,d_sin,vl,nullptr,0,&va,bq4,vpn,0,dpar,danc,dpos);
+        if(g_time){ float ms=tstop(); if(wsingle++){ g_t_single+=ms; g_n_single++; } }   // 첫 호출 warmup 스킵
         std::vector<float> vlh((size_t)Nnodes*V); CK(cudaMemcpy(vlh.data(),vl,vlh.size()*4,cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(hpn.data(),vpn,hpn.size()*4,cudaMemcpyDeviceToHost));
         cudaFree(dpar);cudaFree(danc);cudaFree(dpos);
@@ -263,7 +273,10 @@ static std::pair<std::vector<int>,std::vector<int>> batch_spec(const std::vector
         CK(cudaMemcpy(d_ancb,ancc.data(),(size_t)B*Nnodes*4,cudaMemcpyHostToDevice));
         VerifyArtifacts vab[2]={va[0],va[1]};
         // ★한 forward로 2슬롯 verify
+        static int wbatch=0;
+        if(g_time) tstart();
         qwen35_verify_batch(c,w,sts,d_tokb,B,Nnodes,base_b.data(),d_cos,d_sin,vl,vpn,vab,bq4,d_parb,d_ancb,d_posb);
+        if(g_time){ float ms=tstop(); if(wbatch++){ g_t_batch+=ms; g_n_batch++; } }   // 첫 호출 warmup 스킵
         std::vector<float> vlh((size_t)B*Nnodes*V); CK(cudaMemcpy(vlh.data(),vl,vlh.size()*4,cudaMemcpyDeviceToHost));
         std::vector<float> vpnh((size_t)B*Nnodes*H); CK(cudaMemcpy(vpnh.data(),vpn,vpnh.size()*4,cudaMemcpyDeviceToHost));
         // 슬롯별 accept + promote + catchup (finished slot은 skip)
@@ -293,6 +306,7 @@ int main(int argc,char**argv){
     WD=argc>1?argv[1]:"artifacts/qwen35-0.8b/weights"; GD=(argc>2?argv[2]:"artifacts/qwen35-0.8b/mtp_golden")+std::string("/");
     N=argc>3?atoi(argv[3]):24, K=argc>4?atoi(argv[4]):4, W=argc>5?atoi(argv[5]):3;
     int uq=argc>6?atoi(argv[6]):0;
+    g_time=(getenv("TIME")&&atoi(getenv("TIME"))>0)?1:0;   // 곱 측정 모드
     bq4=uq; dq4=0; int mq4=0;             // body precision=uq(0 fp32/2 W4A8). draft/mtp fp32(정확성 게이트 목적).
     c=load_config_qwen((WD+"/manifest.json").c_str());
     H=c.hidden_size; V=c.vocab_size; rot=c.rotary_dim; NKV=c.num_kv_heads; HD=c.head_dim;
@@ -335,6 +349,14 @@ int main(int argc,char**argv){
     }
     bool pass=(total_mism==0);
     printf("\n[test_batchspec2] uq=%d total_mism=%d → %s\n",uq,total_mism,pass?"PASS":"FAIL");
+    if(g_time && g_n_single>0 && g_n_batch>0){
+        const int Bg=2;                                            // Phase 1 = 고정 2요청
+        double as=g_t_single/g_n_single, ab=g_t_batch/g_n_batch;   // single=1슬롯 forward, batch=B슬롯 1 forward
+        double prod=(double)Bg*as/ab;                              // 곱: single B번 vs batched 1번의 forward 시간비
+        printf("[곱 측정] verify forward 평균: single(M=%d,1슬롯)=%.3f ms(n=%ld), batched(M=%d,%d슬롯)=%.3f ms(n=%ld)\n",
+               Nnodes,as,g_n_single,Bg*Nnodes,Bg,ab,g_n_batch);
+        printf("[곱 측정] %d×single/batched = %.3f× (>1=곱 실현: weight 1운반이 %d슬롯 서빙, matmul 배칭 이득)\n",Bg,prod,Bg);
+    }
     free_weights_qwen(w); free_config_qwen(c);
     cudaFree(d_cos);cudaFree(d_sin);
     return pass?0:1;
