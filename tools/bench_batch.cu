@@ -26,7 +26,10 @@ int main(int argc,char**argv){
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     printf("  %-4s %-12s %-14s %-12s %s\n","B","decode ms/step","throughput t/s","per-req t/s","vs B=1");
     double base1=0;
-    for(int B : {1,2,3,4,5,6,7,8,16}){    // SB는 B≤8 수정(odd 3,5,6,7); 16은 gemm_batch 특수화. (12/24/32 default-collapse는 별도)
+    int bonly = getenv("BONLY") ? atoi(getenv("BONLY")) : 0;   // 튜닝 스윕: 특정 B만(모델 1회 로드, 임의 B 허용). 0=전체
+    int reps  = getenv("REPS")  ? atoi(getenv("REPS"))  : 1;   // 결정성: timed 루프 반복(min ms 채택)
+    std::vector<int> blist = bonly ? std::vector<int>{bonly} : std::vector<int>{1,2,3,4,5,6,7,8,16};
+    for(int B : blist){    // SB는 B≤8 수정(odd 3,5,6,7); 16은 gemm_batch 특수화. (12/24/32 default-collapse는 별도)
         size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB);
         // 대략 예산: GDN S(B*NH*Dv*Dv*4*nGDN) + KV(B*maxlen*NKV*HD*2*nFull) — 가드
         size_t gdnS=(size_t)B*c.gdn_num_v_heads*c.gdn_head_v_dim*c.gdn_head_v_dim*4*48;
@@ -36,9 +39,14 @@ int main(int argc,char**argv){
         int*dtok; CK(cudaMalloc(&dtok,B*4)); CK(cudaMemcpy(dtok,tok.data(),B*4,cudaMemcpyHostToDevice));
         float*dl; CK(cudaMalloc(&dl,(size_t)B*V*4));
         for(int p=0;p<PRE;p++) qwen35_decode_batch(c,w,st,dtok,d_cos,d_sin,dl,use_q4);  // prefill/warmup
-        CK(cudaDeviceSynchronize()); cudaEventRecord(t0);
-        for(int i=0;i<N;i++) qwen35_decode_batch(c,w,st,dtok,d_cos,d_sin,dl,use_q4);
-        cudaEventRecord(t1); CK(cudaEventSynchronize(t1)); float ms=ev(t0,t1);
+        // 결정성 REPS: rep마다 n_past 리셋 → 동일 position 범위(base..base+N)서 재측정, min ms 채택(OOB 방지).
+        int saved_np=st.n_past; float ms=1e30f;
+        for(int r=0;r<reps;r++){
+            st.n_past=saved_np;
+            CK(cudaDeviceSynchronize()); cudaEventRecord(t0);
+            for(int i=0;i<N;i++) qwen35_decode_batch(c,w,st,dtok,d_cos,d_sin,dl,use_q4);
+            cudaEventRecord(t1); CK(cudaEventSynchronize(t1)); float m=ev(t0,t1); if(m<ms)ms=m;
+        }
         double tput=(double)B*N*1000.0/ms, perreq=tput/B; if(B==1)base1=tput;
         printf("  %-4d %-12.2f %-14.1f %-12.1f %.2fx\n",B, ms/N, tput, perreq, base1?tput/base1:1.0); fflush(stdout);
         free_batch_decode_state(st); cudaFree(dtok); cudaFree(dl);

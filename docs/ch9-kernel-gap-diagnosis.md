@@ -96,9 +96,13 @@ long_scoreboard 72.8% 직접 공격. 우리 batch/decode = cp.async 0, 완전 �
 ## stream-K(split-K) BM=16 — in-engine WIN (arc 첫 돌파, `tools/probe_splitk.cu`)
 BM=16 few-blocks(NO-GO) → stream-K(K를 SPLITK로 쪼개 blockIdx.z 블록↑, 40→~96~320). 각 split K-range 부분합(fp dequant)→workspace→reduce 합산(deterministic, atomic 안 씀). MS=1 8warp col, 더블버퍼/MMA/scale 재사용.
 - **correctness**: 격리 argmax==sb 모든 SPLITK(1-2e-5); in-engine iso 게이트(vs 진짜 single decode) argmax PASS(B=12·16 fp32·W4A8).
-- **★in-engine WIN**: 0.8b B=16 772.9→808.5(+4.6%); **27B bench_serve(Bmax16 λ8 c-ch) 33.9→38.6 tok/s(+13.9%), TPOT 0.5205→0.3457(−34%).** plain BM=16(−2~6%)을 few-blocks fix로 뒤집음 — 격리 오도 극복, **이번 arc 첫 in-engine kernel 성공.** bounded 다 NO-GO였지만 stream-K(유일한 길)가 batch wall 돌파.
-- **opt-in(기본 off)**: split-K(MMA)는 sb(DP4A)와 다른 커널 → W4A8 borderline flip으로 **SB 계열의 bit-identical-across-B 속성 깸**(SB8==SB16는 bit-identical, split-K은 아님; test_cbatch_prod got==iso mism 11). argmax 정확. **default off로 mism=0 보존, env BM16=1로 +13.9% throughput(borderline flip trade 감수).** SPLITK auto(~96 blocks) or env SPLITK.
-- **갭**: 27B 배치 serving +13.9%(라마 1.42× 갭 부분 축소). full 아님(0.8b matmul 비중 작아 +4.6%, 27B +13.9%; 서빙 aggregate라 raw B=16 갭보다 희석). **핵심: batch load-latency wall이 stream-K로 실제 열림(측정) — "천장" 아니었음.**
+- **correctness OK**: 격리 argmax==sb 모든 SPLITK; in-engine iso(vs 진짜 single) argmax PASS(B=12·16 fp32·W4A8).
+- **⚠️ 이득 정정(정밀 재측정, 다음 세션 SPLITK 튜닝 brief)**: 지난 세션 "27B +13.9%(33.9→38.6)"는 **controlled A/B서 재현 안 됨**. 동일 코드·seed42·λ8·Bmax16·c-ch back-to-back: **baseline 43.2 → split-K 44.7 = +3.5%**(baseline 43.2≠이전 33.9 — 이전 A/B는 uncontrolled, baseline 비정상 저). raw B=16(bench_batch N64 REPS3 min-ms)도 **65.6→67.9 = +3.5%**(동일!). **honest 이득 = +3.5%, +13.9% 아님(overclaim 정정, honest-perf ⑧).**
+- **B 의존(측정)**: split-K는 **B≥14만 이득**(B10 −12.5%/B12 −4.3%/B14 +4.7%/B16 +3.5%) — BM=16 타일 낭비 (16−B)/16 vs few-blocks 이득. → dispatch 게이트 **B≥14**로 수정(opt-in이 B9~13 regression 안 내게).
+- **SPLITK 최적점 = auto(측정)**: B=16서 auto 67.9 > 고정 SPLITK{2:66.2, 4:65.4, 8:64.5, 16:60.9} 전부 — 고정은 단조 악화. auto가 matmul별 적응(gate/up SK1, down/o SK2, kv SK8) = 이미 최적, **튜닝 여지 0.**
+- **★ncu — 왜 +3.5%만(구조)**: split-K 커널 occupancy = gate/up **46%**(136블록, ≫SM48 — few-blocks 아님!), q 33%(96블록), o/down 28%(80), kv 22%(64). **지배적 MLP matmul은 occupancy-bound(46%)지 few-blocks 아님 — split-K는 occupancy 못 고침 → 이득 미미.** 진짜 few-blocks는 tiny kv(8블록→SK8)뿐이나 시간 비중 극소(37 vs 508us). reduce 비용 작음(11-16us, ~3-5%). **이전 격리 1.60×는 작은 matmul만 봐서 오도(CLAUDE.md #3).**
+- **opt-in(기본 off)**: split-K(MMA)는 sb(DP4A)와 다른 커널 → W4A8 borderline flip으로 **SB 계열 bit-identical-across-B 속성 깸**(test_cbatch_prod mism 11). argmax 정확. default off로 mism=0 보존, env BM16=1로 +3.5%(B≥14, trade 감수).
+- **갭(정직)**: raw B=16 93.56/65.6=**1.427× → 93.56/67.9=1.378×**(부분 ~5% 축소, full 아님). 서빙(avgB≈14.6 saturated) +3.5% = raw와 일치(희석 아니라 애초에 작음). **batch wall은 열리되 좁게 — 진짜 병목은 BM=16 MMA occupancy(46%), split-K가 못 여는 부분. "천장 아님"은 맞으나 "크게 열림"은 아님(정정).**
 
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).

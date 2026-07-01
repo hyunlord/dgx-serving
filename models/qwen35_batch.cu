@@ -126,10 +126,10 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             //   단 opt-in(기본 off): split-K(MMA)는 sb(DP4A)와 다른 커널 → W4A8 borderline flip으로 SB 계열의 bit-identical-across-B
             //   속성 깸(test_cbatch_prod got==iso). argmax는 정확. env BM16=1로 켜서 throughput↑(borderline flip trade 감수). B≤8 sb8.
             static int USE_BM16 = getenv("BM16") ? atoi(getenv("BM16")) : 0;
-            if(B<=8)                   launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
-            else if(USE_BM16 && B<=16) launch_gemm_bm16_splitk(g_bxq,g_bxs,m.wq,m.sc,Y,B,OUT,IN,sdtype);  // M=B rows, split-K
-            else if(B<=15)             launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
-            else                       launch_gemm_batch_w4a8(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);   // 챕터4 W4A8 lane-minor(16 특수화)
+            if(B<=8)                       launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
+            else if(USE_BM16 && B>=14)     launch_gemm_bm16_splitk(g_bxq,g_bxs,m.wq,m.sc,Y,B,OUT,IN,sdtype);  // B14-16만: BM=16 타일 낭비(16−B)/16 < few-blocks 이득(측정: B≤13 SB가 빠름, B14 +4.7%/B16 +3.5%). M=B rows, split-K
+            else if(B<=15)                 launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
+            else                           launch_gemm_batch_w4a8(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);   // 챕터4 W4A8 lane-minor(16 특수화)
         } else if(use_q4){ if(!launch_gemm_mw_q4(X,m.wq,m.sc,Y,IN,OUT,B,sdtype)) launch_gemm_batch_q4(X,m.wq,m.sc,Y,IN,OUT,B,sdtype); }  // q4만 mw 이득(B≥4)
         else              launch_gemm_batch_f32(X,m.wf,Y,IN,OUT,B);      // fp32: bandwidth-bound, mw 무익
     };
