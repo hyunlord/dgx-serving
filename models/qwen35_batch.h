@@ -15,9 +15,12 @@ BatchDecodeState alloc_batch_decode_state(const ModelConfig &c, int B, int max_l
 void free_batch_decode_state(BatchDecodeState &s);
 void reset_batch_decode_state(const ModelConfig &c, BatchDecodeState &s);
 
-// d_tokens: [B] (각 시퀀스의 현재 토큰, 위치 n_past). d_logits: [B, V]. commit(KV append + state + n_past++).
-//   use_q4: 0=fp32, 1=q4, 2=W4A8 (matmul 경로; gemm_batch fp32/q4/w4a8).
+// d_tokens: [B] (각 시퀀스의 현재 토큰). d_logits: [B, V]. commit(KV append + state).
+//   use_q4: 0=fp32, 1=q4, 2=W4A8.
+//   h_pos_b: nullptr=same-length(모든 seq 위치=st.n_past, st.n_past++). 비-null=ragged(연속배칭): h_pos_b[b]=시퀀스 b의
+//     현재 위치(per-seq rope+KV+attn), st.n_past 불변(호출자가 per-seq 위치 관리). 커널 재사용, 위치만 per-seq.
 void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecodeState &st,
-                         const int *d_tokens, const float *d_cos, const float *d_sin, float *d_logits, int use_q4 = 0);
+                         const int *d_tokens, const float *d_cos, const float *d_sin, float *d_logits, int use_q4 = 0,
+                         const int *h_pos_b = nullptr);
 
 #endif // DGX_QWEN35_BATCH_H

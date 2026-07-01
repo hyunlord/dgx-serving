@@ -52,7 +52,8 @@ static float *bws(int &idx, size_t n){
 }
 
 void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecodeState &st,
-                         const int *d_tokens, const float *d_cos, const float *d_sin, float *d_logits, int use_q4){
+                         const int *d_tokens, const float *d_cos, const float *d_sin, float *d_logits, int use_q4,
+                         const int *h_pos_b){
     const int H=c.hidden_size,FFN=c.intermediate_size,HD=c.head_dim,V=c.vocab_size;
     const int NQ=c.num_q_heads,NKV=c.num_kv_heads,rot=c.rotary_dim; const float eps=c.rms_norm_eps;
     const int qdim2=NQ*HD*(c.attn_output_gate?2:1), qdim=NQ*HD, kvdim=NKV*HD;
@@ -61,6 +62,11 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
     const int B=st.B, base=st.n_past, ML=st.max_len;
     const size_t BH=(size_t)B*H;
     const long kvstride=(long)ML*kvdim;
+    // ragged(연속배칭): h_pos_b[b]=seq b 위치. d_pos에 업로드(rope per-seq). null이면 same-length(모두 base).
+    static int *g_dpos=nullptr; static int g_dposcap=0;
+    if(h_pos_b){ if(g_dposcap<B){ if(g_dpos)cudaFree(g_dpos); BK(cudaMalloc(&g_dpos,B*4)); g_dposcap=B; }
+                 BK(cudaMemcpy(g_dpos,h_pos_b,B*4,cudaMemcpyHostToDevice)); }
+    auto POS=[&](int b){ return h_pos_b ? h_pos_b[b] : base; };   // seq b의 현재 위치
 
     int wi=0;
     float *x=bws(wi,BH),*norm=bws(wi,BH),*after=bws(wi,BH),*n2=bws(wi,BH);
@@ -101,17 +107,22 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             launch_rmsnorm_zc(qb,L.q_norm,qn,B*NQ,HD,eps);
             mmb(L.k,norm,kb,H,kvdim); launch_rmsnorm_zc(kb,L.k_norm,kn,B*NKV,HD,eps);
             mmb(L.v,norm,vb,H,kvdim);
-            launch_rope_partial_batch(qn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,B,NQ,HD,rot);
-            launch_rope_partial_batch(kn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,B,NKV,HD,rot);
-            // 각 시퀀스 b: K[b]/V[b]를 cache[b]의 위치 base에 append (시퀀스별 stride, fp32→bf16 변환)
-            for (int b=0; b<B; b++) {
-                launch_f32_to_bf16(kn+(size_t)b*kvdim, st.Kc[l]+(size_t)b*kvstride+(size_t)base*kvdim, (size_t)kvdim);
-                launch_f32_to_bf16(vb+(size_t)b*kvdim, st.Vc[l]+(size_t)b*kvstride+(size_t)base*kvdim, (size_t)kvdim);
+            if(h_pos_b){  // ragged: seq별 위치 g_dpos (rope_partial_pos = per-row 위치, STEP3 자산). row=b.
+                launch_rope_partial_pos(qn,d_cos,d_sin,g_dpos,B,NQ,HD,rot);
+                launch_rope_partial_pos(kn,d_cos,d_sin,g_dpos,B,NKV,HD,rot);
+            } else {
+                launch_rope_partial_batch(qn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,B,NQ,HD,rot);
+                launch_rope_partial_batch(kn,d_cos+(size_t)base*rot,d_sin+(size_t)base*rot,B,NKV,HD,rot);
             }
-            // FA.2 통일: 시퀀스별 KV(kvstride 간격)에 FA.2(single과 동일 attention). decode Sq=1.
+            // 각 시퀀스 b: K[b]/V[b]를 cache[b]의 위치 POS(b)에 append (시퀀스별 stride, fp32→bf16 변환)
+            for (int b=0; b<B; b++) {
+                launch_f32_to_bf16(kn+(size_t)b*kvdim, st.Kc[l]+(size_t)b*kvstride+(size_t)POS(b)*kvdim, (size_t)kvdim);
+                launch_f32_to_bf16(vb+(size_t)b*kvdim, st.Vc[l]+(size_t)b*kvstride+(size_t)POS(b)*kvdim, (size_t)kvdim);
+            }
+            // FA.2 통일: 시퀀스별 KV(kvstride 간격)에 FA.2(single과 동일). decode Sq=1, attend 0..POS(b).
             for (int b=0; b<B; b++)
                 launch_flash_attn(qn+(size_t)b*qdim, st.Kc[l]+(size_t)b*kvstride, st.Vc[l]+(size_t)b*kvstride,
-                                  attn+(size_t)b*qdim, 1, NQ, NKV, HD, base);
+                                  attn+(size_t)b*qdim, 1, NQ, NKV, HD, POS(b));
             launch_gate_sigmoid(attn, gate, (int)((size_t)B*qdim));
             mmb(L.o,attn,ob,qdim,H); launch_add(after,x,ob,(int)BH);
         } else {
@@ -138,6 +149,6 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
     }
     launch_rmsnorm_zc(x,w.final_norm,fn,B,H,eps);
     mmb(w.lm_head,fn,d_logits,H,V);
-    st.n_past += 1;
+    if(!h_pos_b) st.n_past += 1;   // ragged면 per-seq 위치는 호출자(scheduler)가 관리
     BK(cudaDeviceSynchronize());
 }
