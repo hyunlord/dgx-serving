@@ -71,6 +71,13 @@ MMA 빌드 전 ncu로 배치(gemv_w4a8_sb, B=16, 27B shape) 병목 판별:
 - **latency-hiding도 소진**: SB-MLP(outstanding load U-unroll) 이미 시도→역효과(SB는 S-accumulator로 ILP 충분, U-unroll이 occupancy만↓, 챕터9). → 배치 latency wall은 하드.
 - **결론 = ③ 정직 수용**(브리프 결정규칙: memory-bound→③). **de-risk-first가 헛빌드 방지** — MMA 배치 커널 지었어도 compute 병목 아니라 무이득이었을 것.
 
+## load-latency in-engine 공격 (사용자: ③은 도망 — 계속 판다)
+long_scoreboard 72.8% 직접 공격. 우리 batch/decode = cp.async 0, 완전 동기 load(확정). llama = register-ILP(decode)+shared 더블버퍼(batch, docs/llama-mmvq-latency-analysis.md).
+- **격리 de-risk 신뢰성 문제(CLAUDE.md #3)**: decode gemv U-sweep 격리 U=1 최속(ILP 역효과)인데 챕터9 in-engine U=2 +8%=정반대. 격리 warm-cache가 latency-hiding 오도. → in-engine 측정 필수.
+- **register-prefetch(2-stage) in-engine A/B(test_batch_decode 0.8b, SB 경로)**: B=12 759.4→753.6(SB_PIPE), B=15 752.7→750.3 = **~중립(무이득)**. 격리(0.867×)보다 낫지만 in-engine도 이득 0. bit-exact.
+- **구조 규명(NO-GO 근거)**: SB compute-per-load ~32cy ≪ load latency ~400cy → **2-stage 파이프는 1 chunk분(~32cy)만 겹침 = 400cy 못 숨김**(~12-stage 필요). register/cp.async 무관(둘 다 2-stage 더블버퍼). occ 이미 80%(더 못 올림). → **2-stage pipelining은 lever 아님(측정+구조).** cp.async 2-stage도 동일 한계 → 프록시상 NO-GO.
+- **실제 lever(둘 다 major)**: ① deep multi-stage(~12) 파이프(shared 12×, 복잡) ② llama식 big-tile 배치 GEMM(compute-per-load↑로 2-stage로 충분, MMQ 함정 회피 설계). 둘 다 큰 불확실 재작성.
+
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
 - **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.
