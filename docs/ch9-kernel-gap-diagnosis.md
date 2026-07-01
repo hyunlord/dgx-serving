@@ -78,6 +78,13 @@ long_scoreboard 72.8% 직접 공격. 우리 batch/decode = cp.async 0, 완전 �
 - **구조 규명(NO-GO 근거)**: SB compute-per-load ~32cy ≪ load latency ~400cy → **2-stage 파이프는 1 chunk분(~32cy)만 겹침 = 400cy 못 숨김**(~12-stage 필요). register/cp.async 무관(둘 다 2-stage 더블버퍼). occ 이미 80%(더 못 올림). → **2-stage pipelining은 lever 아님(측정+구조).** cp.async 2-stage도 동일 한계 → 프록시상 NO-GO.
 - **실제 lever(둘 다 major)**: ① deep multi-stage(~12) 파이프(shared 12×, 복잡) ② llama식 big-tile 배치 GEMM(compute-per-load↑로 2-stage로 충분, MMQ 함정 회피 설계). 둘 다 큰 불확실 재작성.
 
+## big-tile 배치 GEMM 실현성 de-risk — GO (설계+측정, `tools/probe_mmq_m16.cu`)
+2-stage NO-GO 후 근본 정답(llama big-tile) 실현성 값싸게 규명(major 빌드 전).
+- **설계 계산**: batch M=16 intensity ~16 MAC/weight-byte(고정). big-tile 16×BN(BN=128,KT=64)은 W[128,64] shared 1적재→16×128×64 MAC=32 MMA≈**512cy 컴퓨트/tile-load** > 400cy latency → 2-stage 더블버퍼로 숨김(SB의 32cy와 결정적 차이 — load 입도↑). shared ~10KB(gemm_mmq 26KB보다 적음).
+- **★측정 확증(gemm_mmq BM=128 at M=16, 27B shape)**: **Warp Cycles/Inst 7.23 vs SB 28.23** = **big-tile 더블버퍼가 latency 이미 숨김**(4× 효율). gemm_mmq 0.94×(sb보다 느림)·util 22%는 **오직 empty-row 낭비**(BM=128에 M=16=7/8 빈 행). bit-exact gemm_mmq≈sb 2e-5(fp dequant 순서, argmax-safe).
+- **함정 = empty-row뿐(근본 아님)** → **BM=16(=M, MMA m16 1타일, empty 0)** 으로 고침. gemm_mmq의 cp.async 더블버퍼+MMA+scale 재사용, warp 레이아웃만 재배치(8 warp 전부 col 방향, A-tile 16행). few-blocks(BM=16→OUT/BN 블록=40 vs 48 SM)는 더블버퍼가 intra-block 숨겨 minor(BN 튜닝 가능). **stream-K 전면 재구현 불필요.**
+- **판정: GO — 지을 만함(bounded 빌드).** BM=16 배치 GEMM = gemm_mmq 리타일. 더블버퍼 latency-hiding은 measured(7.23), 함정(empty-row)은 BM=16이 제거. 기대: 배치 raw wall(SB 72.8% long_scoreboard) 제거, throughput↑(정확 이득은 빌드서 측정). bit-exact 게이트(정수 dot + 동일 dequant).
+
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
 - **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.
