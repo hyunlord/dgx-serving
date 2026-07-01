@@ -16,6 +16,11 @@ void free_batch_decode_state(BatchDecodeState &s);
 void reset_batch_decode_state(const ModelConfig &c, BatchDecodeState &s);
 // 챕터9 연속배칭 slot 재사용: 물리 slot b의 GDN state(S/convctx) clear(잔재 제거). KV는 새 요청이 덮음.
 void reset_batch_slot(const ModelConfig &c, BatchDecodeState &s, int b);
+// 챕터9 chunked prefill: slot b에 프롬프트 P토큰을 청크(≤chunk_max, 기본512)로 병렬 prefill(1토큰/step 대신, ~62×).
+//   qwen35_decode(Sq>1 full-MMQ)를 slot b KV/GDN view로 재사용. 후 slot은 pos=P부터 batch decode 합류.
+void prefill_batch_slot(const ModelConfig &c, const QwenWeights &w, BatchDecodeState &st, int b,
+                        const int *d_tokens, int P, const float *d_cos, const float *d_sin,
+                        float *d_logit_out, int use_q4, int chunk_max = 512);
 
 // d_tokens: [B] (각 시퀀스의 현재 토큰). d_logits: [B, V]. commit(KV append + state).
 //   use_q4: 0=fp32, 1=q4, 2=W4A8.

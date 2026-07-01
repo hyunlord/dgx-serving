@@ -35,6 +35,7 @@ struct Stats{ double thru_req=0,thru_tok=0; double ttft50=0,ttft95=0,ttft99=0,e2
 static ModelConfig c; static QwenWeights w; static float *d_cos,*d_sin; static int V,NKV,HD;
 static int *d_tok; static float *d_logit; static int uq, maxlen;
 static const std::vector<int> *IDS;
+static int *g_dtiled=nullptr;   // maxlen 타일링 프롬프트(chunked prefill용 device 버퍼)
 
 // 한 스텝 forward(가변 active B, ragged 위치). 반환: 스텝 wall(초). token 선택/readout 제외.
 static double step_forward(BatchDecodeState&st, std::vector<int>&toks, std::vector<int>&pos){
@@ -48,7 +49,8 @@ static double step_forward(BatchDecodeState&st, std::vector<int>&toks, std::vect
 }
 
 // ── continuous scheduler: 요청 도착 시점에 slot 나면 즉시 admit(재사용), 매 스텝 active만 forward ──
-static Stats run_continuous(std::vector<Req> reqs,int Bmax){
+//   chunked=false: 프롬프트 1토큰/step ingest(현행). chunked=true: admit 시 prefill_batch_slot로 병렬 prefill(1스텝).
+static Stats run_continuous(std::vector<Req> reqs,int Bmax,bool chunked){
     int R=reqs.size();
     BatchDecodeState st=alloc_batch_decode_state(c,Bmax,maxlen); st.B=Bmax;
     reset_batch_decode_state(c,st);
@@ -61,7 +63,12 @@ static Stats run_continuous(std::vector<Req> reqs,int Bmax){
         for(int b=0;b<Bmax;b++) if(slot[b].req<0 && !queue.empty()){
             int r=queue.front(); if(reqs[r].P+reqs[r].gen>maxlen){queue.pop_front();continue;} // 길이 가드
             queue.pop_front(); slot[b]=Slot(); slot[b].req=r; slot[b].P=reqs[r].P; slot[b].gen=reqs[r].gen;
-            reset_batch_slot(c,st,b); reqs[r].admit=simt; }
+            reset_batch_slot(c,st,b); reqs[r].admit=simt;
+            if(chunked){  // 병렬 prefill(1스텝, 측정) — 1토큰/step 대신. 후 pos=P부터 decode. 첫 토큰=prefill 로짓(TTFT).
+                auto p0=clk::now(); prefill_batch_slot(c,w,st,b,g_dtiled,reqs[r].P,d_cos,d_sin,d_logit,uq,512);
+                CK(cudaDeviceSynchronize()); auto p1=clk::now(); simt+=std::chrono::duration<double>(p1-p0).count();
+                slot[b].pos=reqs[r].P; slot[b].g=1; reqs[r].first=simt;  // 첫 gen 토큰=prefill 마지막 로짓
+                if(slot[b].g>=slot[b].gen){ reqs[r].done=simt; completed++; slot[b]=Slot(); } } }
         // active 수 세기
         int active=0; for(int b=0;b<Bmax;b++) if(slot[b].req>=0) active++;
         if(active==0){ // GPU idle → 다음 도착까지 fast-forward(스텝 안 돌림)
@@ -143,9 +150,10 @@ static Stats run_static(std::vector<Req> reqs,int Bmax){
 }
 
 // seed 고정 trace 생성(Poisson 도착 λ + 가변 프롬프트 U[8,32] + bimodal gen[short U16-48 70% / long U96-192 30%])
+static int g_pmax=32;   // 프롬프트 최대 길이(PMAX env) — 긴 프롬프트서 chunked prefill aggregate 이득 커짐
 static std::vector<Req> gen_trace(double lambda,int nreq,unsigned seed){
     std::mt19937 rng(seed); std::exponential_distribution<double> ia(lambda);
-    std::uniform_int_distribution<int> pP(8,32), gS(16,48), gL(96,192); std::uniform_real_distribution<double> u(0,1);
+    std::uniform_int_distribution<int> pP(8,g_pmax), gS(16,48), gL(96,192); std::uniform_real_distribution<double> u(0,1);
     std::vector<Req> v(nreq); double t=0;
     for(int i=0;i<nreq;i++){ t+=ia(rng); v[i].arrival=t; v[i].P=pP(rng); v[i].gen=(u(rng)<0.7)?gS(rng):gL(rng); }
     return v;
@@ -158,14 +166,18 @@ int main(int argc,char**argv){
     // λ 리스트: argv[7..] 또는 기본
     std::vector<double> lambdas; for(int i=7;i<argc;i++) lambdas.push_back(atof(argv[i]));
     if(lambdas.empty()) lambdas={0.5,1,2,4,8,16,32};
+    if(getenv("PMAX")) g_pmax=atoi(getenv("PMAX"));   // 긴 프롬프트 테스트(chunked prefill aggregate 이득 스케일)
     c=load_config_qwen((WD+"/manifest.json").c_str());
-    V=c.vocab_size; NKV=c.num_kv_heads; HD=c.head_dim; int rot=c.rotary_dim; maxlen=256;
+    V=c.vocab_size; NKV=c.num_kv_heads; HD=c.head_dim; int rot=c.rotary_dim; maxlen=(g_pmax+224>256)?g_pmax+224:256;  // P+gen(≤192) 커버
     int nh=c.gdn_num_v_heads,D=c.gdn_head_v_dim,convd=cfg_gdn_conv_dim(&c),Kk=c.gdn_conv_kernel;
     static std::vector<int> ids=ri("token_ids.bin"); IDS=&ids;
     std::vector<float> cl=rf("rope_cos_long.bin",(size_t)128*rot), sl=rf("rope_sin_long.bin",(size_t)128*rot);
     d_cos=up(cl); d_sin=up(sl);
     w=load_weights_qwen(WD.c_str(),c,1,uq==0?1:0);
-    CK(cudaMalloc(&d_tok,Bmax*4)); CK(cudaMalloc(&d_logit,(size_t)Bmax*V*4));
+    int lgrows = Bmax>512?Bmax:512;  // prefill_batch_slot이 [Sq≤chunk_max,V] 씀 → d_logit 충분히 크게
+    CK(cudaMalloc(&d_tok,Bmax*4)); CK(cudaMalloc(&d_logit,(size_t)lgrows*V*4));
+    { std::vector<int> tiled(maxlen); for(int i=0;i<maxlen;i++) tiled[i]=ids[i%ids.size()];  // chunked prefill 프롬프트
+      CK(cudaMalloc(&g_dtiled,(size_t)maxlen*4)); CK(cudaMemcpy(g_dtiled,tiled.data(),(size_t)maxlen*4,cudaMemcpyHostToDevice)); }
     // admission guard: KV 예산(alloc-time)
     int nfull=0,ngdn=0; for(int l=0;l<c.num_layers;l++) c.layer_is_full[l]?nfull++:ngdn++;
     size_t perseq=(size_t)nfull*maxlen*NKV*HD*2*2 + (size_t)ngdn*((size_t)nh*D*D+(size_t)(Kk-1)*convd)*4;
@@ -176,20 +188,19 @@ int main(int argc,char**argv){
            (double)Bmax*perseq>budget?" (Bmax↓ 필요, 중단)":"");
     if((double)Bmax*perseq>budget){ printf("  admission guard: alloc 예산 초과 → 중단(시스템 다운 방지).\n"); return 1; }
     // warm-up 실행(cold 버림): 작은 trace 한 번 돌려 클럭/캐시 예열
-    { auto tr=gen_trace(8.0,12,seed); run_continuous(tr,Bmax); }
+    { auto tr=gen_trace(8.0,12,seed); run_continuous(tr,Bmax,true); }
 
     printf("\n  === 부하 스윕 (warm-up 완료분 20%% 제외, seed 고정 trace) ===\n");
-    printf("  gen 분포: short U[16,48] 70%% / long U[96,192] 30%% (평균 ~66토큰), 프롬프트 U[8,32] (1토큰/step prefill)\n");
+    printf("  gen: short U[16,48] 70%% / long U[96,192] 30%% (평균 ~66), 프롬프트 U[8,32]. c1tok=1토큰prefill c-ch=chunked prefill\n");
     printf("  %-6s %-4s | %8s %8s | %7s %7s %7s | %7s %7s | %5s %5s\n",
            "mode","λ","req/s","tok/s","e2e50","e2e95","e2e99","ttft95","tpot95","avgB","maxQ");
     printf("  %s\n",std::string(96,'-').c_str());
+    auto row=[&](const char*nm,double lam,Stats&s){ printf("  %-6s %-4g | %8.3f %8.1f | %7.3f %7.3f %7.3f | %7.3f %7.4f | %5.2f %5.0f\n",
+           nm,lam,s.thru_req,s.thru_tok,s.e2e50,s.e2e95,s.e2e99,s.ttft95,s.tpot95,s.avgB,s.maxq); };
     for(double lam:lambdas){
-        auto trc=gen_trace(lam,nreq,seed); auto trs=trc; // 같은 trace 복제
-        Stats C=run_continuous(trc,Bmax); Stats T=run_static(trs,Bmax);
-        printf("  %-6s %-4g | %8.3f %8.1f | %7.3f %7.3f %7.3f | %7.3f %7.4f | %5.2f %5.0f\n",
-               "cont",lam,C.thru_req,C.thru_tok,C.e2e50,C.e2e95,C.e2e99,C.ttft95,C.tpot95,C.avgB,C.maxq);
-        printf("  %-6s %-4g | %8.3f %8.1f | %7.3f %7.3f %7.3f | %7.3f %7.4f | %5.2f %5.0f\n",
-               "stat",lam,T.thru_req,T.thru_tok,T.e2e50,T.e2e95,T.e2e99,T.ttft95,T.tpot95,T.avgB,T.maxq);
+        auto t1=gen_trace(lam,nreq,seed); auto t2=t1; auto t3=t1; // 같은 trace 3부
+        Stats C1=run_continuous(t1,Bmax,false); Stats Cc=run_continuous(t2,Bmax,true); Stats T=run_static(t3,Bmax);
+        row("c1tok",lam,C1); row("c-ch",lam,Cc); row("stat",lam,T);
     }
     printf("\n  (latency 초 단위. 토큰선택/logit readout 제외=forward 지배. avgB=평균 active 배치=활용 proxy. maxQ=최대 큐깊이=부하.)\n");
     free_weights_qwen(w); free_config_qwen(c); return 0;

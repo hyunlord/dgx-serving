@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <vector>
 #include <cuda_runtime.h>
+#include "../runtime/decode_state.h"   // 챕터9 chunked prefill: qwen35_decode(single Sq>1) + DecodeState view 재사용
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemm_batch.cuh"
@@ -44,6 +45,27 @@ void reset_batch_slot(const ModelConfig &c, BatchDecodeState &s, int b){
     const size_t ssz=(size_t)nh*D*D, csz=(size_t)(K-1)*convd;
     for(int l=0;l<L;l++) if(!c.layer_is_full[l]){
         BK(cudaMemset(s.S[l]+(size_t)b*ssz,0,ssz*4)); BK(cudaMemset(s.convctx[l]+(size_t)b*csz,0,csz*4)); }
+}
+// 챕터9 chunked prefill: slot b에 프롬프트 P토큰을 청크(≤chunk_max)로 병렬 prefill(1토큰/step 대신 — probe_chunked_prefill 62×).
+//   batch slot b의 KV/GDN 서브영역([B,...]의 b번째=single과 동일 연속 레이아웃)에 alias한 DecodeState view로 기존
+//   qwen35_decode(Sq>1=full-MMQ 병렬) 재사용. device 메모리 공유, host 포인터 배열만 임시(free_decode_state 호출 금지).
+//   호출 후 slot b는 KV[0..P-1]+GDN state 채워짐 → pos=P부터 batch decode 합류. d_logit_out=마지막 청크 로짓([lastSq,V],
+//   마지막 행=pos P-1=첫 gen 예측). 커널 재사용(새 커널 아님). mism: chunked==1토큰 prefill(같은 causal, fp32 bit-identical).
+void prefill_batch_slot(const ModelConfig &c, const QwenWeights &w, BatchDecodeState &st, int b,
+                        const int *d_tokens, int P, const float *d_cos, const float *d_sin,
+                        float *d_logit_out, int use_q4, int chunk_max) {
+    int L=c.num_layers; const int HD=c.head_dim, NKV=c.num_kv_heads;
+    const int nh=c.gdn_num_v_heads, D=c.gdn_head_v_dim, convd=cfg_gdn_conv_dim(&c), K=c.gdn_conv_kernel;
+    std::vector<__nv_bfloat16*> Kc(L,nullptr),Vc(L,nullptr); std::vector<float*> S(L,nullptr),Cx(L,nullptr);
+    for(int l=0;l<L;l++){
+        if(c.layer_is_full[l]){ Kc[l]=st.Kc[l]+(size_t)b*st.max_len*NKV*HD; Vc[l]=st.Vc[l]+(size_t)b*st.max_len*NKV*HD; }
+        else { S[l]=st.S[l]+(size_t)b*nh*D*D; Cx[l]=st.convctx[l]+(size_t)b*(K-1)*convd; }
+    }
+    DecodeState v{}; v.n_past=0; v.max_len=st.max_len; v.L=L; v.Kc=Kc.data(); v.Vc=Vc.data(); v.S=S.data(); v.convctx=Cx.data();
+    if(chunk_max<=0) chunk_max=512;
+    for(int off=0; off<P; off+=chunk_max){ int sq = (P-off<chunk_max)?(P-off):chunk_max;
+        qwen35_decode(c,w,v, d_tokens+off, sq, d_cos, d_sin, d_logit_out, nullptr, 1, nullptr, use_q4); }
+    // v(host 벡터)는 스코프 종료 시 해제 — device 메모리(batch slot)는 st 소유라 건드리지 않음.
 }
 void free_batch_decode_state(BatchDecodeState &s){
     auto F=[](void*p){ if(p)cudaFree(p); };
