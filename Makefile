@@ -71,6 +71,10 @@ tests/test_cbatch: tests/test_cbatch.cu models/qwen35.cu models/qwen35_decode.cu
 tests/test_cbatch_prod: tests/test_cbatch_prod.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_cbatch_prod.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
+# 실부하 서빙 벤치(Poisson 스트림+가변길이+warm-up+정적대비+부하스윕). 사용법: ./tools/bench_serve [w] [g] [uq] [Bmax] [nreq] [seed] [λ...]
+tools/bench_serve: tools/bench_serve.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_serve.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
+
 tests/test_engine: tests/test_engine.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_engine.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
