@@ -121,6 +121,13 @@ matmul occupancy NO-GO 후, nsys 시간분해가 가리킨 **미탐색 GDN(gdn_s
 - **정확성**: **mism=0 gate PASS**(test_cbatch_prod got==iso), tree-spec 커널 미변경(정확성 자산 무관). iso-vs-solo 11→13(FMA contraction from unroll — golden tolerance 내, 중간 반올림↓로 오히려 더 정확). **split-K(mism gate FAIL→opt-in)와 달리 gate 통과 → default-on.** escape: `-DGDN_FORCE_RUNTIME`.
 - **의미**: matmul occupancy(measured NO-GO)와 정반대 — **미탐색 GDN(niche)이 진짜 lever였음.** "안 판 영역 파기"가 옳았음. GDN이 우리 차별점(Qwen3.5 하이브리드 네이티브)이라 niche 강화. 갭 좌표: 서빙 aggregate 43→55는 llama 대비 재측정 필요(다음). 남은 GDN 여지: bf16 state(9.7GB→4.8GB I/O 반감, 추가 lever 후보).
 
+## bf16 GDN state de-risk — 두 관문 통과, 통합은 decision (`tools/probe_gdn_bf16*`)
+GDN template 후 남은 GDN lever = state I/O 대역폭. state fp32(layer당 100.6MB R+W) → bf16 반감.
+- **정확성 de-risk(CPU probe, gdn 수식 N=512 재생, fp32 vs bf16 state)**: max state relerr g_t0.95=**0.6%**·0.99=1.2%·0.999(stress)=1.9%, 전부 **plateau(cascade 없음)**. 이유: recurrence가 **contractive**(scol*=g_t, g_t=exp(G)<1이 오래된 오차 감쇠) — 2bit(decay 없음, 발산)와 근본 다름. **정확성 안전. PASS.**
+- **속도 de-risk(isolated kernel, state 50MB≫캐시=격리≈in-engine, DRAM-bound)**: gdn_step_batch_kernel_t<128,ST> fp32 487us/207GB/s vs bf16 251us/201GB/s = **1.94×**. 둘 다 ~200GB/s(76% peak)=**bandwidth-bound 확증**(ncu L2 13.7%는 오도, GB10 DRAM% n/a). 
+- **step-level 예상**: post-template GDN은 step의 ~13% → bf16이 GDN 반감 → **batch ~+7%(92→~98, llama 95.30 parity/반전 근접)**. 서빙 더 클 수.
+- **STOP-and-report(통합 전)**: 커널은 ST(state type) template화 완료(하위호환, ST=float 기본). full 통합 = 큰 blast radius(bf16 state: single/tree/batch/spec-promote 커널 전부 + fp32-snapshot→bf16 변환[memcpy 아닌 변환 커널 필요] + tree-spec 정확성 자산). de-risk는 GO나 통합은 major → 방향 확인. gdn_step_batch_kernel_t<D,ST>, probe_gdn_bf16.cpp(정확성)·probe_gdn_bf16_speed.cu(속도).
+
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
 - **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.

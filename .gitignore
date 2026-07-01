@@ -18,6 +18,7 @@ build/
 /tools/prefill_prof
 !/tools/*.cu
 !/tools/*.cuh
+!/tools/*.cpp
 
 # Weight dumps / quantized blobs / goldens — never commit big binaries
 *.bin

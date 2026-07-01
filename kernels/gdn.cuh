@@ -407,10 +407,10 @@ static __global__ void gdn_step_batch_kernel(const float *Q, const float *K, con
 // 챕터9 GDN de-risk: D를 template(compile-time)화 → k-루프 unroll → scol[D]가 local mem(stack) 대신 레지스터.
 //   런타임 D 버전은 for(k<D) unroll 불가 → scol[128] local mem → scol[k] 512회/thread = long_scoreboard 601(ncu).
 //   연산 동일(bit-exact), D만 compile-time. gdn_step_ksplit_tree_kernel<D>와 동일 기법.
-template<int D>
+template<int D, typename ST=float>
 static __global__ void gdn_step_batch_kernel_t(const float *Q, const float *K, const float *V,
                                 const float *G, const float *Bt,
-                                const float *Sin, float *Sout, float *O, int NH, int NHk) {
+                                const ST *Sin, ST *Sout, float *O, int NH, int NHk) {
     int h = blockIdx.x, b = blockIdx.y, v = threadIdx.x;
     int g = h * NHk / NH;
     extern __shared__ float sh[];
@@ -418,7 +418,7 @@ static __global__ void gdn_step_batch_kernel_t(const float *Q, const float *K, c
     float scol[D];
     size_t stb = ((size_t)b * NH + h) * D * D;
     #pragma unroll
-    for (int k = 0; k < D; k++) scol[k] = Sin ? Sin[stb + (size_t)k * D + v] : 0.f;
+    for (int k = 0; k < D; k++) scol[k] = Sin ? (float)Sin[stb + (size_t)k * D + v] : 0.f;  // ST=bf16면 mixed(계산 fp32)
     const float invsD = rsqrtf((float)D);
     size_t base = ((size_t)b * NH + h) * D;
     size_t base_qk = ((size_t)b * NHk + g) * D;
@@ -437,7 +437,7 @@ static __global__ void gdn_step_batch_kernel_t(const float *Q, const float *K, c
     for (int k = 0; k < D; k++) { scol[k] += ks[k] * delta; out += scol[k] * qs[k]; }
     O[base + v] = out;
     #pragma unroll
-    for (int k = 0; k < D; k++) Sout[stb + (size_t)k * D + v] = scol[k];
+    for (int k = 0; k < D; k++) Sout[stb + (size_t)k * D + v] = (ST)scol[k];
 }
 static inline void launch_gdn_step_batch(const float *Q, const float *K, const float *V,
                                          const float *G, const float *Bt, const float *Sin,
