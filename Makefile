@@ -67,6 +67,10 @@ tests/test_batch_decode: tests/test_batch_decode.cu models/qwen35.cu models/qwen
 tests/test_cbatch: tests/test_cbatch.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_cbatch.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
+# 챕터10 Phase1: 2-요청 batch+spec 결합 mism=0. batch verify(qwen35_verify_batch)==단독 spec. 사용법: ./tests/test_batchspec2 [w] [g] [N] [K] [W] [uq]
+tests/test_batchspec2: tests/test_batchspec2.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_batchspec2.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
+
 # production scheduler: admission guard(KV예산)+slot 재사용+요청 큐. 사용법: ./tests/test_cbatch_prod [w] [g] [uq] [Bmax] [maxlen]
 tests/test_cbatch_prod: tests/test_cbatch_prod.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_cbatch_prod.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@

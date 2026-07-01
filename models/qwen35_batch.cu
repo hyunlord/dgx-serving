@@ -9,6 +9,7 @@
 #include "../kernels/gemm_batch.cuh"
 #include "../kernels/gemv_w4a8.cuh"   // 챕터9: B≤8 batch decode에 SB 커널(odd-B 1적재)
 #include "../kernels/gemm_mmq.cuh"    // 챕터9: BM=16 split-K 배치 GEMM(B=9~16 load-latency wall, stream-K few-blocks 해결)
+#include "../kernels/gemm_tiled.cuh"  // 챕터10 verify_batch: use_q4==1(plain q4) row-독립 GEMM 경로
 #include "../kernels/gemv_f32.cuh"
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/rope.cuh"
@@ -190,4 +191,168 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
     mmb(w.lm_head,fn,d_logits,H,V);
     if(!h_pos_b) st.n_past += 1;   // ragged면 per-seq 위치는 호출자(scheduler)가 관리
     BK(cudaDeviceSynchronize());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 챕터10 Phase 1: batched tree verify (qwen35_verify_batch)
+//   qwen35_decode(single tree verify, models/qwen35_decode.cu:103) 본체를 슬롯 차원으로 확장.
+//   행 레이아웃 concat: 행 r = b*Nnodes + i (슬롯 b 노드 i). 총 M = B*Nnodes.
+//   row-독립(norm/rope/act/matmul)은 concat 행 그대로; attention/GDN은 슬롯별 루프(+tree mask/fork).
+//   ★W4A8 bit-identical: row-독립 matmul을 슬롯별(M=Nnodes) 호출 — 단독 spec(Nnodes)과 동일 커널 선택
+//     (sb S≤8). concat M=B*Nnodes 한 호출은 sb→mmq 커널을 바꿔 borderline flip → mism≠0(honest-perf 트랩).
+//     fp32(launch_gemv_f32)는 M-무관 행-독립이라 concat 한 호출로 처리(타일 story). quantize_x_q8는 per-row라
+//     concat/슬롯별 bit-identical.
+static std::vector<float*> g_vbws; static std::vector<size_t> g_vbwscap;
+static float *vbws(int &idx, size_t n){
+    if((int)g_vbws.size()<=idx){ g_vbws.push_back(nullptr); g_vbwscap.push_back(0); }
+    if(g_vbwscap[idx]<n){ if(g_vbws[idx])cudaFree(g_vbws[idx]); BK(cudaMalloc(&g_vbws[idx],n*4)); g_vbwscap[idx]=n; }
+    return g_vbws[idx++];
+}
+static std::vector<int8_t*> g_vbwsb; static std::vector<size_t> g_vbwsbcap;
+static int8_t *vbwsi8(int &idx, size_t n){
+    if((int)g_vbwsb.size()<=idx){ g_vbwsb.push_back(nullptr); g_vbwsbcap.push_back(0); }
+    if(g_vbwsbcap[idx]<n){ if(g_vbwsb[idx])cudaFree(g_vbwsb[idx]); BK(cudaMalloc(&g_vbwsb[idx],n)); g_vbwsbcap[idx]=n; }
+    return g_vbwsb[idx++];
+}
+
+void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState **sts,
+                         const int *d_tokens_b, int B, int Nnodes, const int *base_b,
+                         const float *d_cos, const float *d_sin,
+                         float *d_logits, float *d_hnextn, VerifyArtifacts *va, int use_q4,
+                         const int *d_parent_b, const unsigned *d_anc_b, const int *d_pos_b) {
+    const int H=c.hidden_size, FFN=c.intermediate_size, HD=c.head_dim, V=c.vocab_size;
+    const int NQ=c.num_q_heads, NKV=c.num_kv_heads, rot=c.rotary_dim; const float eps=c.rms_norm_eps;
+    const int qdim2=NQ*HD*(c.attn_output_gate?2:1), qdim=NQ*HD, kvdim=NKV*HD;
+    const int convd=cfg_gdn_conv_dim(&c), vdim=cfg_gdn_value_dim(&c), kdim=cfg_gdn_key_dim(&c);
+    const int nvh=c.gdn_num_v_heads, hv=c.gdn_head_v_dim, Kk=c.gdn_conv_kernel;
+    const int M=B*Nnodes;                 // concat 행수
+    const size_t MH=(size_t)M*H;
+    const int sdtype=c.scale_dtype;
+
+    int wi=0;
+    float *x=vbws(wi,MH),*norm=vbws(wi,MH),*after=vbws(wi,MH),*n2=vbws(wi,MH);
+    float *qg=vbws(wi,(size_t)M*qdim2),*qb=vbws(wi,(size_t)M*qdim),*gate=vbws(wi,(size_t)M*qdim),*qn=vbws(wi,(size_t)M*qdim);
+    float *kb=vbws(wi,(size_t)M*kvdim),*kn=vbws(wi,(size_t)M*kvdim),*vb=vbws(wi,(size_t)M*kvdim),*attn=vbws(wi,(size_t)M*qdim),*ob=vbws(wi,MH);
+    float *mixed=vbws(wi,(size_t)M*convd),*mconv=vbws(wi,(size_t)M*convd);
+    float *qg2=vbws(wi,(size_t)M*kdim),*kg2=vbws(wi,(size_t)M*kdim),*vg2=vbws(wi,(size_t)M*vdim);
+    float *zb=vbws(wi,(size_t)M*vdim),*ab=vbws(wi,(size_t)M*nvh),*bb=vbws(wi,(size_t)M*nvh),*gg=vbws(wi,(size_t)M*nvh),*beta=vbws(wi,(size_t)M*nvh);
+    float *core=vbws(wi,(size_t)M*vdim),*normed=vbws(wi,(size_t)M*vdim),*gout=vbws(wi,MH);
+    float *gm=vbws(wi,(size_t)M*FFN),*um=vbws(wi,(size_t)M*FFN),*act=vbws(wi,(size_t)M*FFN),*dbuf=vbws(wi,MH),*fn=vbws(wi,MH);
+    float *snap=vbws(wi,(size_t)M*nvh*hv*hv);          // per-node GDN snapshot (슬롯 b 노드 t → 행 b*Nnodes+t; 슬롯별 sub-buffer)
+
+    // W4A8 shared-X quantize 버퍼: norm/n2([M,H])를 1회 양자화(per-row) → 슬롯별 gemv서 offset 재사용.
+    int bi=0; int8_t *xqn=nullptr,*xq2=nullptr; float *xsn=nullptr,*xs2=nullptr; int32_t *xsmN=nullptr;
+    if(use_q4==2){ xqn=vbwsi8(bi,MH); xq2=vbwsi8(bi,MH); xsn=vbws(wi,MH/QBLK); xs2=vbws(wi,MH/QBLK); xsmN=(int32_t*)vbws(wi,MH/QBLK); }
+
+    // 행-독립 matmul. fp32=concat 한 호출(M). W4A8=슬롯별(M=Nnodes) 호출로 단독 spec 커널 선택 일치(bit-identical).
+    //   xqs/xss: 미리 양자화한 [M,H] 버퍼(use_q4==2). X: fp32 소스.
+    auto MMrow=[&](const QMat&m,const float*X,const int8_t*xqs,const float*xss,float*Y,int IN,int OUT){
+        if(use_q4==2){
+            for(int b=0;b<B;b++){
+                const int8_t *xb=xqs+(size_t)b*Nnodes*IN; const float *sb=xss+(size_t)b*Nnodes*IN/QBLK;
+                float *Yb=Y+(size_t)b*Nnodes*OUT;
+                if      (Nnodes==1) launch_gemv_w4a8_mlp<2>(xb,sb,nullptr,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                else if (Nnodes<=8) launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                else                launch_gemm_mmq_w4a8(xb,sb,m.wq,m.sc,Yb,Nnodes,OUT,IN,sdtype);
+            }
+        } else if(use_q4){ launch_gemm_tiled_q4(X,m.wq,m.sc,Y,M,OUT,IN,sdtype); }
+        else             { launch_gemv_f32(X,m.wf,Y,IN,OUT,M); }
+    };
+    // o_proj/out_p/lm_head도 행-독립. 단독 spec은 mm()(quantize+dispatch) — 여기선 슬롯별 quantize+dispatch로 동일.
+    auto MMrow_q=[&](const QMat&m,const float*X,float*Y,int IN,int OUT){
+        if(use_q4==2){
+            int8_t *xq=vbwsi8(bi,(size_t)M*IN); float *xs=vbws(wi,(size_t)M*IN/QBLK); int32_t*xsm=(int32_t*)vbws(wi,(size_t)M*IN/QBLK);
+            launch_quantize_x_q8(X,xq,xs,xsm,IN,M);            // per-row 양자화(M행) — 슬롯별 offset과 bit-identical
+            for(int b=0;b<B;b++){
+                const int8_t *xb=xq+(size_t)b*Nnodes*IN; const float *sb=xs+(size_t)b*Nnodes*IN/QBLK;
+                float *Yb=Y+(size_t)b*Nnodes*OUT;
+                if      (Nnodes==1) launch_gemv_w4a8_mlp<2>(xb,sb,xsm+(size_t)b*Nnodes*IN/QBLK,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                else if (Nnodes<=8) launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                else                launch_gemm_mmq_w4a8(xb,sb,m.wq,m.sc,Yb,Nnodes,OUT,IN,sdtype);
+            }
+        } else if(use_q4){ launch_gemm_tiled_q4(X,m.wq,m.sc,Y,M,OUT,IN,sdtype); }
+        else             { launch_gemv_f32(X,m.wf,Y,IN,OUT,M); }
+    };
+
+    launch_embedding(d_tokens_b, w.embed, x, M, H);
+    int lin=0;
+    for(int l=0;l<c.num_layers;l++){
+        const QLayer &L=w.layers[l];
+        launch_rmsnorm_zc(x,L.input_ln,norm,M,H,eps);
+        if(use_q4==2) launch_quantize_x_q8(norm,xqn,xsn,xsmN,H,M);   // norm 1회 per-row 양자화 → q/k/v(또는 in_qkv/in_z) 공유
+        if(L.is_full){
+            MMrow(L.q,norm,xqn,xsn,qg,H,qdim2);
+            BK(cudaMemcpy2D(qb,HD*4,qg,2*HD*4,HD*4,(size_t)M*NQ,cudaMemcpyDeviceToDevice));
+            BK(cudaMemcpy2D(gate,HD*4,qg+HD,2*HD*4,HD*4,(size_t)M*NQ,cudaMemcpyDeviceToDevice));
+            launch_rmsnorm_zc(qb,L.q_norm,qn,M*NQ,HD,eps);
+            MMrow(L.k,norm,xqn,xsn,kb,H,kvdim); launch_rmsnorm_zc(kb,L.k_norm,kn,M*NKV,HD,eps);
+            MMrow(L.v,norm,xqn,xsn,vb,H,kvdim);
+            // rope: 노드별 위치 d_pos_b(base+depth) — 행-독립, concat 그대로.
+            launch_rope_partial_pos(qn,d_cos,d_sin,d_pos_b,M,NQ,HD,rot);
+            launch_rope_partial_pos(kn,d_cos,d_sin,d_pos_b,M,NKV,HD,rot);
+            // 슬롯별: K/V[슬롯 b 노드 i] → sts[b]->Kc/Vc slot (base_b[b]+i). 단독 spec과 동일(node index, position 아님).
+            for(int b=0;b<B;b++){
+                launch_f32_to_bf16(kn+(size_t)b*Nnodes*kvdim, sts[b]->Kc[l]+(size_t)base_b[b]*kvdim, (size_t)Nnodes*kvdim);
+                launch_f32_to_bf16(vb+(size_t)b*Nnodes*kvdim, sts[b]->Vc[l]+(size_t)base_b[b]*kvdim, (size_t)Nnodes*kvdim);
+            }
+            // 슬롯별 flash_attn: 슬롯 b 노드(Sq=Nnodes)는 sts[b]->Kc/Vc의 [0..base_b[b]+Nnodes) + tree mask(d_anc_b[b*Nnodes..]).
+            for(int b=0;b<B;b++)
+                launch_flash_attn(qn+(size_t)b*Nnodes*qdim, sts[b]->Kc[l], sts[b]->Vc[l],
+                                  attn+(size_t)b*Nnodes*qdim, Nnodes, NQ, NKV, HD, base_b[b], 0, d_anc_b+(size_t)b*Nnodes);
+            launch_gate_sigmoid(attn, gate, (int)((size_t)M*qdim));
+            MMrow_q(L.o,attn,ob,qdim,H);
+            launch_add(after,x,ob,(int)MH);
+        } else {
+            MMrow(L.in_qkv,norm,xqn,xsn,mixed,H,convd);
+            // conv tree-fork: 슬롯 b 노드는 슬롯-로컬 parent(d_parent_b[b*Nnodes..]) + 슬롯 b convctx(sts[b]).
+            for(int b=0;b<B;b++)
+                launch_gdn_conv1d_silu_decode_tree(mixed+(size_t)b*Nnodes*convd, sts[b]->convctx[l],
+                                                   d_parent_b+(size_t)b*Nnodes, L.conv1d, mconv+(size_t)b*Nnodes*convd, Nnodes, convd, Kk);
+            BK(cudaMemcpy2D(qg2,kdim*4,mconv,convd*4,kdim*4,M,cudaMemcpyDeviceToDevice));
+            BK(cudaMemcpy2D(kg2,kdim*4,mconv+kdim,convd*4,kdim*4,M,cudaMemcpyDeviceToDevice));
+            BK(cudaMemcpy2D(vg2,vdim*4,mconv+2*kdim,convd*4,vdim*4,M,cudaMemcpyDeviceToDevice));
+            MMrow(L.in_z,norm,xqn,xsn,zb,H,vdim);
+            launch_gemv_f32(norm,L.in_a,ab,H,nvh,M); launch_gemv_f32(norm,L.in_b,bb,H,nvh,M);
+            launch_gdn_decay_beta(ab,bb,L.A_log,L.dt_bias,gg,beta,M,nvh);
+            if(hv==128){
+                launch_gdn_qk_norm(qg2,kg2,qg2,kg2, M*c.gdn_num_k_heads, hv);   // 행-독립(row=노드×k-head), concat 그대로
+                // 슬롯별 tree-fork: 슬롯 b 노드는 sts[b]->S서 fork(parent 슬롯-로컬), snap도 슬롯별 sub-buffer(자식이 부모 read).
+                for(int b=0;b<B;b++)
+                    launch_gdn_step_ksplit_tree<128,2>(qg2+(size_t)b*Nnodes*kdim, kg2+(size_t)b*Nnodes*kdim, vg2+(size_t)b*Nnodes*vdim,
+                                                       gg+(size_t)b*Nnodes*nvh, beta+(size_t)b*Nnodes*nvh, sts[b]->S[l],
+                                                       d_parent_b+(size_t)b*Nnodes, snap+(size_t)b*Nnodes*nvh*hv*hv, core+(size_t)b*Nnodes*vdim,
+                                                       Nnodes, nvh, c.gdn_num_k_heads);
+            } else {
+                fprintf(stderr,"[qwen35_verify_batch] tree-verify는 GDN head_v_dim=128만(현재 %d). 조용한 오답 대신 중단.\n",hv); abort();
+            }
+            // verify snapshot → va[b] (슬롯별). 슬롯 b 노드 t = snap 행 b*Nnodes+t → va[b].gdn_snap[(t*n_linear+lin)].
+            if(va){
+                size_t ssz=(size_t)nvh*hv*hv;
+                for(int b=0;b<B;b++) for(int t=0;t<Nnodes;t++)
+                    BK(cudaMemcpy(va[b].gdn_snap + ((size_t)t*va[b].n_linear + lin)*ssz,
+                                  snap + (size_t)(b*Nnodes+t)*ssz, ssz*4, cudaMemcpyDeviceToDevice));
+                for(int b=0;b<B;b++) for(int t=0;t<Nnodes;t++)
+                    BK(cudaMemcpy(va[b].conv_mixed + ((size_t)t*va[b].n_linear + lin)*convd,
+                                  mixed + (size_t)(b*Nnodes+t)*convd, (size_t)convd*4, cudaMemcpyDeviceToDevice));
+            }
+            launch_rms_norm_gated(core,zb,L.gdn_norm,normed,M*nvh,hv,eps);
+            MMrow_q(L.out_p,normed,gout,vdim,H);
+            launch_add(after,x,gout,(int)MH);
+            lin++;
+        }
+        launch_rmsnorm_zc(after,L.post_ln,n2,M,H,eps);
+        if(use_q4==2) launch_quantize_x_q8(n2,xq2,xs2,xsmN,H,M);   // n2 1회 per-row 양자화 → gate/up 공유
+        MMrow(L.gate,n2,xq2,xs2,gm,H,FFN); MMrow(L.up,n2,xq2,xs2,um,H,FFN);
+        launch_swiglu(gm,um,act,(size_t)M*FFN);
+        MMrow_q(L.down,act,dbuf,FFN,H);
+        launch_add(x,after,dbuf,(int)MH);
+    }
+    launch_rmsnorm_zc(x,w.final_norm,fn,M,H,eps);
+    // d_hnextn = postnorm(final-norm 적용 후) = MTP draft 입력 h_nextn. single spec qwen35_decode의 d_postnorm과 동일 역할
+    //   (test_treespec_e2e/mtp_step이 h_post로 쓰는 값). ★prenorm(x) 아님 — 초기 오작(prenorm 출력)이 draft 오염 → mism 원인.
+    if(d_hnextn) BK(cudaMemcpy(d_hnextn,fn,MH*4,cudaMemcpyDeviceToDevice));
+    MMrow_q(w.lm_head,fn,d_logits,H,V);
+    // commit 안 함(verify) — n_past 불변. promote는 호스트가 슬롯별 promote_tree_path.
+    BK(cudaDeviceSynchronize());
+    (void)lin;
 }
