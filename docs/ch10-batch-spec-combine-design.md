@@ -85,3 +85,28 @@ SpecSlot { int req;                     // 요청 id (-1=빈 슬롯)
 - **payoff 불확실성**: 곱의 상한은 크나(B×accept), verify의 attention/GDN이 ragged라 matmul만큼 안 배칭될 수(attention/GDN 슬롯별 = 배칭 이득 부분적). Phase 1서 batched-verify가 실제 얼마 빠른지 measured(격리 오도 주의).
 - **mism=0 불변**: 전 Phase 핵심 게이트. 깨지면 그 Phase서 정지·보고.
 - **단계적**: 세션급 아님. Phase마다 de-risk+mism=0, overclaim 금지(honest-perf ⑧⑨⑩).
+
+## Phase 2 결과 (완결 61e1e62 — W4A8 concat 곱 실현+측정)
+> Phase 1은 mism=0 토대만(W4A8은 per-slot, 곱 미실현). Phase 2 = W4A8 concat 곱 실현.
+
+### golden-debug 여정 (추측 금지, 헌법)
+- Phase 2 첫 시도(SPEC_MMQ concat)서 **slot-B 발산(A=0/24, B=14~16/24)** — reasoning 4회 막힘.
+- **격리 probe(tools/probe_mmq_rowdep)**: mmq(M=14)[slot-B rows] == mmq(M=7) solo = max|Δ|=0.0 → **mmq row-독립 증명**(곱 achievable, 벽=verify_batch 배선?).
+- **in-context golden dump(실제 verify_batch xqn 버퍼, MMrow 첫 호출)**: concat-mmq[slot-B] == solo-mmq[slot-B] **max|d|=0.0**(입력 sum|xqs[A]-xqs[B]|≠0로 실제 다른 입력 확인). → **배선 3후보(quantize 커버리지/Y offset/solo-ref 전파) 전부 제거.**
+- **진짜 원인**: matmul은 in-context서도 row-독립(정확). Phase2 발산은 **Nnodes≤8서 단독 spec=sb인데 concat=mmq를 강제한 커널 불일치(W4A8 borderline flip)** — 배선 버그가 아니었음. (초기 "fixable plumbing" 진단은 부정확.)
+
+### fix (재설계 아님, 올바른 게이팅)
+- `MMrow`/`MMrow_q`(models/qwen35_batch.cu): **Nnodes>8이면 concat mmq(M=B*Nnodes) 1콜.** Nnodes>8이면 단독 spec(S=Nnodes)도 자동 mmq → mmq-vs-mmq row-독립 bit-identical. Nnodes≤8은 per-slot sb 유지(Phase1 불변).
+
+### 측정 (in-engine controlled A/B, 2×single vs batched 1콜, warmup 스킵)
+| 모델 | N=K+W | single(M=N) | batched(M=2N) | **2×single/batched** |
+|---|---|---|---|---|
+| 0.8b W4A8 | 10 | 13.46 ms | 17.96 ms | **1.498×** |
+| **27b W4A8** | 10 | 195.29 ms | 224.27 ms | **1.742×**(서빙 타깃, DRAM-bound라 큼) |
+- **mism=0**: 0.8b·27b, W4A8+fp32, A·B 0/24 전 시나리오. **곱 mechanism 증명+측정 성공**(weight 1운반이 2슬롯 서빙).
+
+### 정직 스코프
+- **Nnodes>8서만 곱**(둘 다 mmq). 1.74×는 **verify-forward matmul 배칭(B=2)**, full e2e serving throughput 아님.
+- **실용 서빙(작은 트리 ≤8 + 큰 B로 M=B*Nnodes>8)**은 단독 spec을 **canonical mmq로 정렬**해야 mism=0 — **Phase 3 핵심 결정**(sb vs mmq 중 spec의 정본 W4A8; 둘 다 fp32 golden 아닌 유효 argmax).
+- probe/GDUMP 계측 제거, fix만 커밋(미커밋 원칙).
+- **다음 = Phase 3**: 연속 배칭 통합(admission/slot+spec, B 가변) + canonical-kernel 결정으로 ≤8 트리 곱 확장.
