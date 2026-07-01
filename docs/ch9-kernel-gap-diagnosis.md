@@ -126,7 +126,17 @@ GDN template 후 남은 GDN lever = state I/O 대역폭. state fp32(layer당 100
 - **정확성 de-risk(CPU probe, gdn 수식 N=512 재생, fp32 vs bf16 state)**: max state relerr g_t0.95=**0.6%**·0.99=1.2%·0.999(stress)=1.9%, 전부 **plateau(cascade 없음)**. 이유: recurrence가 **contractive**(scol*=g_t, g_t=exp(G)<1이 오래된 오차 감쇠) — 2bit(decay 없음, 발산)와 근본 다름. **정확성 안전. PASS.**
 - **속도 de-risk(isolated kernel, state 50MB≫캐시=격리≈in-engine, DRAM-bound)**: gdn_step_batch_kernel_t<128,ST> fp32 487us/207GB/s vs bf16 251us/201GB/s = **1.94×**. 둘 다 ~200GB/s(76% peak)=**bandwidth-bound 확증**(ncu L2 13.7%는 오도, GB10 DRAM% n/a). 
 - **step-level 예상**: post-template GDN은 step의 ~13% → bf16이 GDN 반감 → **batch ~+7%(92→~98, llama 95.30 parity/반전 근접)**. 서빙 더 클 수.
-- **STOP-and-report(통합 전)**: 커널은 ST(state type) template화 완료(하위호환, ST=float 기본). full 통합 = 큰 blast radius(bf16 state: single/tree/batch/spec-promote 커널 전부 + fp32-snapshot→bf16 변환[memcpy 아닌 변환 커널 필요] + tree-spec 정확성 자산). de-risk는 GO나 통합은 major → 방향 확인. gdn_step_batch_kernel_t<D,ST>, probe_gdn_bf16.cpp(정확성)·probe_gdn_bf16_speed.cu(속도).
+- **STOP-and-report(통합 전)**: 커널 ST-template 완료. full 통합 major → 방향 확인. probe_gdn_bf16.cpp·probe_gdn_bf16_speed.cu.
+
+### bf16 state 단계적 full 통합 — 완료·전 경로 검증(7b7c39c, opt-in)
+GdnStateT typedef(기본 float, -DGDN_BF16_STATE=bf16), DecodeState.S·BatchDecodeState.S=GdnStateT, GDN 커널 Sin=GdnStateT(읽기 (float) mixed), snapshot(fp32)→state 변환 헬퍼 `state_from_f32` 3곳(commit·promote_prefix·promote_tree_path).
+- **회귀 0(default fp32)**: bench_batch 88.2·test_cbatch_prod mism=0·test_treespec_e2e accept3.67/mism0 전부 불변.
+- **batch(bf16)**: fp32 88.2→**bf16 93.3 t/s(+5.8%)**, B=16 controlled. **93.3 vs llama 95.30 = 1.021×(near-parity!).**
+- **single(bf16)**: test_cbatch_prod mism=0 PASS(batch/single bit-identical 보존).
+- **tree-spec(bf16, 정확성 자산)**: test_treespec_e2e accept **3.67(fp32와 동일)**·mism **0/40** PASS — bit-identical + accept 완전 보존.
+- **근거**: recurrence contractive(g_t<1) → bf16 오차 감쇠(de-risk <2% plateau); 커널 bandwidth-bound(1.94×). memory: state 절반(GB10 unified 여유).
+- **서빙(bf16, controlled A/B 27B λ8)**: fp32 55.2→**bf16 58.3 tok/s(+5.6%)**·tpot95 0.2489→0.2367. 전체 GDN arc 서빙 **43.3(pre-GDN)→55.2(template)→58.3(bf16) = +34.6%.**
+- **opt-in(default fp32)**: -DGDN_BF16_STATE로 활성(회귀 0 = fp32-exactness 테스트 보존). 배포 빌드=플래그. arc batch 갭 1.42→1.1(GDN template)→**1.02×(bf16 state)**.
 
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
