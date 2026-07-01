@@ -37,6 +37,14 @@ void reset_batch_decode_state(const ModelConfig &c, BatchDecodeState &s){
     s.n_past=0; int L=c.num_layers; const int nh=c.gdn_num_v_heads,D=c.gdn_head_v_dim,convd=cfg_gdn_conv_dim(&c),K=c.gdn_conv_kernel;
     for(int l=0;l<L;l++) if(!c.layer_is_full[l]){ BK(cudaMemset(s.S[l],0,(size_t)s.B*nh*D*D*4)); BK(cudaMemset(s.convctx[l],0,(size_t)s.B*(K-1)*convd*4)); }
 }
+// 챕터9 연속배칭: slot 재사용 시 그 물리 slot의 GDN 잔재만 clear(새 요청이 이전 요청 state 안 읽음 — compaction 버그 교훈).
+//   KV는 clear 불요(새 요청이 pos0부터 덮고 attention은 [0..pos]만 읽음). GDN S/convctx는 recurrence라 반드시 zero.
+void reset_batch_slot(const ModelConfig &c, BatchDecodeState &s, int b){
+    int L=c.num_layers; const int nh=c.gdn_num_v_heads,D=c.gdn_head_v_dim,convd=cfg_gdn_conv_dim(&c),K=c.gdn_conv_kernel;
+    const size_t ssz=(size_t)nh*D*D, csz=(size_t)(K-1)*convd;
+    for(int l=0;l<L;l++) if(!c.layer_is_full[l]){
+        BK(cudaMemset(s.S[l]+(size_t)b*ssz,0,ssz*4)); BK(cudaMemset(s.convctx[l]+(size_t)b*csz,0,csz*4)); }
+}
 void free_batch_decode_state(BatchDecodeState &s){
     auto F=[](void*p){ if(p)cudaFree(p); };
     for(int l=0;l<s.L;l++){ F(s.Kc[l]);F(s.Vc[l]);F(s.S[l]);F(s.convctx[l]); }

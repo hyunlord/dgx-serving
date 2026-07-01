@@ -67,6 +67,10 @@ tests/test_batch_decode: tests/test_batch_decode.cu models/qwen35.cu models/qwen
 tests/test_cbatch: tests/test_cbatch.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_cbatch.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
+# production scheduler: admission guard(KV예산)+slot 재사용+요청 큐. 사용법: ./tests/test_cbatch_prod [w] [g] [uq] [Bmax] [maxlen]
+tests/test_cbatch_prod: tests/test_cbatch_prod.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_cbatch_prod.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
+
 tests/test_engine: tests/test_engine.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_engine.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 

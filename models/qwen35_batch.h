@@ -14,6 +14,8 @@ struct BatchDecodeState {
 BatchDecodeState alloc_batch_decode_state(const ModelConfig &c, int B, int max_len);
 void free_batch_decode_state(BatchDecodeState &s);
 void reset_batch_decode_state(const ModelConfig &c, BatchDecodeState &s);
+// 챕터9 연속배칭 slot 재사용: 물리 slot b의 GDN state(S/convctx) clear(잔재 제거). KV는 새 요청이 덮음.
+void reset_batch_slot(const ModelConfig &c, BatchDecodeState &s, int b);
 
 // d_tokens: [B] (각 시퀀스의 현재 토큰). d_logits: [B, V]. commit(KV append + state).
 //   use_q4: 0=fp32, 1=q4, 2=W4A8.
