@@ -43,6 +43,21 @@ int8 WMMA(tensor core s8) 최소 GEMM 커널 측정:
 - **bit-exact by construction**: int8·int8→int32 누적은 정수=순서무관 정확 → MMA와 DP4A 같은 정수 dot → dequant 동일 적용 시 **MMA W4A8 == DP4A W4A8 bit-exact**(드롭인, 정확성 보존).
 - **→ GO: 정식 int8-MMA W4A8 GEMM 재작성 정당**(occupancy 벽 완화 measured, bit-exact 보장). caveat: 100% occ는 필요조건 — 실 speedup은 tensor core util·int4 unpack·memory feed에 의존(정식 구현서 측정).
 
+### ★ 중대 정정 — 우리 prefill은 이미 MMA (STEP 2 진단 오류 수정, 커널 실사)
+정식 착수 전 커널 실사: **gemm_mmq(prefill)는 이미 `mma.sync.aligned.m16n8k32.s8.s8.s32` 사용**(line 93) — int8 tensor-core MMA, DP4A 아님. **STEP 2의 "우리=DP4A, llama=MMA" 진단은 prefill엔 틀림.** 실사 결과:
+| 우리 커널 | 연산 | 경로 |
+|---|---|---|
+| gemm_mmq | **MMA** (m16n8k32.s8) | prefill Sq>8 |
+| gemm_batch_w4a8 | **DP4A** (float acc[B]) | batch B=16 |
+| gemv_w4a8(+sb) | **DP4A** | decode B=1 + small-batch B≤15 |
+
+**정정된 갭 분해:**
+- **prefill(901 vs 656)**: 둘 다 MMA. 갭 = **타일/occupancy 튜닝**(우리 128×128 타일 → 72 regs·26.3KB·occ 50%; de-risk의 작은 타일 MMA는 100% occ지만 weight-reuse↓ 트레이드 — 챕터7 이미 탐색한 영역). MMA 부재 아님.
+- **decode B=1(13.8 vs 11.9)**: GEMV(M=1), MMA 적용 불가(M≥16 필요). memory-bound(75% bw). MMA N/A.
+- **batch B=8-16(93.56 vs 65.9, 1.42×)**: 우리 DP4A(gemv_sb/gemm_batch), M=B=16이 **MMA m16n8k32에 적합** → **MMA가 진짜 빠진 유일한 곳**. llama 배치는 MMA 추정.
+
+**→ 재초점: int8-MMA 기회 = 배치 경로(B=8-16), prefill 아님(이미 MMA)·decode 아님(GEMV).** 단 caveat: 배치가 부분 memory-bound(weight 대역폭 1적재)면 MMA(compute) 이득 제한 — llama B=1→16 스케일 6.97×(≠16×)=부분 compute-bound라 MMA 여지 있으나 불확실. **정식 대상 = MMA 배치 GEMM(gemm_batch DP4A 대체), payoff 불확실 → 착수 전 방향 확인.**
+
 ## 정직 좌표 (이번 결론)
 - **STEP 1 블록**: llama fair spec 측정 불가(자산 — MTP-GGUF/vocab-matched draft 부재). 우리 spec vs llama non-spec(불공정)만 측정됨.
 - **STEP 2 진단**: 갭은 **compute 실행 효율/occupancy**(캐시 아님, 챕터7서 L1/TEX 맞춤). llama = int8 MMA+튜닝 타일 추정.
