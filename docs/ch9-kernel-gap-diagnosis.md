@@ -146,6 +146,13 @@ GdnStateT typedef(기본 float, -DGDN_BF16_STATE=bf16), DecodeState.S·BatchDeco
 - **stream-K N/A**: prefill grid 160+(1.67 waves)=블록 충분 → few-blocks 문제 없음(batch grid 40과 다름). split-K 무의미. chapter-7 기각 재확인.
 - **판정(정직 천장)**: prefill은 register-blocked 128×128이 최적, occ/stream-K 둘 다 non-lever(measured). 남은 1.28~1.38× 갭 = **llama 타일/파이프 성숙도**(KTILE/deep cp.async — chapter-7 major NO-GO, instruction overhead). = GDN(미탐색 WIN)과 대조 — prefill은 이미 판 벽, 새 도구로도 구조 천장 재확인. single 1.16×도 memory-bound 구조. **정직 인정(도망 아님, measured 재확인).**
 
+## spec 심화 de-risk — 무학습 천장 재확인(measured)
+우리 최강 niche spec 21.3(llama non-spec 13.77의 1.55×). accept(이미 판 벽) 말고 verify 효율(미탐색?)을 GDN 교훈으로 규명.
+- **가설**: verify Sq=9~16이 gemm_mmq(BM=128) 씀(qwen35_decode:58) → M=9~16 empty-row 낭비(batch가 split-K로 고친 함정). tree-spec이 실제로 nodes≤8로 CAP돼 있음(코드 warning: ">8 → MMQ 함정"). split-K가 풀면 nodes>8 tree 넓혀 accept↑?
+- **★스윕(test_treespec_e2e, K4 W3/5/8/11 = nodes 7/9/12/15)**: **avg_accept 3.57 flat(전부 동일!), alt_hits=1** — width 늘려도 accept 이득 **0**. t/s만 하락(57.9→33.8, verify% 69→82). → **verify-matmul/split-K lever는 non-useful**: 넓은 tree가 accept 안 올림(draft-limited, W=3서 포화). ≤8 cap은 accept 제약 아니라 이미 최적.
+- **bf16 state(nodes=7 optimal)**: fp32 59.5→bf16 60.1(+1%만, Sq=7 GDN 작음 — B=1처럼). mism 0/40.
+- **판정**: spec 모든 커널 lever measured non-useful(verify-matmul=width 벽, bf16=+1%, accept=draft 품질 벽). **spec 21.3 = 무학습 커널 천장**; 더 올리려면 별도 draft(EAGLE/Medusa)=학습 영역(커널 밖). prefill과 같은 계열(이미 판 벽), GDN(미탐색)과 대조. **niche는 진짜(1.55×)지만 커널로는 천장.**
+
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
 - **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.
