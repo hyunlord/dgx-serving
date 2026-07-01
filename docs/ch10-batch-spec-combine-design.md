@@ -68,7 +68,12 @@ SpecSlot { int req;                     // 요청 id (-1=빈 슬롯)
 - **Phase 3 — 연속 배칭 통합**: admission/slot/큐 + spec, 요청 도착·완료하며 spec batch 변동(B 가변, 슬롯 재사용 시 spec 상태 clear). **게이트: 동적 도착서 mism=0 + 서빙 throughput 측정.**
 - **Phase 4 — e2e + 역전 측정**: Poisson 부하 + spec 결합. throughput×accept, TPOT/p95. **게이트: in-engine controlled A/B, near-parity(1.02×) 대비 역전? overclaim 금지(공정 조건).**
 
-## Phase 1 상세 스코프 (다음 세션 첫 빌드)
+## Phase 1 결과 (완료 8c8a03d — mism=0 토대 확립)
+- `qwen35_verify_batch`(2슬롯 tree concat verify) + tests/test_batchspec2 빌드. row-독립(norm/rope/act/matmul) concat 행, attn/GDN 슬롯별 루프(block-diagonal 격리).
+- **★게이트 통과(직접 검증)**: fp32 mism 0/24·W4A8 mism 0/24, 3 시나리오(A/B 다른 프롬프트) 모두 PASS. A가 B와 batch돼도 각 == 단독 spec bit-identical.
+- **★정직(STEP C 속도)**: W4A8은 **슬롯별 matmul(M=Nnodes)**로 bit-identity 보장 — concat M이 sb→mmq(S≤8) 경계 넘어 borderline flip하는 트랩 회피. **∴ W4A8 concat-matmul 속도 이득 미실현**(각 슬롯 weight 재적재). fp32만 concat. **곱 premise가 W4A8(서빙)엔 아직 X** — 실현엔 **단독 spec을 batched와 동일 large-M 커널로 정렬(Phase 2+ 필수 refinement).** Phase 1=정확성 토대만.
+
+## Phase 1 상세 스코프 (참고 — 위 결과로 완료)
 - **하네스**: `tests/test_batchspec2.cu` — 요청 2개(각 프롬프트), 각 자기 tree(고정 K,W). batched verify 1콜(Sq=2×Nnodes) → 각 요청 accept/logits. vs 단독 spec(test_treespec_e2e 로직) 슬롯별 대조.
 - **신규 함수**: `qwen35_verify_batch(...)` — qwen35_decode(tree verify)를 슬롯 차원 추가. 입력: 슬롯별 tok/par/pos/anc(offset 배열) + 슬롯별 base. matmul concat, attention/GDN 슬롯별 루프(+tree mask/fork).
 - **자산 재사용**: qwen35_decode의 tree verify 본체 + qwen35_decode_batch의 슬롯별 attention/GDN 루프. **결합만 신규**(슬롯별 tree offset + concat 행).
