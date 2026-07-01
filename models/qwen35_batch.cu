@@ -8,6 +8,7 @@
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemm_batch.cuh"
 #include "../kernels/gemv_w4a8.cuh"   // 챕터9: B≤8 batch decode에 SB 커널(odd-B 1적재)
+#include "../kernels/gemm_mmq.cuh"    // 챕터9: BM=16 split-K 배치 GEMM(B=9~16 load-latency wall, stream-K few-blocks 해결)
 #include "../kernels/gemv_f32.cuh"
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/rope.cuh"
@@ -121,8 +122,12 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             // 챕터9 batch serving: B≤15는 SB 커널(런타임 S, 1적재 — gemm_batch의 비특수화 default 루프[B× 재적재] 회피).
             //   SB는 SMAX dispatch(S≤8=SMAX8 occ100% / 9~15=SMAX16 occ83%, de-risk probe_sb16: S=12 gemm_batch 대비 5.85×).
             //   B=16은 gemm_batch<16> 특수화가 SB16보다 빠름(340 vs 398us) → 유지. bit-exact(SB16==gemm_batch 모든 S).
-            if(B<=15) launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
-            else      launch_gemm_batch_w4a8(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);   // 챕터4: W4A8 lane-minor 최적(16 특수화)
+            // 챕터9 stream-K: B=9~16을 BM=16 split-K(few-blocks 해결)로 — env BM16(기본 off, in-engine A/B). B≤8 sb8.
+            static int USE_BM16 = getenv("BM16") ? atoi(getenv("BM16")) : 0;
+            if(B<=8)                   launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
+            else if(USE_BM16 && B<=16) launch_gemm_bm16_splitk(g_bxq,g_bxs,m.wq,m.sc,Y,B,OUT,IN,sdtype);  // M=B rows, split-K
+            else if(B<=15)             launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
+            else                       launch_gemm_batch_w4a8(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);   // 챕터4 W4A8 lane-minor(16 특수화)
         } else if(use_q4){ if(!launch_gemm_mw_q4(X,m.wq,m.sc,Y,IN,OUT,B,sdtype)) launch_gemm_batch_q4(X,m.wq,m.sc,Y,IN,OUT,B,sdtype); }  // q4만 mw 이득(B≥4)
         else              launch_gemm_batch_f32(X,m.wf,Y,IN,OUT,B);      // fp32: bandwidth-bound, mw 무익
     };
