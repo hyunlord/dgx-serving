@@ -404,12 +404,53 @@ static __global__ void gdn_step_batch_kernel(const float *Q, const float *K, con
     O[base + v] = out;
     for (int k = 0; k < D; k++) Sout[stb + (size_t)k * D + v] = scol[k];   // 갱신 state commit
 }
+// 챕터9 GDN de-risk: D를 template(compile-time)화 → k-루프 unroll → scol[D]가 local mem(stack) 대신 레지스터.
+//   런타임 D 버전은 for(k<D) unroll 불가 → scol[128] local mem → scol[k] 512회/thread = long_scoreboard 601(ncu).
+//   연산 동일(bit-exact), D만 compile-time. gdn_step_ksplit_tree_kernel<D>와 동일 기법.
+template<int D>
+static __global__ void gdn_step_batch_kernel_t(const float *Q, const float *K, const float *V,
+                                const float *G, const float *Bt,
+                                const float *Sin, float *Sout, float *O, int NH, int NHk) {
+    int h = blockIdx.x, b = blockIdx.y, v = threadIdx.x;
+    int g = h * NHk / NH;
+    extern __shared__ float sh[];
+    float *qs = sh, *ks = sh + D, *red = sh + 2 * D;
+    float scol[D];
+    size_t stb = ((size_t)b * NH + h) * D * D;
+    #pragma unroll
+    for (int k = 0; k < D; k++) scol[k] = Sin ? Sin[stb + (size_t)k * D + v] : 0.f;
+    const float invsD = rsqrtf((float)D);
+    size_t base = ((size_t)b * NH + h) * D;
+    size_t base_qk = ((size_t)b * NHk + g) * D;
+    float qe = Q[base_qk + v], ke = K[base_qk + v];
+    float sq = block_reduce_sum(qe * qe, red);
+    float sk = block_reduce_sum(ke * ke, red);
+    qs[v] = qe * rsqrtf(sq + 1e-6f) * invsD;
+    ks[v] = ke * rsqrtf(sk + 1e-6f);
+    __syncthreads();
+    float g_t = expf(G[(size_t)b * NH + h]), beta_t = Bt[(size_t)b * NH + h];
+    float kv = 0.f;
+    #pragma unroll
+    for (int k = 0; k < D; k++) { scol[k] *= g_t; kv += scol[k] * ks[k]; }
+    float delta = (V[base + v] - kv) * beta_t, out = 0.f;
+    #pragma unroll
+    for (int k = 0; k < D; k++) { scol[k] += ks[k] * delta; out += scol[k] * qs[k]; }
+    O[base + v] = out;
+    #pragma unroll
+    for (int k = 0; k < D; k++) Sout[stb + (size_t)k * D + v] = scol[k];
+}
 static inline void launch_gdn_step_batch(const float *Q, const float *K, const float *V,
                                          const float *G, const float *Bt, const float *Sin,
                                          float *Sout, float *O, int B, int NH, int D, int NHk, cudaStream_t st = 0) {
     dim3 grid(NH, B);
     size_t shmem = (size_t)(2 * D + 32) * sizeof(float);
-    gdn_step_batch_kernel<<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, D, NHk);
+    // D compile-time 특수화(scol 레지스터화). 흔한 head_dim만; 그 외 런타임 fallback.
+#ifndef GDN_FORCE_RUNTIME   // A/B용: -DGDN_FORCE_RUNTIME로 런타임(local-mem) 버전 강제
+    if      (D==128) gdn_step_batch_kernel_t<128><<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, NHk);
+    else if (D==256) gdn_step_batch_kernel_t<256><<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, NHk);
+    else
+#endif
+                     gdn_step_batch_kernel<<<grid, D, shmem, st>>>(Q, K, V, G, Bt, Sin, Sout, O, NH, D, NHk);
 }
 
 // ---- (4) gated RMSNorm (Qwen3_5RMSNormGated) ----
