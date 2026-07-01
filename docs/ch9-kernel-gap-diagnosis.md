@@ -93,6 +93,13 @@ long_scoreboard 72.8% 직접 공격. 우리 batch/decode = cp.async 0, 완전 �
 - **근본**: BM=16 grid = N/128 × M/16 = **few blocks(~40 이하)**. GB10 SM=48. 격리선 GPU 독점이라 40블록 OK지만, **in-engine선 다른 레이어 커널과 경쟁 + few-blocks가 GPU 못 채움**. SB는 grid=OUT warps=**many blocks**로 GPU 채워 latency를 block-간 숨김(per-warp long_scoreboard 72.8%여도 many-block로 극복). **de-risk의 "few-blocks minor" 판단이 오류** — in-engine dominant.
 - **→ NO-GO(bounded 리타일). 진짜 해결 = stream-K(split-K로 소-M서 블록 생성, 회피하려던 major)** — llama mmq의 실제 설계. big-tile 리타일만으론 few-blocks로 불가. **batch wall 닫기 = stream-K major 빌드 확정(더 이상 추측 아님, 측정).**
 
+## stream-K(split-K) BM=16 — in-engine WIN (arc 첫 돌파, `tools/probe_splitk.cu`)
+BM=16 few-blocks(NO-GO) → stream-K(K를 SPLITK로 쪼개 blockIdx.z 블록↑, 40→~96~320). 각 split K-range 부분합(fp dequant)→workspace→reduce 합산(deterministic, atomic 안 씀). MS=1 8warp col, 더블버퍼/MMA/scale 재사용.
+- **correctness**: 격리 argmax==sb 모든 SPLITK(1-2e-5); in-engine iso 게이트(vs 진짜 single decode) argmax PASS(B=12·16 fp32·W4A8).
+- **★in-engine WIN**: 0.8b B=16 772.9→808.5(+4.6%); **27B bench_serve(Bmax16 λ8 c-ch) 33.9→38.6 tok/s(+13.9%), TPOT 0.5205→0.3457(−34%).** plain BM=16(−2~6%)을 few-blocks fix로 뒤집음 — 격리 오도 극복, **이번 arc 첫 in-engine kernel 성공.** bounded 다 NO-GO였지만 stream-K(유일한 길)가 batch wall 돌파.
+- **opt-in(기본 off)**: split-K(MMA)는 sb(DP4A)와 다른 커널 → W4A8 borderline flip으로 **SB 계열의 bit-identical-across-B 속성 깸**(SB8==SB16는 bit-identical, split-K은 아님; test_cbatch_prod got==iso mism 11). argmax 정확. **default off로 mism=0 보존, env BM16=1로 +13.9% throughput(borderline flip trade 감수).** SPLITK auto(~96 blocks) or env SPLITK.
+- **갭**: 27B 배치 serving +13.9%(라마 1.42× 갭 부분 축소). full 아님(0.8b matmul 비중 작아 +4.6%, 27B +13.9%; 서빙 aggregate라 raw B=16 갭보다 희석). **핵심: batch load-latency wall이 stream-K로 실제 열림(측정) — "천장" 아니었음.**
+
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
 - **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.
