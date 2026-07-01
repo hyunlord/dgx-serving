@@ -104,6 +104,14 @@ BM=16 few-blocks(NO-GO) → stream-K(K를 SPLITK로 쪼개 blockIdx.z 블록↑,
 - **opt-in(기본 off)**: split-K(MMA)는 sb(DP4A)와 다른 커널 → W4A8 borderline flip으로 **SB 계열 bit-identical-across-B 속성 깸**(test_cbatch_prod mism 11). argmax 정확. default off로 mism=0 보존, env BM16=1로 +3.5%(B≥14, trade 감수).
 - **갭(정직)**: raw B=16 93.56/65.6=**1.427× → 93.56/67.9=1.378×**(부분 ~5% 축소, full 아님). 서빙(avgB≈14.6 saturated) +3.5% = raw와 일치(희석 아니라 애초에 작음). **batch wall은 열리되 좁게 — 진짜 병목은 BM=16 MMA occupancy(46%), split-K가 못 여는 부분. "천장 아님"은 맞으나 "크게 열림"은 아님(정정).**
 
+## occupancy de-risk — measured NO-GO (occupancy는 lever 아님)
+batch matmul occupancy 46%가 진짜 병목인가 규명(파느냐 마느냐 근거).
+- **payoff 상한(nsys 시간 분해, 27B B=16 decode step)**: gemm_bm16_splitk(batch matmul) **59.5%**, gdn_step_batch(GDN recurrence) **36.3%**, flash_attn+gemv+rmsnorm+etc ~4%. → matmul 지배(개선 여지 59.5%), 단 **GDN 36%가 별도 큰 덩어리**(occupancy work 무관).
+- **limiter(ncu)**: Registers/thread **80** → Block Limit Registers **3**(min) = 확정 limiter=**REGISTER**. Theoretical occ **50%**(launch_bounds(256,2)). Achieved 28%(o/down grid80=**0.56 waves**)~46%(gate/up grid136) « 50% = **wave quantization**(BM=16 few M-tiles → 블록 부족).
+- **★payoff 측정(launch_bounds 2→4→6, regs 80→64→40, spill 0)**: 이론 occ 50→66→100% 올려도 **achieved occ 28% 불변**(mb2·mb4 동일 28%!), **throughput 68.7→68.4→67.9(미세 감소)**. **occupancy 올려도 throughput 안 오름 = occupancy는 lever 아님(measured).**
+- **근본**: achieved occ 낮음은 register 제한이 아니라 **wave quantization**(BM=16 M-타일 1개 → 블록 부족, 이론 상한 올려도 채울 블록 없음). matmul은 대역폭 35%(비포화)·long_scoreboard 11-15(latency-bound 아님)·occupancy 무관 → **grid-level wave-quant + B=16 저 arithmetic-intensity가 구조적 제약.** 블록↑ 유일 수단=split-K인데 auto 넘으면 reduce 오버헤드로 악화(측정).
+- **결론(정직 니치, 도망 아님)**: raw batch matmul은 **GB10 BM=16 구조 천장 근접**(occupancy measured NO-GO, split-K +3.5%가 이 스킴 천장). 남은 1.38× 갭은 (a)다른 타일링(BN 쪼개 wave-fill — major, matmul이 latency-bound 아니라 payoff 불확실) or (b)llama broad 커널 성숙도(honest-perf ⑦). **occupancy는 팠고 lever 아님을 measured — 우리 우위는 niche(spec/서빙/정확성).** 별도 lever 후보 = **GDN(36%)** — matmul 아닌 recurrence 커널(미탐색, 추후).
+
 ## 최종 정직 좌표 (커널 갭 3-축 종합)
 - **prefill(901 vs 656, 1.37×)**: 둘 다 MMA. 갭 = 128×128 타일 occupancy 50% 트레이드(챕터7 근본 벽, 재구조 필요).
 - **decode B=1(13.8 vs 11.9, 1.16×)**: GEMV memory-latency-bound(long_scoreboard), MMA N/A, gemv-MLP +8% 소진.

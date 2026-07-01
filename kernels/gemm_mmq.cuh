@@ -113,6 +113,9 @@ static __global__ void __launch_bounds__(256,2) gemm_mmq_kernel(const int8_t*X,c
 // 챕터9 stream-K(split-K) BM=16 배치 GEMM: BM=16 few-blocks(grid~40<SM48) 해결 — K를 SPLITK로 쪼개 blockIdx.z로 블록↑.
 //   각 split이 K-range 부분합(fp dequant됨)→workspace[split] 기록→reduce가 합산(deterministic, atomic 안 씀). MS=1, 8 warp col.
 //   격리 correctness: argmax==sb(fp 순서차 1-2e-5). in-engine 측정이 진실(격리 오도 3전례). cp.async 더블버퍼/MMA/scale 재사용.
+// launch_bounds(256,2)=80 regs, 3블록/SM, 이론 occ 50%. occupancy de-risk(측정): minblk 4(64reg)/6(40reg,spill0)로
+// 이론 occ 66/100% 올려도 achieved occ 28% 불변(wave quant — BM=16 few-blocks라 채울 블록 없음) → throughput 불변(68.7→67.9).
+// = occupancy는 batch matmul lever 아님. 진짜 제약 = BM=16 grid(few M-tiles). minblk 2가 측정 최적.
 template<int KT, typename ST>
 static __global__ void __launch_bounds__(256,2) gemm_bm16_splitk_kernel(const int8_t*X,const float*xs,const uint8_t*Wq,
                                        const ST*sw,float*out,int M,int N,int K,int SPLITK,long MN){
