@@ -169,3 +169,47 @@ SpecSlot { int req;                     // 요청 id (-1=빈 슬롯)
 ### 축2 종합 (정직)
 - **완성**: ragged spec 연속 배칭 인프라(vLLM급 신규 3개 중 ragged verify+ragged accept 완성, 정확성 mism=0/iso 12/12) + 곱 mechanism B-scaling 실증(verify 3.83×@B8).
 - **미달**: e2e 서빙 throughput(plain 2.0× 우세) — 원인은 batch+spec 결합이 아니라 **draft 파이프라인**(순차+호스트 sync+fp32 MTP body). **Phase 4 = draft 배칭**(슬롯 병렬 mtp_step 배치 forward + top-k 디바이스화)이 곱을 e2e로 옮기는 열쇠.
+
+## Phase 4 — draft 배칭 (곱을 e2e로)
+
+### STEP 0 — 시작 게이트
+- **27b 서빙 ISO(dq4=1, 순차 draft) 8/8 bit-identical PASS** — 축2가 남긴 실 lm_head 경로 게이트 충족.
+
+### STEP A+B — mtp_step_batch (슬롯 배치 draft)
+- `mtp_step_batch`(bench_serve_spec): B슬롯 draft를 depth별 1 forward(M=B행)로. depth 루프는 순차 유지(본질), 슬롯 루프를 배치.
+- **bit-identity 근거(설계로 확보)**: MTP body matmul은 전부 `gemv_f32`/`gemv_q4` — **단일 커널, S-무관, warp당 (s,o) row-독립**(launch_gemv_f32 dispatch는 IN 기준이라 S로 커널이 안 바뀜) → **sb/mmq flip 자체가 없음**(verify와 다른 지형, canonical 게이팅 불필요). rmsnorm/embedding/swiglu/add/gate row-독립. rope는 `rope_partial_pos`(per-row pos, verify_batch서 검증된 자산). attn/KV append는 per-slot 루프(순차와 동일 커널·kv.n·순서). top-k는 host 동일 코드(M×V logits 1회 D2H) → **sync B×K→K**.
+- **catchup도 배치**: promote 후 depth j별 active 부분집합({b: a_b≥j})을 mtp_step_batch — ragged depth를 부분집합으로 처리.
+- 순차 경로는 DRAFT_SEQ=1로 보존(A/B·게이트). STEP B(top-k 디바이스화)는 depth당 sync 1회가 남지만 tree 구성이 host라 현 구조에선 host top-k 유지(배칭 D2H 1회로 이미 sync 최소화) — 완전 디바이스 상주는 후속.
+- **게이트: 0.8b 서빙 ISO(배칭 draft) 12/12 bit-identical PASS**(solo=순차 draft이므로 ISO가 곧 draft mism=0 게이트) + DRAFT_SEQ=1 회귀 12/12. 버그 1건(워크스페이스 8H를 6H로 산정 → OOB memcpy) 수정.
+- 0.8b 속도: λ4 258.4 / λ8 240.9 tok/s(accept 5.55) — 순차 대비 대폭 개선(조건 상이라 참고).
+
+### STEP C — 27b 판정 (measured)
+- **27b 서빙 ISO(배칭 draft, dq4=1) 8/8 bit-identical PASS** — solo=순차 draft이므로 이것이 곧 27b draft mism=0 게이트. accept 4.50 불변.
+- **★27b e2e A/B (Bmax=8, nreq=60, 같은 seed/trace, λ=1,2,4, controlled back-to-back)**:
+  | λ | plain c-ch | c-spec(배칭 draft) | (축2 순차 draft) | 판정 |
+  |---|---|---|---|---|
+  | 1 | 38.3 | 20.6 | 20.2 | plain 1.9× |
+  | 2 | 40.3 | 20.7 | 20.3 | plain 1.9× |
+  | 4 | **40.7** | **20.8** | 20.4 | **plain 2.0× 우세** |
+  **정직: 미달.** draft 배칭이 27b e2e를 거의 못 움직임(20.4→20.8, **+2%**) — Amdahl 예측(~50 tok/s)이 크게 빗나감. plain 재측정은 축2와 소수점까지 일치(재현성 OK). verify 곱은 3.79×@B8(t(1)=196.3ms) 재확인 — 곱 mechanism은 그대로.
+- **사이클 재분해(CYC=1, 5구간 경계 deviceSync, λ4 Bmax=8 nreq=30, 77스텝 동일 trace, avgB 6.06)**:
+  | 구간 | 배칭 draft | 순차 draft(DRAFT_SEQ=1) |
+  |---|---|---|
+  | draft | **37.0s (44.8%)** | **38.1s (45.2%)** |
+  | verify | 27.3s (33.0%) | 27.2s (32.3%) |
+  | accept·host | 3.0s (3.6%) | 19.0s (22.5%, catchup 포함 통짜) |
+  | catchup(배치) | 15.4s (18.6%) | — |
+  | 합 / tok/s | 82.6s / 21.1 | 84.3s / 20.7 |
+- **★근본 원인(수치 정합으로 확정): draft matmul은 GEMV라 배칭 곱이 원천적으로 없다.**
+  - 27b MTP 1 forward 운반 = fp32 body 1.70GB(fc 210+q 252+k/v 42+o 126+gate/up/down 1070MB) + lm_head q4 0.79GB ≈ **2.5GB → 하한 9.2ms@273GB/s**. 순차 draft 슬롯당 81ms(6 forward×13.6ms) — 대역폭 천장 부근.
+  - 배칭 draft 스텝당 480ms ≈ **순차 슬롯당 81ms × avgB 6.06 = 494ms (오차 3%)** — M=B행인데 시간이 M배 그대로. `gemv_f32`/`gemv_q4`는 warp당 (s,o) **row-독립 = weight 재사용 0** → M행이어도 weight를 M번 운반. **배칭이 없앤 건 host sync뿐(-3%)**. verify서 곱이 난 건 mmq(MMA 타일)/sb(컬럼-독립 grid)가 **weight 1적재를 M행에 재사용**해서 — draft엔 그 커널이 안 붙어 있었던 것.
+  - 축2의 "draft 75-80%(host sync 지배)" 분해도 과대였음 — 실측 draft 45%(그것도 대역폭), verify 33%, catchup 19%.
+- **판정: Phase 4의 가설("draft 배칭=사이클 재균형")은 기각 — 배칭 인프라(mtp_step_batch, ISO PASS)는 완성됐으나 곱은 커널이 만든다.** 다음 lever(Phase 5 후보, Amdahl):
+  1. **draft matmul을 M-재사용 커널로**(verify의 concat-mmq/sb 원리를 mtp_step_batch matmul에) — draft 37→~10s, catchup 15→~4s ⇒ 합 ~44s ≈ **40 tok/s(plain 동급)**.
+  2. **MTP body fp32→W4A8**(1.70→~0.43GB, 운반 4×↓) — 1과 결합 시 합 ~35s ⇒ **~50 tok/s(추월권)**. 27b body가 이미 W4A8이므로 MTP만 fp32로 남은 상태(추출 파이프라인 확장).
+  3. top-k 디바이스화·D2H 축소는 잔여(~10-15%) — 1·2 이후에.
+
+### Phase 4 종합 (정직)
+- **완성**: draft 슬롯 배치 인프라(mtp_step_batch + 배치 catchup + DRAFT_SEQ 폴백) — 정확성 완전(0.8b ISO 12/12 배칭·순차 회귀, **27b ISO 8/8**, accept 4.50 불변). 0.8b는 대폭 개선(λ4 258.4 tok/s — 작은 모델은 sync가 실제 병목이었음).
+- **미달**: 27b e2e 20.4→20.8(+2%) — plain 40.7의 2.0× 열세 유지. **교훈: "배칭=곱"이 아니다 — 곱은 weight-재사용 커널(mmq/sb)이 만들고, GEMV 경로는 M행이어도 bytes가 M배.** 사이클 분해를 구간 계측(CYC) 없이 추정으로 말한 축2의 75-80%도 부정확했음(실측 draft 45%).
+- **다음(챕터10 Phase 5)**: draft matmul M-재사용 커널화 + MTP body W4A8 — 둘 다 "토큰당 bytes ↓"라는 프로젝트 제1원리로의 회귀. Amdahl 상 ~50 tok/s(추월권), 단 이번처럼 실측 전까진 예측일 뿐.
