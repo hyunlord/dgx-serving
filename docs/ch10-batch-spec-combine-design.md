@@ -213,3 +213,38 @@ SpecSlot { int req;                     // 요청 id (-1=빈 슬롯)
 - **완성**: draft 슬롯 배치 인프라(mtp_step_batch + 배치 catchup + DRAFT_SEQ 폴백) — 정확성 완전(0.8b ISO 12/12 배칭·순차 회귀, **27b ISO 8/8**, accept 4.50 불변). 0.8b는 대폭 개선(λ4 258.4 tok/s — 작은 모델은 sync가 실제 병목이었음).
 - **미달**: 27b e2e 20.4→20.8(+2%) — plain 40.7의 2.0× 열세 유지. **교훈: "배칭=곱"이 아니다 — 곱은 weight-재사용 커널(mmq/sb)이 만들고, GEMV 경로는 M행이어도 bytes가 M배.** 사이클 분해를 구간 계측(CYC) 없이 추정으로 말한 축2의 75-80%도 부정확했음(실측 draft 45%).
 - **다음(챕터10 Phase 5)**: draft matmul M-재사용 커널화 + MTP body W4A8 — 둘 다 "토큰당 bytes ↓"라는 프로젝트 제1원리로의 회귀. Amdahl 상 ~50 tok/s(추월권), 단 이번처럼 실측 전까진 예측일 뿐.
+
+## Phase 5 — draft 곱 실현 (① M-재사용 커널 + ② MTP W4)
+
+### STEP A — ① draft matmul GEMV→gemm_batch (M-재사용)
+- draft matmul(fc/qkvo/SwiGLU 8개 + lm_head)을 `gemm_batch_f32`/`gemm_batch_q4`(챕터3 자산 — weight row 1로드→B행 재사용)로 교체. `draft_mm_f32/q4` 디스패처, `DRAFT_GEMV=1` 폴백(P4 gemv 경로 재현).
+- **canonical 설계**: gemm_batch는 행별 acc가 B-template과 무관하게 같은 i 순서로 누적 → **같은 행은 B=1(순차 mtp_step)과 B=Mr(배칭) bit-identical** — 순차·배칭 둘 다 gemm_batch로 통일하면 ISO가 커널 구조로 성립. 기존 gemv(float4 mo)와는 합산 순서가 달라 draft 토큰 flip 가능(출력은 verify가 보장 — accept로 관찰).
+- **Mr round-up 패딩**: 템플릿 B∈{1,2,4,8,16} → M=6은 Mr=8로 gemm만 패딩 호출(나머지 커널·D2H는 M — row-독립이라 패딩 행 무해). lm_head가 caller 버퍼(Down)를 Mr행 읽으므로 g_bown은 Mr 할당.
+- **게이트**: 0.8b ISO 12/12(새 canonical, 배칭==순차) + DRAFT_SEQ 회귀 12/12 + DRAFT_GEMV(P4 경로) 회귀 12/12, **27b ISO 8/8(dq4=1)**. 0.8b accept 5.52(P4 5.55 근접 — flip 영향 미미).
+- 측정 결과 아래 STEP C 표.
+
+### STEP A 측정 (27b, controlled back-to-back, Bmax=8 nreq=60 같은 seed)
+- **e2e**: plain 38.2/40.2/40.6 (P4와 ±0.1 재현) vs **c-spec ① 36.8/37.6/37.9 tok/s**(λ=1/2/4) — P4 20.8에서 **+82%**, 예측(~40)과 부합. **plain 대비 0.93×(아직 미달)**. accept **4.50 불변**(커널 교체에도 — flip이 accept에 무영향). verify 곱 3.80×@B8 유지.
+- **CYC 재분해(λ4, 77스텝 동일 trace)**: draft 37.0→**8.9s(4.2×↓)**, catchup 15.4→**4.5s(3.4×↓)**, verify 27.2s(이제 62.5%로 지배), 합 82.6→**43.5s(1.9×↓)** — **"커널이 곱을 만든다" 실측 입증**(gemm_batch=weight 1로드→M행 상각).
+- 잔여 draft+catchup 13.4s의 지배분 = fp32 MTP body 운반(forward당 하한 9.2ms) → ②의 몫.
+
+### STEP B — ② MTP body q4 (bytes 4×↓)
+- `MTP_Q4=1`: load_mtp에서 host 양자화(본체 추출과 동일 스킴 QBLK=32/scale=absmax/7/2per-byte) → big 8개 q4만 상주(fp32 1.70GB 미탑재→~0.43GB). matmul은 `gemm_batch_q4`(fp32 act × q4 weight — act 양자화 오차 없음, accept 위험 최소). lm_head는 기존 q4(dq4).
+- **accept 게이트: 4.50 → 4.48(-0.4%, 사실상 유지 — GO).** q4 draft의 추측 품질 손실이 accept에 거의 무영향(fp32 act 유지 덕).
+- **ISO(①+②)**: 0.8b 12/12 + **27b 8/8 bit-identical PASS**(순차·배칭 같은 q4 canonical).
+
+### STEP C — 결합 e2e 판정 (measured, controlled back-to-back)
+- **★27b e2e 서빙 A/B (Bmax=8, nreq=60, 같은 seed/trace, λ=1,2,4)**:
+  | λ | plain c-ch | c-spec ①만 | c-spec ①+② | ①+② vs plain |
+  |---|---|---|---|---|
+  | 1 | 38.2 | 36.8 | **40.0** | **1.05×** |
+  | 2 | 40.2 | 37.6 | **43.6** | **1.08×** |
+  | 4 | 40.6 | 37.9 | **44.1** | **1.09×** |
+  **판정: 27b 연속배칭 서빙에서 spec(배칭 draft + MTP q4)이 plain을 전 λ에서 추월 — 챕터10의 곱(B×accept) 역전이 e2e에 처음 실현.** 조건 명시(overclaim 방지): Qwen3.5-27B W4A8 본체, K6W4 트리(Nn=10, concat-mmq), MTP_Q4=1(accept 4.48), in-engine plain 대비(llama.cpp 서빙과의 비교 아님 — 챕터9 apples-to-oranges). ~50 예측에는 미달(44.1) — verify가 지배구간이 되며 Amdahl 상한 도달. per-request tpot는 여전히 plain 우세(0.239 vs 0.179s — spec은 사이클이 커서 개별 지연↑, 총량↑).
+- **CYC 재분해(λ4, 77스텝)**: draft 6.6s(16.9%) / verify 27.5s(**70.7% — 지배**) / accept·host 3.0s / catchup 1.8s — 사이클합 **38.8s**(P4 82.6 → ① 43.5 → ①+② 38.8). drafting 경로(draft+catchup)는 P4 52.4s → **8.4s(6.2×↓)**.
+- verify 곱 3.71×@B8 유지(t(1)=192.2ms).
+
+### Phase 5 종합
+- **예측 vs 실측**: ① ~40 예측 → 37.9 실측(부합), ①+② ~50 예측 → **44.1 실측(방향 맞음, 크기 미달 — verify 70.7% 지배로 Amdahl 상한)**. Phase 4 교훈(단계 실측) 준수 — 예측 연쇄 없이 각 lever 기여 분리 측정.
+- **lever 기여**: ① M-재사용 커널(gemm_batch) = 20.8→37.9(+82%), ② MTP q4(bytes 4×↓) = 37.9→44.1(+16%). 곱은 커널이 만들고, bytes가 남은 갭을 채웠다 — 프로젝트 제1원리(bandwidth ÷ bytes) 그대로.
+- **다음 lever(후속 후보)**: verify가 70.7% — verify 자체는 이미 concat-mmq 곱이므로 남은 건 (a)트리 형상 최적화(K/W vs accept 트레이드), (b)verify attention/GDN의 per-slot 루프 배칭, (c)top-k 디바이스화(accept·host 7.8%). 모두 예측일 뿐 — 실측이 판정.
