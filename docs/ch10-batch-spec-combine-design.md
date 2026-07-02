@@ -110,3 +110,29 @@ SpecSlot { int req;                     // 요청 id (-1=빈 슬롯)
 - **실용 서빙(작은 트리 ≤8 + 큰 B로 M=B*Nnodes>8)**은 단독 spec을 **canonical mmq로 정렬**해야 mism=0 — **Phase 3 핵심 결정**(sb vs mmq 중 spec의 정본 W4A8; 둘 다 fp32 golden 아닌 유효 argmax).
 - probe/GDUMP 계측 제거, fix만 커밋(미커밋 원칙).
 - **다음 = Phase 3**: 연속 배칭 통합(admission/slot+spec, B 가변) + canonical-kernel 결정으로 ≤8 트리 곱 확장.
+
+## Phase 3 축1 결과 (완결 50c8d1c — concat-sb로 ≤8 트리 곱, canonical 결정)
+> STEP C는 Nnodes>8만 곱. 실용 서빙 작은 트리(≤8) 곱 확장 = Phase 3 축1.
+
+### 핵심 통찰 — sb도 weight 1적재 (곱)
+- `gemv_w4a8_sb`: **grid=OUT warps(S 무관), 각 warp가 weight 행 1회 적재 후 S 컬럼 DP4A**(L2 상주 activation). 컬럼-독립.
+- ∴ **concat-sb(M=B*Nnodes)** 1콜 = weight 1적재로 M 컬럼 서빙 vs per-slot sb(B콜) = weight B적재. **weight B→1 = 곱**(mmq와 같은 원천).
+- **컬럼-독립 → concat-sb == per-slot sb bit-identical**(K-누적 순서 동일, SMAX만 다름). 단독 spec(2≤Nnodes≤8)도 sb → **canonical 자동 일치, mism=0, empty-row 낭비·flip 없음, 딜레마 없음.** sb SMAX=16 한계라 M≤16.
+
+### fix + 측정
+- `MMrow`/`MMrow_q`: 2≤Nnodes≤8 && M≤16 → concat-sb(M) 1콜. Nnodes==1(단독 mlp)·M>16 → per-slot.
+- **측정(in-engine controlled): 27b W4A8 N=7(M=14) 곱 1.27×, 0.8b 1.24×.** mism=0: 0.8b N=7·N=4(SMAX8)·N=10(mmq 회귀)+fp32 A·B 0/24 PASS.
+
+### canonical-kernel 결정 (de-risk 완료)
+| M 범위 | 커널 | mism=0 | 곱 | 딜레마 |
+|---|---|---|---|---|
+| M≤16 (트리≤8, 저-중 B) | **concat-sb** | 단독 sb와 일치 | 1.24~1.27× | 없음 |
+| M>16 (트리>8, or 큰 B) | **concat-mmq** | 단독 mmq와 일치 | 1.74×(M=20) | 트리>8이면 없음(단독도 mmq) |
+- **B=2: 경계 정렬**(Nnodes≤8⟺M≤16→sb, Nnodes>8⟺M>16→mmq) → **모든 트리 크기 곱 완결, 딜레마 없음.**
+- mmq 곱 > sb 곱(MMA가 batched compute amortize↑; sb는 S 컬럼 DP4A라 compute S 비례 → batched M=14가 single M=7의 1.57배 시간, 곱 희석). 단 sb는 단독 정렬 불필요.
+- **가변 B의 진짜 딜레마**: 트리≤8인데 큰 B로 M>16 → sb 한계 초과 mmq 강제, 단독 spec은 sb → flip. 해법 (a)**adaptive**(sb≤16/mmq>16, 경계서 load-dependent-but-valid W4A8 argmax) or (b)**uniform mmq**(단독 mm+MMs 둘 다 mmq 정렬 + B=1 empty-row 페널티). MMQ_FORCE 실험(mm만 게이팅=mism 31)이 "모든 matmul 경로 정렬 필요" 확인. = **축2 설계 결정.**
+
+### 축2/3 = major 빌드 (미착수, STOP-report)
+- **축2 연속 배칭+spec**: ragged verify_batch(슬롯별 다른 Nnodes — 현재 uniform Nnodes 가정) + per-slot MTP draft/accept/promote + 가변 B admission. **vLLM급 ragged speculative continuous batching = dedicated 세션.**
+- **축3 곱→e2e throughput**: 축2 의존(연속 배칭 없이 서빙 throughput 측정 불가).
+- 긴 세션 강행 = mism=0 미검증 위험 → 보고(헌법). **다음 세션: ragged verify_batch(Nnodes_b[]+prefix-offset, per-slot 루프 기존 자산) → bench_serve spec 사이클 → 곱 B-scaling(Nnodes>8로 mism=0 유지 B=2,4,8 — 곱이 B로 커지나) → e2e Poisson(Phase 4).**
