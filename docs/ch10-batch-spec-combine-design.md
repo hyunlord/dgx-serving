@@ -248,3 +248,42 @@ SpecSlot { int req;                     // 요청 id (-1=빈 슬롯)
 - **예측 vs 실측**: ① ~40 예측 → 37.9 실측(부합), ①+② ~50 예측 → **44.1 실측(방향 맞음, 크기 미달 — verify 70.7% 지배로 Amdahl 상한)**. Phase 4 교훈(단계 실측) 준수 — 예측 연쇄 없이 각 lever 기여 분리 측정.
 - **lever 기여**: ① M-재사용 커널(gemm_batch) = 20.8→37.9(+82%), ② MTP q4(bytes 4×↓) = 37.9→44.1(+16%). 곱은 커널이 만들고, bytes가 남은 갭을 채웠다 — 프로젝트 제1원리(bandwidth ÷ bytes) 그대로.
 - **다음 lever(후속 후보)**: verify가 70.7% — verify 자체는 이미 concat-mmq 곱이므로 남은 건 (a)트리 형상 최적화(K/W vs accept 트레이드), (b)verify attention/GDN의 per-slot 루프 배칭, (c)top-k 디바이스화(accept·host 7.8%). 모두 예측일 뿐 — 실측이 판정.
+
+## Phase 6 — 트리 형상 K/W 재스윕 + verify 내부 분해
+
+### 재스윕 정당성 (전제 변화)
+챕터9 "accept W-flat 3.57(draft-limited)"은 옛 draft(품질≈3.57, GEMV 비용) 전제. 지금은 draft 품질↑(lm_head q4 → 4.48)+비용 4.2×↓(gemm_batch) — 균형점 이동 가능해 재측정(honest-perf ⑩ 예외). 형상은 argv config(커널 무변경).
+
+### STEP A — K/W 스크리닝 (27b MTP_Q4=1, λ4, nreq=40, 같은 seed=42, controlled 형상 비교)
+| K/W | Nn | tok/s | tpot(p95) | accept |
+|---|---|---|---|---|
+| 6/4(현행) | 10 | 44.6 | 0.236 | 4.44 |
+| **6/3** | 9 | **45.6** | 0.231 | 4.37 |
+| 6/5 | 11 | 42.7 | 0.246 | 4.43 |
+| 5/4 | 9 | 44.9 | 0.224 | 4.20 |
+| 5/5 | 10 | 43.5 | 0.232 | 4.22 |
+| 4/5 | 9 | 42.8 | 0.229 | 3.78 |
+- **패턴**: **K(depth)가 accept 드라이버**(K4→5→6: 3.78→4.20→4.37, Nn=9 고정 비교), **W(width)는 accept flat**(W3→5: 4.37→4.43·4.44 — 챕터9 W-flat이 새 전제에서도 재확인) — W↑는 verify 비용(Nn)만 늘림. ∴ 최적 = 최대 K + 최소 W(단 Nn>8 canonical 유지 → W=3). Nn≤8은 sb/mmq 가변 B 딜레마 복귀(per-slot 폴백=곱 손실)라 미시험.
+- **K6W3 full 확정(nreq=60, controlled)**: ISO 8/8 PASS(형상도 mism=0). e2e **47.2 / 44.5 / 44.8 tok/s**(λ=1/2/4), accept 4.41, tpot(p95) 0.231(K6W4 0.239서 소폭 개선, plain 0.179 대비 여전히 열세).
+  | λ | plain | K6W4(P5) | **K6W3(P6)** | vs plain |
+  |---|---|---|---|---|
+  | 1 | 38.2 | 40.0 | **47.2** | **1.24×** |
+  | 2 | 40.2 | 43.6 | **44.5** | 1.11× |
+  | 4 | 40.6 | 44.1 | **44.8** | **1.10×** |
+  **44.1 → 44.8(λ4, +1.6%), λ1은 +18%(40.0→47.2 — 저부하에서 작은 트리의 사이클 단축 효과가 큼).** CYC(λ4): draft 17.7% / **verify 70.2%(26.6s)** / accept·host 7.4% / catchup 4.8% — 사이클 38.8→37.9s, verify 지배 유지.
+
+### STEP B — verify 내부 분해 (nsys cuda_gpu_kern_sum, K6W4 λ4 nreq=12 — draft·verify·prefill 혼입 주의, avgB 3.98로 작음)
+| 커널군 | GPU 시간 비중 | 성격 |
+|---|---|---|
+| **gemm_mmq(verify concat matmul+prefill)** | **59.2%** | 이미 곱 실현(concat-mmq) |
+| gemm_batch_q4(draft+catchup, B1~8 합) | 25.8% | P5 ①② 완료 경로(CYC 22.5%와 정합) |
+| **GDN(gdn_step_ksplit_tree+conv1d tree)** | **9.4%** | per-slot 루프 — (b) 대상 |
+| **attention(flash_attn2bs p1+p2)** | **1.1%** | per-slot 루프 — (b) 대상 |
+| 기타(rmsnorm/quantize/elementwise 등) | ~4.5% | row-독립 |
+- **★(b) payoff 상한 = per-slot attn+GDN 합 ~10.5%** — "verify 70%의 대부분이 per-slot 루프"라는 가설은 **기각**: verify의 대부분은 이미 곱이 실현된 concat-mmq matmul(59.2%). GDN tree 커널은 평균 167μs/launch(16k회) — launch 오버헤드(~5μs)가 아니라 **슬롯별 bf16 state 운반이 지배로 추정**(state는 슬롯 고유라 배칭해도 운반 총량 불변 → 배칭 이득은 병렬성/launch 일부만, 예측).
+
+### STEP C — 판정
+- **최적 형상 = K6W3(Nn=9)로 확정** — 서빙 기본값 변경 권고(config, 커널 무변경). 27b e2e 최고점 **44.8 tok/s(λ4, plain 1.10×) / 47.2(λ1, 1.24×)**. tpot 트레이드: 0.231 vs plain 0.179 — throughput 우위·지연 열세 유지.
+- **재스윕의 수확**: 챕터9 "W-flat"은 새 전제(accept 4.4대)에서도 유효 — 단 결론이 뒤집힘: W는 accept를 못 늘리므로 **W를 줄이는 게 이득**(verify ∝ Nn). K는 accept 드라이버(K4→6: 3.78→4.37) — depth 유지가 필수.
+- **(b) verify attn/GDN 배칭: 낮은 우선순위 권고(사실상 기각)** — payoff 상한 ~10%(GPU 시간), 그 지배분(GDN 9%)은 state 대역폭 bound로 배칭 이득 제한적(예측). 남은 큰 벽은 **concat-mmq 커널 자체(59.2%)** — 이는 챕터7에서 micro-lever 천장 판정된 영역(FP4 MMA가 toolkit-blocked 해제 시 최대 lever).
+- Phase 6은 config 변경뿐(커널 무변경) — 스윕·계측 결과만 doc/메모리 기록.
