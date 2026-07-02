@@ -1,0 +1,17 @@
+{
+  "name": "GB10 (DGX Spark, sm_121)",
+  "arch": "sm_121",
+  "compile_arch": "sm_120",
+  "bandwidth_gbps": 273,
+  "unified_memory": true,
+  "mem_total_gb": 128,
+  "mem_probe": "max(cudaMemGetInfo.free, /proc/meminfo MemAvailable)",
+  "mem_guard_margin": 0.7,
+  "toolkit": {
+    "cuda_version": "13.0",
+    "cp_async": true,
+    "mma_int8": true,
+    "fp4_mma": false,
+    "fp4_blocked_reason": "ptxas PTX 9.0 cannot emit mxf4 (needs >=9.2)"
+  }
+}

@@ -1,0 +1,570 @@
+{
+ "schema": "dgx-serving/autotune-config@1",
+ "created": "2026-07-02T20:44:02",
+ "device_profile": {
+  "name": "GB10 (DGX Spark, sm_121)",
+  "arch": "sm_121",
+  "compile_arch": "sm_120",
+  "bandwidth_gbps": 273,
+  "unified_memory": true,
+  "mem_total_gb": 128,
+  "mem_probe": "max(cudaMemGetInfo.free, /proc/meminfo MemAvailable)",
+  "mem_guard_margin": 0.7,
+  "toolkit": {
+   "cuda_version": "13.0",
+   "cp_async": true,
+   "mma_int8": true,
+   "fp4_mma": false,
+   "fp4_blocked_reason": "ptxas PTX 9.0 cannot emit mxf4 (needs >=9.2)"
+  }
+ },
+ "model_profile": {
+  "name": "Qwen3.5-27B",
+  "weights_dir": "artifacts/qwen35-27b/weights",
+  "golden_dir": "artifacts/qwen35-27b/mtp_golden",
+  "uq": 2,
+  "params_b": 27,
+  "gdn": true,
+  "tied_lm_head": false,
+  "moe": false,
+  "quant": "w4a8",
+  "num_layers": 64,
+  "full_attention_interval": 4,
+  "num_kv_heads": 4,
+  "head_dim": 256,
+  "linear_num_key_heads": 16,
+  "linear_num_value_heads": 48,
+  "linear_key_head_dim": 128,
+  "linear_value_head_dim": 128,
+  "linear_conv_kernel": 4,
+  "pmax_default": 32
+ },
+ "objective": {
+  "lam": 4.0,
+  "nreq": 40,
+  "seed": 42,
+  "tpot_cap": 0.35,
+  "metric": "tok_s - 100*max(0,tpot95-cap)"
+ },
+ "best_config": {
+  "bmax": 12,
+  "K": 6,
+  "W": 3,
+  "Nn": 9,
+  "env": {
+   "MTP_Q4": "1"
+  }
+ },
+ "best_measured": {
+  "tok_s": 50.1,
+  "tpot95": 0.3247,
+  "accept": 4.37,
+  "avgB": 9.79
+ },
+ "verify": {
+  "alt_seed": 777,
+  "alt_measured": {
+   "tok_s": 47.5,
+   "tpot95": 0.3138,
+   "accept": 4.52
+  },
+  "iso": "[ISO] 12/12 요청 bit-identical → PASS",
+  "iso_pass": true,
+  "cyc": [
+   "[CYC] draft 18.1%(2.83s) | verify 71.6%(11.19s) | accept·host 5.5%(0.86s) | catchup 4.8%(0.76s) | tail 0.0%(0.00s) — 사이클합 15.63s, 40스텝",
+   "[CYC] draft 18.7%(6.45s) | verify 68.0%(23.47s) | accept·host 8.6%(2.98s) | catchup 4.7%(1.64s) | tail 0.0%(0.00s) — 사이클합 34.53s, 60스텝"
+  ]
+ },
+ "trials": [
+  {
+   "n": 0,
+   "params": {
+    "bmax": 4,
+    "K": 7,
+    "W": 3
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 33.7,
+   "attrs": {
+    "accept": 4.59,
+    "avgB": 3.72,
+    "mem_need_gb": 6.83,
+    "tok_s": 33.7,
+    "tpot95": 0.1527,
+    "wall_s": 106.9
+   }
+  },
+  {
+   "n": 1,
+   "params": {
+    "bmax": 14,
+    "K": 8,
+    "W": 3
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 35.8,
+   "attrs": {
+    "accept": 4.83,
+    "avgB": 10.91,
+    "mem_need_gb": 26.05,
+    "tok_s": 45.8,
+    "tpot95": 0.45,
+    "wall_s": 90.2
+   }
+  },
+  {
+   "n": 2,
+   "params": {
+    "bmax": 10,
+    "K": 3,
+    "W": 2
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 3,
+   "params": {
+    "bmax": 10,
+    "K": 7,
+    "W": 5
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 42.8,
+   "attrs": {
+    "accept": 4.7,
+    "avgB": 7.84,
+    "mem_need_gb": 20.14,
+    "tok_s": 42.8,
+    "tpot95": 0.3176,
+    "wall_s": 93.0
+   }
+  },
+  {
+   "n": 4,
+   "params": {
+    "bmax": 8,
+    "K": 3,
+    "W": 2
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 5,
+   "params": {
+    "bmax": 16,
+    "K": 4,
+    "W": 3
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 6,
+   "params": {
+    "bmax": 16,
+    "K": 3,
+    "W": 4
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 7,
+   "params": {
+    "bmax": 16,
+    "K": 4,
+    "W": 3
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 8,
+   "params": {
+    "bmax": 16,
+    "K": 3,
+    "W": 3
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 9,
+   "params": {
+    "bmax": 14,
+    "K": 7,
+    "W": 3
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 39.89,
+   "attrs": {
+    "accept": 4.59,
+    "avgB": 10.91,
+    "mem_need_gb": 23.91,
+    "tok_s": 47.3,
+    "tpot95": 0.4241,
+    "wall_s": 87.7
+   }
+  },
+  {
+   "n": 10,
+   "params": {
+    "bmax": 4,
+    "K": 6,
+    "W": 5
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 32.7,
+   "attrs": {
+    "accept": 4.43,
+    "avgB": 3.79,
+    "mem_need_gb": 7.44,
+    "tok_s": 32.7,
+    "tpot95": 0.1549,
+    "wall_s": 110.4
+   }
+  },
+  {
+   "n": 11,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 5
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 40.09,
+   "attrs": {
+    "accept": 4.43,
+    "avgB": 9.84,
+    "mem_need_gb": 22.33,
+    "tok_s": 43.2,
+    "tpot95": 0.3811,
+    "wall_s": 93.5
+   }
+  },
+  {
+   "n": 12,
+   "params": {
+    "bmax": 10,
+    "K": 6,
+    "W": 5
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 43.6,
+   "attrs": {
+    "accept": 4.43,
+    "avgB": 8.04,
+    "mem_need_gb": 18.61,
+    "tok_s": 43.6,
+    "tpot95": 0.2999,
+    "wall_s": 91.3
+   }
+  },
+  {
+   "n": 13,
+   "params": {
+    "bmax": 8,
+    "K": 6,
+    "W": 5
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 42.6,
+   "attrs": {
+    "accept": 4.43,
+    "avgB": 6.94,
+    "mem_need_gb": 14.89,
+    "tok_s": 42.6,
+    "tpot95": 0.2477,
+    "wall_s": 92.7
+   }
+  },
+  {
+   "n": 14,
+   "params": {
+    "bmax": 8,
+    "K": 5,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 44.7,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 6.75,
+    "mem_need_gb": 12.44,
+    "tok_s": 44.7,
+    "tpot95": 0.2265,
+    "wall_s": 90.1
+   }
+  },
+  {
+   "n": 15,
+   "params": {
+    "bmax": 6,
+    "K": 5,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 40.5,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 5.47,
+    "mem_need_gb": 9.33,
+    "tok_s": 40.5,
+    "tpot95": 0.1676,
+    "wall_s": 97.0
+   }
+  },
+  {
+   "n": 16,
+   "params": {
+    "bmax": 8,
+    "K": 5,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 44.7,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 6.75,
+    "cached": true,
+    "mem_need_gb": 12.44,
+    "tok_s": 44.7,
+    "tpot95": 0.2265,
+    "wall_s": 90.1
+   }
+  },
+  {
+   "n": 17,
+   "params": {
+    "bmax": 6,
+    "K": 5,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 40.5,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 5.47,
+    "cached": true,
+    "mem_need_gb": 9.33,
+    "tok_s": 40.5,
+    "tpot95": 0.1676,
+    "wall_s": 97.0
+   }
+  },
+  {
+   "n": 18,
+   "params": {
+    "bmax": 8,
+    "K": 5,
+    "W": 1
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 19,
+   "params": {
+    "bmax": 6,
+    "K": 4,
+    "W": 4
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 20,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 9.57,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3167,
+    "wall_s": 83.5
+   }
+  },
+  {
+   "n": 21,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 9.57,
+    "cached": true,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3167,
+    "wall_s": 83.5
+   }
+  },
+  {
+   "n": 22,
+   "params": {
+    "bmax": 12,
+    "K": 4,
+    "W": 4
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 23,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 9.57,
+    "cached": true,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3167,
+    "wall_s": 83.5
+   }
+  },
+  {
+   "n": 24,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 9.57,
+    "cached": true,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3167,
+    "wall_s": 83.5
+   }
+  },
+  {
+   "n": 25,
+   "params": {
+    "bmax": 14,
+    "K": 4,
+    "W": 2
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 26,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 4
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 48.2,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 9.52,
+    "mem_need_gb": 20.49,
+    "tok_s": 48.2,
+    "tpot95": 0.3388,
+    "wall_s": 86.4
+   }
+  },
+  {
+   "n": 27,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 5
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 41.73,
+   "attrs": {
+    "accept": 4.22,
+    "avgB": 11.1,
+    "mem_need_gb": 23.91,
+    "tok_s": 46.6,
+    "tpot95": 0.3987,
+    "wall_s": 88.7
+   }
+  },
+  {
+   "n": 28,
+   "params": {
+    "bmax": 10,
+    "K": 4,
+    "W": 4
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 29,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 3
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 50.1,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 9.79,
+    "mem_need_gb": 18.66,
+    "tok_s": 50.1,
+    "tpot95": 0.3247,
+    "wall_s": 83.5
+   }
+  }
+ ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "Qwen3.5-27B",
+  "weights_dir": "artifacts/qwen35-27b/weights",
+  "golden_dir": "artifacts/qwen35-27b/mtp_golden",
+  "uq": 2,
+  "params_b": 27,
+  "gdn": true,
+  "tied_lm_head": false,
+  "moe": false,
+  "quant": "w4a8",
+  "num_layers": 64,
+  "full_attention_interval": 4,
+  "num_kv_heads": 4,
+  "head_dim": 256,
+  "linear_num_key_heads": 16,
+  "linear_num_value_heads": 48,
+  "linear_key_head_dim": 128,
+  "linear_value_head_dim": 128,
+  "linear_conv_kernel": 4,
+  "pmax_default": 32
+}

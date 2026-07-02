@@ -45,3 +45,6 @@ __pycache__/
 .idea/
 *.swp
 .DS_Store
+tools/autotune/autotune.db
+!tools/autotune/artifacts/
+!tools/autotune/artifacts/*.json
