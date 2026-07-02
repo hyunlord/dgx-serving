@@ -216,7 +216,7 @@ static int8_t *vbwsi8(int &idx, size_t n){
 }
 
 void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState **sts,
-                         const int *d_tokens_b, int B, int Nnodes, const int *base_b,
+                         const int *d_tokens_b, int B, const int *Nnodes_b, const int *base_b,
                          const float *d_cos, const float *d_sin,
                          float *d_logits, float *d_hnextn, VerifyArtifacts *va, int use_q4,
                          const int *d_parent_b, const unsigned *d_anc_b, const int *d_pos_b) {
@@ -225,7 +225,13 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
     const int qdim2=NQ*HD*(c.attn_output_gate?2:1), qdim=NQ*HD, kvdim=NKV*HD;
     const int convd=cfg_gdn_conv_dim(&c), vdim=cfg_gdn_value_dim(&c), kdim=cfg_gdn_key_dim(&c);
     const int nvh=c.gdn_num_v_heads, hv=c.gdn_head_v_dim, Kk=c.gdn_conv_kernel;
-    const int M=B*Nnodes;                 // concat 행수
+    // ragged(Phase3 축2): 슬롯별 Nnodes_b[b] + prefix-offset off[b]=ΣNnodes_b[0..b-1]. uniform은 off[b]=b*Nnodes의 일반화.
+    std::vector<int> off(B+1,0);
+    for(int b=0;b<B;b++) off[b+1]=off[b]+Nnodes_b[b];
+    const int M=off[B];                   // concat 행수 = ΣNnodes_b
+    // canonical 게이팅(축1 결정, ragged 일반화): 전 슬롯 같은 커널 family여야 concat이 단독 spec과 bit-identical.
+    bool all_gt8=true, all_2to8=true;
+    for(int b=0;b<B;b++){ if(Nnodes_b[b]<=8) all_gt8=false; if(Nnodes_b[b]<2||Nnodes_b[b]>8) all_2to8=false; }
     const size_t MH=(size_t)M*H;
     const int sdtype=c.scale_dtype;
 
@@ -248,23 +254,25 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
     //   xqs/xss: 미리 양자화한 [M,H] 버퍼(use_q4==2). X: fp32 소스.
     auto MMrow=[&](const QMat&m,const float*X,const int8_t*xqs,const float*xss,float*Y,int IN,int OUT){
         if(use_q4==2){
-            if(Nnodes>8){
-                // ★곱: Nnodes>8이면 단독 spec(S=Nnodes)도 mmq → concat mmq(M=B*Nnodes) 1콜이 bit-identical
+            if(all_gt8){
+                // ★곱: 전 슬롯 Nnodes>8이면 단독 spec(S=Nnodes_b)도 mmq → concat mmq(M=ΣNnodes_b) 1콜이 bit-identical
                 //   (mmq row-독립: tools/probe_mmq_rowdep + in-context golden dump로 concat[slot]==solo max|d|=0.0 확정).
-                //   weight 1운반이 B슬롯 전부 서빙(현 per-slot은 슬롯마다 weight 재적재). matmul 배칭 이득 = 곱의 원천.
+                //   weight 1운반이 B슬롯 전부 서빙(per-slot은 슬롯마다 weight 재적재). matmul 배칭 이득 = 곱의 원천.
                 launch_gemm_mmq_w4a8(xqs,xss,m.wq,m.sc,Y,M,OUT,IN,sdtype);
-            } else if(Nnodes>=2 && M<=16){
-                // ★곱(≤8 트리, Phase3 축1): concat-sb(M=B*Nnodes) 1콜. sb는 grid=OUT warps(S무관, weight 1적재)+컬럼-독립
+            } else if(all_2to8 && M<=16){
+                // ★곱(≤8 트리, Phase3 축1): concat-sb(M) 1콜. sb는 grid=OUT warps(S무관, weight 1적재)+컬럼-독립
                 //   → per-slot sb(B콜=B적재)와 bit-identical하되 weight B적재→1 = 곱. 단독 spec(2≤S≤8)도 sb라 canonical 일치
-                //   (mism=0, borderline flip 없음). ≤8 트리 곱을 canonical 딜레마·empty-row 낭비 없이 실현. sb SMAX=16 한계라 M≤16.
+                //   (mism=0, borderline flip 없음). sb SMAX=16 한계라 M≤16.
                 launch_gemv_w4a8_sb(xqs,xss,m.wq,m.sc,Y,IN,OUT,M,sdtype);
             } else {
-                // Nnodes==1(단독=mlp) 또는 M>16(sb 범위 밖): per-slot로 커널 일치(bit-identical).
+                // 혼합(슬롯별 커널 family 다름)·M>16(sb 범위 밖)·Nnodes==1 포함: per-slot로 각 슬롯 단독 커널과 일치(bit-identical, 곱 부분 손실).
                 for(int b=0;b<B;b++){
-                    const int8_t *xb=xqs+(size_t)b*Nnodes*IN; const float *sb=xss+(size_t)b*Nnodes*IN/QBLK;
-                    float *Yb=Y+(size_t)b*Nnodes*OUT;
-                    if      (Nnodes==1) launch_gemv_w4a8_mlp<2>(xb,sb,nullptr,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
-                    else                launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                    const int Nb=Nnodes_b[b];
+                    const int8_t *xb=xqs+(size_t)off[b]*IN; const float *sb=xss+(size_t)off[b]*IN/QBLK;
+                    float *Yb=Y+(size_t)off[b]*OUT;
+                    if      (Nb==1) launch_gemv_w4a8_mlp<2>(xb,sb,nullptr,m.wq,m.sc,Yb,IN,OUT,Nb,sdtype);
+                    else if (Nb<=8) launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nb,sdtype);
+                    else            launch_gemm_mmq_w4a8(xb,sb,m.wq,m.sc,Yb,Nb,OUT,IN,sdtype);
                 }
             }
         } else if(use_q4){ launch_gemm_tiled_q4(X,m.wq,m.sc,Y,M,OUT,IN,sdtype); }
@@ -275,16 +283,18 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
         if(use_q4==2){
             int8_t *xq=vbwsi8(bi,(size_t)M*IN); float *xs=vbws(wi,(size_t)M*IN/QBLK); int32_t*xsm=(int32_t*)vbws(wi,(size_t)M*IN/QBLK);
             launch_quantize_x_q8(X,xq,xs,xsm,IN,M);            // per-row 양자화(M행) — 슬롯별 offset과 bit-identical
-            if(Nnodes>8){
-                launch_gemm_mmq_w4a8(xq,xs,m.wq,m.sc,Y,M,OUT,IN,sdtype);   // ★곱: concat mmq(M) — 단독 mmq(Nnodes)와 row-독립 bit-identical
-            } else if(Nnodes>=2 && M<=16){
-                launch_gemv_w4a8_sb(xq,xs,m.wq,m.sc,Y,IN,OUT,M,sdtype);     // ★곱(≤8): concat-sb(M) — 단독 sb(Nnodes)와 컬럼-독립 bit-identical, weight 1적재
+            if(all_gt8){
+                launch_gemm_mmq_w4a8(xq,xs,m.wq,m.sc,Y,M,OUT,IN,sdtype);   // ★곱: concat mmq(M) — 단독 mmq(Nnodes_b)와 row-독립 bit-identical
+            } else if(all_2to8 && M<=16){
+                launch_gemv_w4a8_sb(xq,xs,m.wq,m.sc,Y,IN,OUT,M,sdtype);     // ★곱(≤8): concat-sb(M) — 단독 sb(Nnodes_b)와 컬럼-독립 bit-identical, weight 1적재
             } else {
                 for(int b=0;b<B;b++){
-                    const int8_t *xb=xq+(size_t)b*Nnodes*IN; const float *sb=xs+(size_t)b*Nnodes*IN/QBLK;
-                    float *Yb=Y+(size_t)b*Nnodes*OUT;
-                    if      (Nnodes==1) launch_gemv_w4a8_mlp<2>(xb,sb,xsm+(size_t)b*Nnodes*IN/QBLK,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
-                    else                launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nnodes,sdtype);
+                    const int Nb=Nnodes_b[b];
+                    const int8_t *xb=xq+(size_t)off[b]*IN; const float *sb=xs+(size_t)off[b]*IN/QBLK;
+                    float *Yb=Y+(size_t)off[b]*OUT;
+                    if      (Nb==1) launch_gemv_w4a8_mlp<2>(xb,sb,xsm+(size_t)off[b]*IN/QBLK,m.wq,m.sc,Yb,IN,OUT,Nb,sdtype);
+                    else if (Nb<=8) launch_gemv_w4a8_sb(xb,sb,m.wq,m.sc,Yb,IN,OUT,Nb,sdtype);
+                    else            launch_gemm_mmq_w4a8(xb,sb,m.wq,m.sc,Yb,Nb,OUT,IN,sdtype);
                 }
             }
         } else if(use_q4){ launch_gemm_tiled_q4(X,m.wq,m.sc,Y,M,OUT,IN,sdtype); }
@@ -307,24 +317,24 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
             // rope: 노드별 위치 d_pos_b(base+depth) — 행-독립, concat 그대로.
             launch_rope_partial_pos(qn,d_cos,d_sin,d_pos_b,M,NQ,HD,rot);
             launch_rope_partial_pos(kn,d_cos,d_sin,d_pos_b,M,NKV,HD,rot);
-            // 슬롯별: K/V[슬롯 b 노드 i] → sts[b]->Kc/Vc slot (base_b[b]+i). 단독 spec과 동일(node index, position 아님).
+            // 슬롯별: K/V[슬롯 b 노드 i] → sts[b]->Kc/Vc slot (base_b[b]+i). 단독 spec과 동일(node index, position 아님). ragged=off[b]행.
             for(int b=0;b<B;b++){
-                launch_f32_to_bf16(kn+(size_t)b*Nnodes*kvdim, sts[b]->Kc[l]+(size_t)base_b[b]*kvdim, (size_t)Nnodes*kvdim);
-                launch_f32_to_bf16(vb+(size_t)b*Nnodes*kvdim, sts[b]->Vc[l]+(size_t)base_b[b]*kvdim, (size_t)Nnodes*kvdim);
+                launch_f32_to_bf16(kn+(size_t)off[b]*kvdim, sts[b]->Kc[l]+(size_t)base_b[b]*kvdim, (size_t)Nnodes_b[b]*kvdim);
+                launch_f32_to_bf16(vb+(size_t)off[b]*kvdim, sts[b]->Vc[l]+(size_t)base_b[b]*kvdim, (size_t)Nnodes_b[b]*kvdim);
             }
-            // 슬롯별 flash_attn: 슬롯 b 노드(Sq=Nnodes)는 sts[b]->Kc/Vc의 [0..base_b[b]+Nnodes) + tree mask(d_anc_b[b*Nnodes..]).
+            // 슬롯별 flash_attn: 슬롯 b 노드(Sq=Nnodes_b[b])는 sts[b]->Kc/Vc의 [0..base_b[b]+Nnodes_b[b]) + tree mask(d_anc_b[off[b]..]).
             for(int b=0;b<B;b++)
-                launch_flash_attn(qn+(size_t)b*Nnodes*qdim, sts[b]->Kc[l], sts[b]->Vc[l],
-                                  attn+(size_t)b*Nnodes*qdim, Nnodes, NQ, NKV, HD, base_b[b], 0, d_anc_b+(size_t)b*Nnodes);
+                launch_flash_attn(qn+(size_t)off[b]*qdim, sts[b]->Kc[l], sts[b]->Vc[l],
+                                  attn+(size_t)off[b]*qdim, Nnodes_b[b], NQ, NKV, HD, base_b[b], 0, d_anc_b+(size_t)off[b]);
             launch_gate_sigmoid(attn, gate, (int)((size_t)M*qdim));
             MMrow_q(L.o,attn,ob,qdim,H);
             launch_add(after,x,ob,(int)MH);
         } else {
             MMrow(L.in_qkv,norm,xqn,xsn,mixed,H,convd);
-            // conv tree-fork: 슬롯 b 노드는 슬롯-로컬 parent(d_parent_b[b*Nnodes..]) + 슬롯 b convctx(sts[b]).
+            // conv tree-fork: 슬롯 b 노드는 슬롯-로컬 parent(d_parent_b[off[b]..]) + 슬롯 b convctx(sts[b]).
             for(int b=0;b<B;b++)
-                launch_gdn_conv1d_silu_decode_tree(mixed+(size_t)b*Nnodes*convd, sts[b]->convctx[l],
-                                                   d_parent_b+(size_t)b*Nnodes, L.conv1d, mconv+(size_t)b*Nnodes*convd, Nnodes, convd, Kk);
+                launch_gdn_conv1d_silu_decode_tree(mixed+(size_t)off[b]*convd, sts[b]->convctx[l],
+                                                   d_parent_b+(size_t)off[b], L.conv1d, mconv+(size_t)off[b]*convd, Nnodes_b[b], convd, Kk);
             BK(cudaMemcpy2D(qg2,kdim*4,mconv,convd*4,kdim*4,M,cudaMemcpyDeviceToDevice));
             BK(cudaMemcpy2D(kg2,kdim*4,mconv+kdim,convd*4,kdim*4,M,cudaMemcpyDeviceToDevice));
             BK(cudaMemcpy2D(vg2,vdim*4,mconv+2*kdim,convd*4,vdim*4,M,cudaMemcpyDeviceToDevice));
@@ -335,22 +345,22 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
                 launch_gdn_qk_norm(qg2,kg2,qg2,kg2, M*c.gdn_num_k_heads, hv);   // 행-독립(row=노드×k-head), concat 그대로
                 // 슬롯별 tree-fork: 슬롯 b 노드는 sts[b]->S서 fork(parent 슬롯-로컬), snap도 슬롯별 sub-buffer(자식이 부모 read).
                 for(int b=0;b<B;b++)
-                    launch_gdn_step_ksplit_tree<128,2>(qg2+(size_t)b*Nnodes*kdim, kg2+(size_t)b*Nnodes*kdim, vg2+(size_t)b*Nnodes*vdim,
-                                                       gg+(size_t)b*Nnodes*nvh, beta+(size_t)b*Nnodes*nvh, sts[b]->S[l],
-                                                       d_parent_b+(size_t)b*Nnodes, snap+(size_t)b*Nnodes*nvh*hv*hv, core+(size_t)b*Nnodes*vdim,
-                                                       Nnodes, nvh, c.gdn_num_k_heads);
+                    launch_gdn_step_ksplit_tree<128,2>(qg2+(size_t)off[b]*kdim, kg2+(size_t)off[b]*kdim, vg2+(size_t)off[b]*vdim,
+                                                       gg+(size_t)off[b]*nvh, beta+(size_t)off[b]*nvh, sts[b]->S[l],
+                                                       d_parent_b+(size_t)off[b], snap+(size_t)off[b]*nvh*hv*hv, core+(size_t)off[b]*vdim,
+                                                       Nnodes_b[b], nvh, c.gdn_num_k_heads);
             } else {
                 fprintf(stderr,"[qwen35_verify_batch] tree-verify는 GDN head_v_dim=128만(현재 %d). 조용한 오답 대신 중단.\n",hv); abort();
             }
-            // verify snapshot → va[b] (슬롯별). 슬롯 b 노드 t = snap 행 b*Nnodes+t → va[b].gdn_snap[(t*n_linear+lin)].
+            // verify snapshot → va[b] (슬롯별). 슬롯 b 노드 t = snap 행 off[b]+t → va[b].gdn_snap[(t*n_linear+lin)].
             if(va){
                 size_t ssz=(size_t)nvh*hv*hv;
-                for(int b=0;b<B;b++) for(int t=0;t<Nnodes;t++)
+                for(int b=0;b<B;b++) for(int t=0;t<Nnodes_b[b];t++)
                     BK(cudaMemcpy(va[b].gdn_snap + ((size_t)t*va[b].n_linear + lin)*ssz,
-                                  snap + (size_t)(b*Nnodes+t)*ssz, ssz*4, cudaMemcpyDeviceToDevice));
-                for(int b=0;b<B;b++) for(int t=0;t<Nnodes;t++)
+                                  snap + (size_t)(off[b]+t)*ssz, ssz*4, cudaMemcpyDeviceToDevice));
+                for(int b=0;b<B;b++) for(int t=0;t<Nnodes_b[b];t++)
                     BK(cudaMemcpy(va[b].conv_mixed + ((size_t)t*va[b].n_linear + lin)*convd,
-                                  mixed + (size_t)(b*Nnodes+t)*convd, (size_t)convd*4, cudaMemcpyDeviceToDevice));
+                                  mixed + (size_t)(off[b]+t)*convd, (size_t)convd*4, cudaMemcpyDeviceToDevice));
             }
             launch_rms_norm_gated(core,zb,L.gdn_norm,normed,M*nvh,hv,eps);
             MMrow_q(L.out_p,normed,gout,vdim,H);

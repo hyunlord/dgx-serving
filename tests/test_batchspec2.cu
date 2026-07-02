@@ -128,6 +128,7 @@ static ModelConfig c;
 static QwenWeights w; static MtpW mw; static float* E;
 static float *d_cos,*d_sin;
 static int H,V,rot,NKV,HD, N,K,W,Nnodes, bq4,dq4, maxlen;
+static int K2,W2,Nnodes2;   // Phase3 축2 ragged: 슬롯 B의 트리 형상(기본=슬롯 A와 동일=uniform 회귀)
 static int argmaxV(const std::vector<float>&lg,int p){int b=0;float bv=lg[(size_t)p*V];for(int j=1;j<V;j++){float z=lg[(size_t)p*V+j];if(z>bv){bv=z;b=j;}}return b;}
 
 // [곱 측정] verify forward 시간 누적(TIME=1). single(M=Nnodes 1슬롯)×2 vs batched(M=B*Nnodes) — matmul weight-load 배칭 이득.
@@ -137,21 +138,22 @@ static cudaEvent_t g_e0,g_e1; static int g_ev_init=0;
 static inline void tstart(){ if(!g_ev_init){cudaEventCreate(&g_e0);cudaEventCreate(&g_e1);g_ev_init=1;} cudaEventRecord(g_e0); }
 static inline float tstop(){ cudaEventRecord(g_e1); cudaEventSynchronize(g_e1); float ms=0; cudaEventElapsedTime(&ms,g_e0,g_e1); return ms; }
 
-// 슬롯의 draft tree(root=cur, h_cur, base) → tok/par/pos/anc(슬롯-로컬) + owns hidden. (solo/batch 공용, 동일 로직)
-static void draft_tree(MtpKV& kv, int cur, float* h_cur, int base,
+// 슬롯의 draft tree(root=cur, h_cur, base, 형상 K_/W_) → tok/par/pos/anc(슬롯-로컬) + owns hidden. (solo/batch 공용, 동일 로직)
+static void draft_tree(MtpKV& kv, int cur, float* h_cur, int base, int K_, int W_,
                        std::vector<int>&tok, std::vector<int>&par, std::vector<int>&pos, std::vector<unsigned>&anc,
                        std::vector<float*>&owns){
-    tok.assign(Nnodes,0); par.assign(Nnodes,0); pos.assign(Nnodes,0); owns.clear();
+    const int Nn=K_+W_;
+    tok.assign(Nn,0); par.assign(Nn,0); pos.assign(Nn,0); owns.clear();
     std::vector<int> top0;
     tok[0]=cur; par[0]=-1; pos[0]=base;
-    { float*own; CK(cudaMalloc(&own,(size_t)H*4)); mtp_step(c,mw,kv,E,cur,h_cur,base,true,d_cos,d_sin,own,true,&w.lm_head,dq4,&top0,W); owns.push_back(own); }
-    for(int j=0;j<W;j++){ tok[1+j]=top0[j]; par[1+j]=0; pos[1+j]=base+1; }
+    { float*own; CK(cudaMalloc(&own,(size_t)H*4)); mtp_step(c,mw,kv,E,cur,h_cur,base,true,d_cos,d_sin,own,true,&w.lm_head,dq4,&top0,W_); owns.push_back(own); }
+    for(int j=0;j<W_;j++){ tok[1+j]=top0[j]; par[1+j]=0; pos[1+j]=base+1; }
     int e_tok=top0[0]; float* h_in=owns[0]; int prev_idx=1;
-    for(int i=1;i<K;i++){ float*own; CK(cudaMalloc(&own,(size_t)H*4));
+    for(int i=1;i<K_;i++){ float*own; CK(cudaMalloc(&own,(size_t)H*4));
         int d=mtp_step(c,mw,kv,E,e_tok,h_in,base+i,true,d_cos,d_sin,own,true,&w.lm_head,dq4); owns.push_back(own);
-        int idx=W+i; tok[idx]=d; par[idx]=prev_idx; pos[idx]=base+1+i; prev_idx=idx; e_tok=d; h_in=own; }
-    anc.assign(Nnodes,0);
-    for(int j=0;j<Nnodes;j++){ unsigned mm=0; for(int x=j;x>=0;x=par[x]) mm|=(1u<<x); anc[j]=mm; }
+        int idx=W_+i; tok[idx]=d; par[idx]=prev_idx; pos[idx]=base+1+i; prev_idx=idx; e_tok=d; h_in=own; }
+    anc.assign(Nn,0);
+    for(int j=0;j<Nn;j++){ unsigned mm=0; for(int x=j;x>=0;x=par[x]) mm|=(1u<<x); anc[j]=mm; }
 }
 
 // verify logits(vlh, [Nnodes,V]) + draft(tok/par) → longest-greedy accept path + plen + next_cur(끝 노드 argmax).
@@ -159,7 +161,7 @@ static void accept_path(const std::vector<float>&vlh, const std::vector<int>&tok
                         std::vector<int>&path, int&plen, int&node_out, int&next_cur){
     path.clear(); path.push_back(0); int node=0;
     while(true){ int g=argmaxV(vlh,node); int child=-1;
-        for(int j=0;j<Nnodes;j++) if(par[j]==node && tok[j]==g){ child=j; break; }
+        for(int j=0;j<(int)par.size();j++) if(par[j]==node && tok[j]==g){ child=j; break; }   // 슬롯-로컬 Nn=par.size() (ragged)
         if(child<0) break; path.push_back(child); node=child; }
     plen=(int)path.size(); node_out=node; next_cur=argmaxV(vlh,node);
 }
@@ -177,8 +179,9 @@ static void promote_and_catchup(DecodeState& st, VerifyArtifacts& va, MtpKV& kv,
     CK(cudaMemcpy(h_cur,d_vpn+(size_t)node*H,(size_t)H*4,cudaMemcpyDeviceToDevice));   // 다음 root의 h_post
 }
 
-// ── 단독 spec 전체 (요청 하나) → 생성 시퀀스 (test_treespec_e2e B-루프와 동일) ──
-static std::vector<int> solo_spec(const std::vector<int>& prompt){
+// ── 단독 spec 전체 (요청 하나, 트리 형상 K_/W_) → 생성 시퀀스 (test_treespec_e2e B-루프와 동일) ──
+static std::vector<int> solo_spec(const std::vector<int>& prompt, int K_, int W_){
+    const int Nn=K_+W_;
     int P=prompt.size(); std::vector<int> out;
     DecodeState st=alloc_decode_state(c,maxlen);
     MtpKV kv; CK(cudaMalloc(&kv.Kc,(size_t)maxlen*NKV*HD*4)); CK(cudaMalloc(&kv.Vc,(size_t)maxlen*NKV*HD*4)); kv.n=0;
@@ -190,21 +193,21 @@ static std::vector<int> solo_spec(const std::vector<int>& prompt){
     for(int q=1;q<P;q++){ float*ht; CK(cudaMalloc(&ht,(size_t)H*4)); mtp_step(c,mw,kv,E,prompt[q],dpn+(size_t)(q-1)*H,q,true,d_cos,d_sin,ht,false); cudaFree(ht); }
     float *h_cur; CK(cudaMalloc(&h_cur,(size_t)H*4)); CK(cudaMemcpy(h_cur,dpn+(size_t)(P-1)*H,(size_t)H*4,cudaMemcpyDeviceToDevice));
     cudaFree(dl); cudaFree(dpn);
-    VerifyArtifacts va=alloc_verify_artifacts(c,Nnodes);
-    float *vl,*vpn; CK(cudaMalloc(&vl,(size_t)Nnodes*V*4)); CK(cudaMalloc(&vpn,(size_t)Nnodes*H*4));
+    VerifyArtifacts va=alloc_verify_artifacts(c,Nn);
+    float *vl,*vpn; CK(cudaMalloc(&vl,(size_t)Nn*V*4)); CK(cudaMalloc(&vpn,(size_t)Nn*H*4));
     float *d_own; CK(cudaMalloc(&d_own,(size_t)H*4));
-    std::vector<float> hpn((size_t)Nnodes*H);
+    std::vector<float> hpn((size_t)Nn*H);
     while((int)out.size()<N){
         int mn_committed=kv.n, base=st.n_past;
         std::vector<int> tok,par,pos; std::vector<unsigned> anc; std::vector<float*> owns;
-        draft_tree(kv,cur,h_cur,base,tok,par,pos,anc,owns);
-        CK(cudaMemcpy(d_tok,tok.data(),(size_t)Nnodes*4,cudaMemcpyHostToDevice));
-        int*dpar=upi(par); int*dpos=upi(pos); unsigned*danc; CK(cudaMalloc(&danc,Nnodes*4)); CK(cudaMemcpy(danc,anc.data(),Nnodes*4,cudaMemcpyHostToDevice));
+        draft_tree(kv,cur,h_cur,base,K_,W_,tok,par,pos,anc,owns);
+        CK(cudaMemcpy(d_tok,tok.data(),(size_t)Nn*4,cudaMemcpyHostToDevice));
+        int*dpar=upi(par); int*dpos=upi(pos); unsigned*danc; CK(cudaMalloc(&danc,Nn*4)); CK(cudaMemcpy(danc,anc.data(),Nn*4,cudaMemcpyHostToDevice));
         static int wsingle=0;
         if(g_time) tstart();
-        qwen35_decode(c,w,st,d_tok,Nnodes,d_cos,d_sin,vl,nullptr,0,&va,bq4,vpn,0,dpar,danc,dpos);
+        qwen35_decode(c,w,st,d_tok,Nn,d_cos,d_sin,vl,nullptr,0,&va,bq4,vpn,0,dpar,danc,dpos);
         if(g_time){ float ms=tstop(); if(wsingle++){ g_t_single+=ms; g_n_single++; } }   // 첫 호출 warmup 스킵
-        std::vector<float> vlh((size_t)Nnodes*V); CK(cudaMemcpy(vlh.data(),vl,vlh.size()*4,cudaMemcpyDeviceToHost));
+        std::vector<float> vlh((size_t)Nn*V); CK(cudaMemcpy(vlh.data(),vl,vlh.size()*4,cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(hpn.data(),vpn,hpn.size()*4,cudaMemcpyDeviceToHost));
         cudaFree(dpar);cudaFree(danc);cudaFree(dpos);
         std::vector<int> path; int plen,node,next_cur; accept_path(vlh,tok,par,path,plen,node,next_cur);
@@ -220,9 +223,13 @@ static std::vector<int> solo_spec(const std::vector<int>& prompt){
     return out;
 }
 
-// ── batch spec 전체 (2 요청) → 각 생성 시퀀스. verify만 qwen35_verify_batch(concat), 나머지 solo와 동일 ──
+// ── batch spec 전체 (2 요청, ragged: 슬롯 A=(K,W), B=(K2,W2)) → 각 생성 시퀀스. verify만 qwen35_verify_batch(concat) ──
 static std::pair<std::vector<int>,std::vector<int>> batch_spec(const std::vector<int>& pA, const std::vector<int>& pB){
     const int B=2;
+    const int Kb[2]={K,K2}, Wb[2]={W,W2};
+    const int Nb[2]={K+W, K2+W2};                        // 슬롯별 트리 크기(ragged)
+    const int off[3]={0, Nb[0], Nb[0]+Nb[1]};            // prefix-offset(concat 행 시작)
+    const int M=off[2];                                  // concat 총 행수
     std::vector<std::vector<int>> prompt={pA,pB};
     // 슬롯별 상태
     std::vector<DecodeState> st(B); std::vector<MtpKV> kv(B); std::vector<float*> h_cur(B);
@@ -232,7 +239,7 @@ static std::pair<std::vector<int>,std::vector<int>> batch_spec(const std::vector
         int P=prompt[b].size();
         st[b]=alloc_decode_state(c,maxlen);
         CK(cudaMalloc(&kv[b].Kc,(size_t)maxlen*NKV*HD*4)); CK(cudaMalloc(&kv[b].Vc,(size_t)maxlen*NKV*HD*4)); kv[b].n=0;
-        va[b]=alloc_verify_artifacts(c,Nnodes); hpn[b].resize((size_t)Nnodes*H);
+        va[b]=alloc_verify_artifacts(c,Nb[b]); hpn[b].resize((size_t)Nb[b]*H);
         int*d_tok; CK(cudaMalloc(&d_tok,maxlen*4)); CK(cudaMemcpy(d_tok,prompt[b].data(),P*4,cudaMemcpyHostToDevice));
         float *dl,*dpn; CK(cudaMalloc(&dl,(size_t)P*V*4)); CK(cudaMalloc(&dpn,(size_t)P*H*4));
         qwen35_decode(c,w,st[b],d_tok,P,d_cos,d_sin,dl,nullptr,1,nullptr,bq4,dpn);
@@ -243,53 +250,53 @@ static std::pair<std::vector<int>,std::vector<int>> batch_spec(const std::vector
         cudaFree(dl);cudaFree(dpn);cudaFree(d_tok);
     }
     float *d_own; CK(cudaMalloc(&d_own,(size_t)H*4));
-    float *vl,*vpn; CK(cudaMalloc(&vl,(size_t)B*Nnodes*V*4)); CK(cudaMalloc(&vpn,(size_t)B*Nnodes*H*4));
-    int *d_tokb; CK(cudaMalloc(&d_tokb,(size_t)B*Nnodes*4));
+    float *vl,*vpn; CK(cudaMalloc(&vl,(size_t)M*V*4)); CK(cudaMalloc(&vpn,(size_t)M*H*4));
+    int *d_tokb; CK(cudaMalloc(&d_tokb,(size_t)M*4));
     int *d_parb,*d_posb; unsigned *d_ancb;
-    CK(cudaMalloc(&d_parb,(size_t)B*Nnodes*4)); CK(cudaMalloc(&d_posb,(size_t)B*Nnodes*4)); CK(cudaMalloc(&d_ancb,(size_t)B*Nnodes*4));
+    CK(cudaMalloc(&d_parb,(size_t)M*4)); CK(cudaMalloc(&d_posb,(size_t)M*4)); CK(cudaMalloc(&d_ancb,(size_t)M*4));
     DecodeState* sts[2]={ &st[0], &st[1] };
 
-    // 사이클: 두 슬롯 모두 N 도달까지. (같은 Nnodes, 슬롯별 독립 전진 — Phase1은 매 사이클 두 슬롯 다 draft/verify.)
+    // 사이클: 두 슬롯 모두 N 도달까지. (ragged: 슬롯별 Nb[b], concat 행은 off[b]부터 — 슬롯별 독립 전진.)
     // 슬롯 draft 상태 보관(사이클 내)
     std::vector<std::vector<int>> tokS(B),parS(B),posS(B); std::vector<std::vector<unsigned>> ancS(B);
     std::vector<std::vector<float*>> ownsS(B); std::vector<int> baseS(B), mnS(B);
     std::vector<char> done(B,0);   // out[b]>=N이면 freeze(더 이상 draft/promote 안 함 — n_past 고정, solo와 동일 종료).
     while(out[0].size()<(size_t)N || out[1].size()<(size_t)N){
-        std::vector<int> tokc(B*Nnodes),parc(B*Nnodes),posc(B*Nnodes); std::vector<unsigned> ancc(B*Nnodes); std::vector<int> base_b(B);
+        std::vector<int> tokc(M),parc(M),posc(M); std::vector<unsigned> ancc(M); std::vector<int> base_b(B);
         for(int b=0;b<B;b++){
             if(done[b]){
                 // freeze: 직전 tree 재사용(base 고정, MtpKV 불변). 배치 2-wide 유지용 harmless 행. promote/collect 안 함.
                 base_b[b]=baseS[b];   // 마지막 draft 시점 base 그대로(verify는 그 위치에 재기록 — 무해)
-                for(int i=0;i<Nnodes;i++){ tokc[b*Nnodes+i]=tokS[b][i]; parc[b*Nnodes+i]=parS[b][i]; posc[b*Nnodes+i]=posS[b][i]; ancc[b*Nnodes+i]=ancS[b][i]; }
+                for(int i=0;i<Nb[b];i++){ tokc[off[b]+i]=tokS[b][i]; parc[off[b]+i]=parS[b][i]; posc[off[b]+i]=posS[b][i]; ancc[off[b]+i]=ancS[b][i]; }
                 continue;
             }
             mnS[b]=kv[b].n; baseS[b]=st[b].n_past; base_b[b]=st[b].n_past;
-            draft_tree(kv[b],cur[b],h_cur[b],baseS[b], tokS[b],parS[b],posS[b],ancS[b], ownsS[b]);
-            for(int i=0;i<Nnodes;i++){ tokc[b*Nnodes+i]=tokS[b][i]; parc[b*Nnodes+i]=parS[b][i]; posc[b*Nnodes+i]=posS[b][i]; ancc[b*Nnodes+i]=ancS[b][i]; }
+            draft_tree(kv[b],cur[b],h_cur[b],baseS[b], Kb[b],Wb[b], tokS[b],parS[b],posS[b],ancS[b], ownsS[b]);
+            for(int i=0;i<Nb[b];i++){ tokc[off[b]+i]=tokS[b][i]; parc[off[b]+i]=parS[b][i]; posc[off[b]+i]=posS[b][i]; ancc[off[b]+i]=ancS[b][i]; }
         }
-        CK(cudaMemcpy(d_tokb,tokc.data(),(size_t)B*Nnodes*4,cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(d_parb,parc.data(),(size_t)B*Nnodes*4,cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(d_posb,posc.data(),(size_t)B*Nnodes*4,cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(d_ancb,ancc.data(),(size_t)B*Nnodes*4,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_tokb,tokc.data(),(size_t)M*4,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_parb,parc.data(),(size_t)M*4,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_posb,posc.data(),(size_t)M*4,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ancb,ancc.data(),(size_t)M*4,cudaMemcpyHostToDevice));
         VerifyArtifacts vab[2]={va[0],va[1]};
-        // ★한 forward로 2슬롯 verify
+        // ★한 forward로 2슬롯 verify (ragged Nnodes_b)
         static int wbatch=0;
         if(g_time) tstart();
-        qwen35_verify_batch(c,w,sts,d_tokb,B,Nnodes,base_b.data(),d_cos,d_sin,vl,vpn,vab,bq4,d_parb,d_ancb,d_posb);
+        qwen35_verify_batch(c,w,sts,d_tokb,B,Nb,base_b.data(),d_cos,d_sin,vl,vpn,vab,bq4,d_parb,d_ancb,d_posb);
         if(g_time){ float ms=tstop(); if(wbatch++){ g_t_batch+=ms; g_n_batch++; } }   // 첫 호출 warmup 스킵
-        std::vector<float> vlh((size_t)B*Nnodes*V); CK(cudaMemcpy(vlh.data(),vl,vlh.size()*4,cudaMemcpyDeviceToHost));
-        std::vector<float> vpnh((size_t)B*Nnodes*H); CK(cudaMemcpy(vpnh.data(),vpn,vpnh.size()*4,cudaMemcpyDeviceToHost));
+        std::vector<float> vlh((size_t)M*V); CK(cudaMemcpy(vlh.data(),vl,vlh.size()*4,cudaMemcpyDeviceToHost));
+        std::vector<float> vpnh((size_t)M*H); CK(cudaMemcpy(vpnh.data(),vpn,vpnh.size()*4,cudaMemcpyDeviceToHost));
         // 슬롯별 accept + promote + catchup (finished slot은 skip)
         for(int b=0;b<B;b++){
             if(done[b]) continue;
-            // 슬롯 b logits/prenorm sub-view(행 b*Nnodes..)
-            std::vector<float> vlh_b(vlh.begin()+(size_t)b*Nnodes*V, vlh.begin()+(size_t)(b+1)*Nnodes*V);
-            std::copy(vpnh.begin()+(size_t)b*Nnodes*H, vpnh.begin()+(size_t)(b+1)*Nnodes*H, hpn[b].begin());
+            // 슬롯 b logits/prenorm sub-view(행 off[b]..off[b]+Nb[b])
+            std::vector<float> vlh_b(vlh.begin()+(size_t)off[b]*V, vlh.begin()+(size_t)(off[b]+Nb[b])*V);
+            std::copy(vpnh.begin()+(size_t)off[b]*H, vpnh.begin()+(size_t)(off[b]+Nb[b])*H, hpn[b].begin());
             std::vector<int> path; int plen,node,next_cur; accept_path(vlh_b,tokS[b],parS[b],path,plen,node,next_cur);
             int a=plen-1;
             out[b].push_back(cur[b]); for(int t=1;t<=a&&out[b].size()<(size_t)N;t++) out[b].push_back(tokS[b][path[t]]);
             // vpn 슬롯 b sub-buffer 포인터(h_cur 갱신용, node는 슬롯-로컬)
-            float* d_vpn_b = vpn+(size_t)b*Nnodes*H;
+            float* d_vpn_b = vpn+(size_t)off[b]*H;
             promote_and_catchup(st[b],va[b],kv[b],mnS[b],baseS[b],cur[b],tokS[b],path,plen,h_cur[b],hpn[b],node,d_vpn_b,d_own);
             cur[b]=next_cur;
             for(float*p:ownsS[b])cudaFree(p);
@@ -306,12 +313,13 @@ int main(int argc,char**argv){
     WD=argc>1?argv[1]:"artifacts/qwen35-0.8b/weights"; GD=(argc>2?argv[2]:"artifacts/qwen35-0.8b/mtp_golden")+std::string("/");
     N=argc>3?atoi(argv[3]):24, K=argc>4?atoi(argv[4]):4, W=argc>5?atoi(argv[5]):3;
     int uq=argc>6?atoi(argv[6]):0;
+    K2=argc>7?atoi(argv[7]):K; W2=argc>8?atoi(argv[8]):W;   // ragged: 슬롯 B 트리 형상(기본=A와 동일=uniform)
     g_time=(getenv("TIME")&&atoi(getenv("TIME"))>0)?1:0;   // 곱 측정 모드
     bq4=uq; dq4=0; int mq4=0;             // body precision=uq(0 fp32/2 W4A8). draft/mtp fp32(정확성 게이트 목적).
     c=load_config_qwen((WD+"/manifest.json").c_str());
     H=c.hidden_size; V=c.vocab_size; rot=c.rotary_dim; NKV=c.num_kv_heads; HD=c.head_dim;
     std::vector<int> ids=ri("token_ids.bin");
-    Nnodes=K+W;
+    Nnodes=K+W; Nnodes2=K2+W2;
     struct Scen{ const char*name; std::vector<int> A,B; };
     std::vector<Scen> scens;
     { std::vector<int> a(ids.begin(),ids.begin()+5), b(ids.begin()+2,ids.begin()+10);
@@ -321,9 +329,9 @@ int main(int argc,char**argv){
     { std::vector<int> a(ids.begin()+1,ids.begin()+6), b(ids.begin(),ids.begin()+6);
       scens.push_back({"S3 A=5 B=6(겹침)",a,b}); }
 
-    printf("[batchspec2] uq=%d(0=fp32,2=W4A8) N=%d K=%d W=%d Nnodes=%d | 시나리오 %zu개\n",uq,N,K,W,Nnodes,scens.size());
-    if(Nnodes>8) printf("  주의 nodes=%d>8 → W4A8 verify가 MMQ 경로(단독도 MMQ라 일치). ≤8 권장.\n",Nnodes);
-    maxlen=0; for(auto&s:scens) maxlen=std::max(maxlen,(int)std::max(s.A.size(),s.B.size())); maxlen += N+Nnodes+8;
+    printf("[batchspec2] uq=%d(0=fp32,2=W4A8) N=%d slotA(K=%d,W=%d,Nn=%d) slotB(K=%d,W=%d,Nn=%d)%s | 시나리오 %zu개\n",
+           uq,N,K,W,Nnodes,K2,W2,Nnodes2, Nnodes!=Nnodes2?" [RAGGED]":"", scens.size());
+    maxlen=0; for(auto&s:scens) maxlen=std::max(maxlen,(int)std::max(s.A.size(),s.B.size())); maxlen += N+std::max(Nnodes,Nnodes2)+8;
     if(maxlen>=128){ printf("need longer rope table (maxlen=%d)\n",maxlen); return 1; }
 
     std::vector<float> cl=rfg("rope_cos_long.bin",(size_t)128*rot), sl=rfg("rope_sin_long.bin",(size_t)128*rot);
@@ -334,7 +342,7 @@ int main(int argc,char**argv){
     int total_mism=0;
     for(size_t si=0; si<scens.size(); si++){
         auto&s=scens[si];
-        std::vector<int> soloA=solo_spec(s.A), soloB=solo_spec(s.B);
+        std::vector<int> soloA=solo_spec(s.A,K,W), soloB=solo_spec(s.B,K2,W2);   // 단독 spec = 각 슬롯 자기 트리 형상
         auto pr=batch_spec(s.A,s.B);
         std::vector<int>&batA=pr.first,&batB=pr.second;
         int mmA=0,mmB=0;
@@ -350,12 +358,13 @@ int main(int argc,char**argv){
     bool pass=(total_mism==0);
     printf("\n[test_batchspec2] uq=%d total_mism=%d → %s\n",uq,total_mism,pass?"PASS":"FAIL");
     if(g_time && g_n_single>0 && g_n_batch>0){
-        const int Bg=2;                                            // Phase 1 = 고정 2요청
-        double as=g_t_single/g_n_single, ab=g_t_batch/g_n_batch;   // single=1슬롯 forward, batch=B슬롯 1 forward
+        const int Bg=2;                                            // 고정 2요청
+        double as=g_t_single/g_n_single, ab=g_t_batch/g_n_batch;   // single=1슬롯 forward(A/B 혼합 평균), batch=B슬롯 1 forward
         double prod=(double)Bg*as/ab;                              // 곱: single B번 vs batched 1번의 forward 시간비
-        printf("[곱 측정] verify forward 평균: single(M=%d,1슬롯)=%.3f ms(n=%ld), batched(M=%d,%d슬롯)=%.3f ms(n=%ld)\n",
-               Nnodes,as,g_n_single,Bg*Nnodes,Bg,ab,g_n_batch);
-        printf("[곱 측정] %d×single/batched = %.3f× (>1=곱 실현: weight 1운반이 %d슬롯 서빙, matmul 배칭 이득)\n",Bg,prod,Bg);
+        printf("[곱 측정] verify forward 평균: single(M=%d/%d 혼합,1슬롯)=%.3f ms(n=%ld), batched(M=%d,%d슬롯)=%.3f ms(n=%ld)\n",
+               Nnodes,Nnodes2,as,g_n_single,Nnodes+Nnodes2,Bg,ab,g_n_batch);
+        printf("[곱 측정] %d×single/batched = %.3f× (>1=곱 실현: weight 1운반이 %d슬롯 서빙%s)\n",Bg,prod,Bg,
+               Nnodes!=Nnodes2?"; ragged라 single 평균은 A/B 혼합=근사":"");
     }
     free_weights_qwen(w); free_config_qwen(c);
     cudaFree(d_cos);cudaFree(d_sin);
