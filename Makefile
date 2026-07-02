@@ -79,6 +79,11 @@ tests/test_cbatch_prod: tests/test_cbatch_prod.cu models/qwen35.cu models/qwen35
 tools/bench_serve: tools/bench_serve.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_serve.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
+# 챕터10 축2: spec-serving 벤치(연속배칭+슬롯별 spec 사이클, ragged verify_batch). ISO=1 iso게이트, TIME=1 곱 B버킷.
+#   사용법: ./tools/bench_serve_spec [w] [g] [uq] [Bmax] [nreq] [seed] [K] [W] [λ...]
+tools/bench_serve_spec: tools/bench_serve_spec.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_serve_spec.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
+
 # SMAX 8→16 iso 게이트: batch decode(B=12 SB16, B=16 gemm_batch) == single. 사용법: ./tests/test_sb16_iso [w] [g] [uq]
 tests/test_sb16_iso: tests/test_sb16_iso.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_sb16_iso.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
