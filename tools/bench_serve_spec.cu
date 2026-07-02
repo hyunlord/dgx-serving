@@ -577,9 +577,10 @@ int main(int argc,char**argv){
     int iso=(getenv("ISO")&&atoi(getenv("ISO"))>0)?1:0;
     dq4=(uq!=0)?1:0; if(getenv("DQ4")) dq4=atoi(getenv("DQ4"));   // draft lm_head=q4 기본(uq!=0) — 27b untied embed서 필수(E-as-lmhead=accept 붕괴)
     int pmax=getenv("PMAX")?atoi(getenv("PMAX")):32;
+    int trials=(getenv("TRIALS")&&atoi(getenv("TRIALS"))>0)?1:0;   // warm 서버 모드(오토튜닝): 모델 1회 로드, stdin에서 trial 반복
     c=load_config_qwen((WD+"/manifest.json").c_str());
     H=c.hidden_size; V=c.vocab_size; rot=c.rotary_dim; NKV=c.num_kv_heads; HD=c.head_dim;
-    maxlen=pmax+192+K+Nn+16; if(maxlen<288) maxlen=288;
+    maxlen=pmax+192+(trials?8+13:K+Nn)+16; if(maxlen<288) maxlen=288;   // TRIALS: 최악 형상(K8,Nn13) 기준 고정(형상 갱신에도 rope/KV 안전)
     static std::vector<int> ids=ri("token_ids.bin"); IDS=&ids;
     // rope: ext 테이블 우선(bench_serve와 동일)
     std::vector<float> cl,sl;
@@ -633,6 +634,22 @@ int main(int argc,char**argv){
     }
 
     { auto tr=gen_trace(4.0,12,seed,pmax); run_spec_continuous(tr,Bmax); }   // warm-up
+    if(trials){
+        // warm 서버: stdin 한 줄 = "Bmax K W lam nreq seed" → 측정 1회 → "TRIAL tok/s tpot95 accept avgB" 출력.
+        // 상태: DecodeState/MtpKV/VA는 요청 수명(run 내 할당·해제), 워크스페이스는 용량-단조 재사용(row-독립) —
+        //   trial 간 오염 없음(같은 라인 재실행 bit-exact 동일로 게이트). 형상(K/W/Nn)은 전역 갱신, maxlen은 최악 고정.
+        printf("TRIALS_READY\n");
+        char line[256];
+        while(fgets(line,sizeof line,stdin)){
+            int b,k,ww,nr; unsigned sd; double lm;
+            if(sscanf(line,"%d %d %d %lf %d %u",&b,&k,&ww,&lm,&nr,&sd)!=6){ printf("TRIAL_ERR parse\n"); continue; }
+            K=k; W=ww; Nn=K+W;
+            auto tr=gen_trace(lm,nr,sd,pmax);
+            Stats S=run_spec_continuous(tr,b);
+            printf("TRIAL %.1f %.4f %.2f %.2f\n",S.thru_tok,S.tpot95,S.acc_n?S.acc_sum/S.acc_n:0,S.avgB);
+        }
+        return 0;
+    }
     printf("\n  === spec-serving 부하 스윕 (warm-up 20%% 제외, seed 고정 trace — bench_serve와 동일 프로토콜) ===\n");
     printf("  %-6s %-4s | %8s %8s | %7s %7s %7s | %7s %7s | %5s %5s | %6s\n",
            "mode","λ","req/s","tok/s","e2e50","e2e95","e2e99","ttft95","tpot95","avgB","maxQ","accept");

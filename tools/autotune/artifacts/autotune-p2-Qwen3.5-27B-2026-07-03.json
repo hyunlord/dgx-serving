@@ -1,0 +1,2579 @@
+{
+ "schema": "dgx-serving/autotune-config@2",
+ "created": "2026-07-03T00:39:17",
+ "device_profile": {
+  "name": "GB10 (DGX Spark, sm_121)",
+  "arch": "sm_121",
+  "compile_arch": "sm_120",
+  "bandwidth_gbps": 273,
+  "unified_memory": true,
+  "mem_total_gb": 128,
+  "mem_probe": "max(cudaMemGetInfo.free, /proc/meminfo MemAvailable)",
+  "mem_guard_margin": 0.7,
+  "toolkit": {
+   "cuda_version": "13.0",
+   "cp_async": true,
+   "mma_int8": true,
+   "fp4_mma": false,
+   "fp4_blocked_reason": "ptxas PTX 9.0 cannot emit mxf4 (needs >=9.2)"
+  }
+ },
+ "model_profile": {
+  "name": "Qwen3.5-27B",
+  "weights_dir": "artifacts/qwen35-27b/weights",
+  "golden_dir": "artifacts/qwen35-27b/mtp_golden",
+  "uq": 2,
+  "params_b": 27,
+  "gdn": true,
+  "tied_lm_head": false,
+  "moe": false,
+  "quant": "w4a8",
+  "num_layers": 64,
+  "full_attention_interval": 4,
+  "num_kv_heads": 4,
+  "head_dim": 256,
+  "linear_num_key_heads": 16,
+  "linear_num_value_heads": 48,
+  "linear_key_head_dim": 128,
+  "linear_value_head_dim": 128,
+  "linear_conv_kernel": 4,
+  "pmax_default": 32
+ },
+ "objective": {
+  "lam": 4.0,
+  "nreq": 40,
+  "seed": 42,
+  "tpot_cap": 0.35,
+  "metric": "tok_s - 100*max(0,tpot95-cap)",
+  "phase2_axes": [
+   "MTP_Q4",
+   "DRAFT_GEMV",
+   "DRAFT_SEQ"
+  ],
+  "excluded_axes": {
+   "compile_time": [
+    "SMAX",
+    "GdnStateT",
+    "MMQ tile"
+   ],
+   "no_knob": [
+    "chunk size",
+    "canonical M boundary",
+    "splitk gate"
+   ],
+   "not_in_spec_path": [
+    "BM16",
+    "SPLITK"
+   ],
+   "known_degenerate": [
+    "DQ4=0 (27b accept collapse)"
+   ]
+  }
+ },
+ "candidates": [
+  {
+   "rank": 1,
+   "trial": 91,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "scheme_env": {
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "objective_measured": {
+    "tok_s": 52.5,
+    "tpot95": 0.3578,
+    "accept": 4.2,
+    "avgB": 11.11
+   },
+   "alt_seed": {
+    "seed": 777,
+    "tok_s": 51.7,
+    "tpot95": 0.3525,
+    "accept": 4.39
+   },
+   "nreq60": {
+    "tok_s": 50.2,
+    "tpot95": 0.3427,
+    "accept": 4.22,
+    "avgB": 10.93
+   },
+   "iso": "[ISO] 12/12 요청 bit-identical → PASS",
+   "iso_pass": true,
+   "cyc": [
+    "[CYC] draft 15.6%(2.48s) | verify 74.3%(11.84s) | accept·host 5.7%(0.91s) | catchup 4.4%(0.71s) | tail 0.0%(0.00s) — 사이클합 15.94s, 41스텝",
+    "[CYC] draft 16.1%(5.31s) | verify 70.3%(23.16s) | accept·host 9.0%(2.97s) | catchup 4.6%(1.52s) | tail 0.0%(0.00s) — 사이클합 32.96s, 54스텝"
+   ]
+  },
+  {
+   "rank": 2,
+   "trial": 53,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "scheme_env": {
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "objective_measured": {
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "accept": 4.37,
+    "avgB": 11.1
+   },
+   "alt_seed": {
+    "seed": 777,
+    "tok_s": 50.0,
+    "tpot95": 0.364,
+    "accept": 4.52
+   },
+   "nreq60": {
+    "tok_s": 50.4,
+    "tpot95": 0.3526,
+    "accept": 4.41,
+    "avgB": 10.95
+   },
+   "iso": "[ISO] 12/12 요청 bit-identical → PASS",
+   "iso_pass": true,
+   "cyc": [
+    "[CYC] draft 18.1%(2.85s) | verify 71.5%(11.23s) | accept·host 5.6%(0.87s) | catchup 4.9%(0.76s) | tail 0.0%(0.00s) — 사이클합 15.72s, 40스텝",
+    "[CYC] draft 18.5%(6.18s) | verify 68.0%(22.72s) | accept·host 8.6%(2.87s) | catchup 4.9%(1.62s) | tail 0.0%(0.00s) — 사이클합 33.40s, 55스텝"
+   ]
+  },
+  {
+   "rank": 3,
+   "trial": 37,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "scheme_env": {
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "objective_measured": {
+    "tok_s": 49.9,
+    "tpot95": 0.3157,
+    "accept": 4.2,
+    "avgB": 9.57
+   },
+   "alt_seed": {
+    "seed": 777,
+    "tok_s": 49.1,
+    "tpot95": 0.3012,
+    "accept": 4.39
+   },
+   "nreq60": {
+    "tok_s": 48.8,
+    "tpot95": 0.3089,
+    "accept": 4.22,
+    "avgB": 10.08
+   },
+   "iso": "[ISO] 12/12 요청 bit-identical → PASS",
+   "iso_pass": true,
+   "cyc": [
+    "[CYC] draft 15.5%(2.46s) | verify 74.3%(11.83s) | accept·host 5.8%(0.92s) | catchup 4.4%(0.71s) | tail 0.0%(0.00s) — 사이클합 15.92s, 41스텝",
+    "[CYC] draft 16.3%(5.55s) | verify 70.0%(23.75s) | accept·host 9.0%(3.04s) | catchup 4.7%(1.60s) | tail 0.0%(0.00s) — 사이클합 33.93s, 58스텝"
+   ]
+  }
+ ],
+ "param_importance": {
+  "DRAFT_SEQ": 0.3302,
+  "bmax": 0.3095,
+  "DRAFT_GEMV": 0.1913,
+  "MTP_Q4": 0.1252,
+  "K": 0.0297,
+  "W": 0.0141
+ },
+ "trials": [
+  {
+   "n": 0,
+   "params": {
+    "bmax": 4,
+    "K": 7,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 16.9,
+   "attrs": {
+    "accept": 4.64,
+    "avgB": 3.79,
+    "mem_need_gb": 6.83,
+    "tok_s": 16.9,
+    "tpot95": 0.2748,
+    "wall_s": 149.1
+   }
+  },
+  {
+   "n": 1,
+   "params": {
+    "bmax": 10,
+    "K": 7,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 18.99,
+   "attrs": {
+    "accept": 4.7,
+    "avgB": 7.84,
+    "mem_need_gb": 20.14,
+    "tok_s": 29.8,
+    "tpot95": 0.4581,
+    "wall_s": 90.6
+   }
+  },
+  {
+   "n": 2,
+   "params": {
+    "bmax": 16,
+    "K": 3,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 3,
+   "params": {
+    "bmax": 14,
+    "K": 7,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -36.160000000000004,
+   "attrs": {
+    "accept": 4.64,
+    "avgB": 11.16,
+    "mem_need_gb": 23.91,
+    "tok_s": 20.4,
+    "tpot95": 0.9156,
+    "wall_s": 132.9
+   }
+  },
+  {
+   "n": 4,
+   "params": {
+    "bmax": 14,
+    "K": 4,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 5,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -20.090000000000003,
+   "attrs": {
+    "accept": 4.14,
+    "avgB": 11.13,
+    "mem_need_gb": 23.91,
+    "tok_s": 22.0,
+    "tpot95": 0.7709,
+    "wall_s": 123.3
+   }
+  },
+  {
+   "n": 6,
+   "params": {
+    "bmax": 8,
+    "K": 3,
+    "W": 1,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 7,
+   "params": {
+    "bmax": 8,
+    "K": 6,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 8,
+   "params": {
+    "bmax": 8,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 44.9,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 6.75,
+    "mem_need_gb": 12.44,
+    "tok_s": 44.9,
+    "tpot95": 0.2251,
+    "wall_s": 60.2
+   }
+  },
+  {
+   "n": 9,
+   "params": {
+    "bmax": 8,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 32.9,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 6.75,
+    "mem_need_gb": 12.44,
+    "tok_s": 32.9,
+    "tpot95": 0.3106,
+    "wall_s": 81.7
+   }
+  },
+  {
+   "n": 10,
+   "params": {
+    "bmax": 6,
+    "K": 3,
+    "W": 4,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 11,
+   "params": {
+    "bmax": 6,
+    "K": 6,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 37.6,
+   "attrs": {
+    "accept": 4.43,
+    "avgB": 5.36,
+    "mem_need_gb": 11.16,
+    "tok_s": 37.6,
+    "tpot95": 0.2064,
+    "wall_s": 70.9
+   }
+  },
+  {
+   "n": 12,
+   "params": {
+    "bmax": 6,
+    "K": 5,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 39.6,
+   "attrs": {
+    "accept": 4.22,
+    "avgB": 5.5,
+    "mem_need_gb": 10.25,
+    "tok_s": 39.6,
+    "tpot95": 0.1726,
+    "wall_s": 67.9
+   }
+  },
+  {
+   "n": 13,
+   "params": {
+    "bmax": 14,
+    "K": 4,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 48.19,
+   "attrs": {
+    "accept": 3.78,
+    "avgB": 10.72,
+    "mem_need_gb": 21.77,
+    "tok_s": 49.6,
+    "tpot95": 0.3641,
+    "wall_s": 55.5
+   }
+  },
+  {
+   "n": 14,
+   "params": {
+    "bmax": 16,
+    "K": 5,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 39.19,
+   "attrs": {
+    "accept": 4.22,
+    "avgB": 11.86,
+    "mem_need_gb": 27.32,
+    "tok_s": 48.2,
+    "tpot95": 0.4401,
+    "wall_s": 57.4
+   }
+  },
+  {
+   "n": 15,
+   "params": {
+    "bmax": 12,
+    "K": 3,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 16,
+   "params": {
+    "bmax": 12,
+    "K": 4,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 41.6,
+   "attrs": {
+    "accept": 3.78,
+    "avgB": 9.77,
+    "mem_need_gb": 18.66,
+    "tok_s": 41.6,
+    "tpot95": 0.3419,
+    "wall_s": 65.7
+   }
+  },
+  {
+   "n": 17,
+   "params": {
+    "bmax": 12,
+    "K": 4,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 18,
+   "params": {
+    "bmax": 14,
+    "K": 4,
+    "W": 1,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 19,
+   "params": {
+    "bmax": 12,
+    "K": 8,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 34.32999999999999,
+   "attrs": {
+    "accept": 4.81,
+    "avgB": 9.29,
+    "mem_need_gb": 24.16,
+    "tok_s": 41.3,
+    "tpot95": 0.4197,
+    "wall_s": 65.7
+   }
+  },
+  {
+   "n": 20,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 21,
+   "params": {
+    "bmax": 10,
+    "K": 4,
+    "W": 4,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 22,
+   "params": {
+    "bmax": 14,
+    "K": 4,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 40.18,
+   "attrs": {
+    "accept": 3.78,
+    "avgB": 11.21,
+    "mem_need_gb": 21.77,
+    "tok_s": 43.6,
+    "tpot95": 0.3842,
+    "wall_s": 62.9
+   }
+  },
+  {
+   "n": 23,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 4,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -16.380000000000003,
+   "attrs": {
+    "accept": 4.51,
+    "avgB": 9.64,
+    "mem_need_gb": 20.49,
+    "tok_s": 21.5,
+    "tpot95": 0.7288,
+    "wall_s": 126.2
+   }
+  },
+  {
+   "n": 24,
+   "params": {
+    "bmax": 16,
+    "K": 3,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 25,
+   "params": {
+    "bmax": 4,
+    "K": 5,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 17.9,
+   "attrs": {
+    "accept": 4.14,
+    "avgB": 3.85,
+    "mem_need_gb": 6.83,
+    "tok_s": 17.9,
+    "tpot95": 0.2399,
+    "wall_s": 140.4
+   }
+  },
+  {
+   "n": 26,
+   "params": {
+    "bmax": 10,
+    "K": 6,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 36.9,
+   "attrs": {
+    "accept": 4.41,
+    "avgB": 7.9,
+    "mem_need_gb": 18.61,
+    "tok_s": 36.9,
+    "tpot95": 0.3001,
+    "wall_s": 73.3
+   }
+  },
+  {
+   "n": 27,
+   "params": {
+    "bmax": 14,
+    "K": 4,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -13.440000000000008,
+   "attrs": {
+    "accept": 3.78,
+    "avgB": 11.21,
+    "mem_need_gb": 21.77,
+    "tok_s": 23.3,
+    "tpot95": 0.7174,
+    "wall_s": 116.6
+   }
+  },
+  {
+   "n": 28,
+   "params": {
+    "bmax": 6,
+    "K": 5,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 29,
+   "params": {
+    "bmax": 4,
+    "K": 7,
+    "W": 1,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 30,
+   "params": {
+    "bmax": 4,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 28.5,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 3.83,
+    "mem_need_gb": 6.22,
+    "tok_s": 28.5,
+    "tpot95": 0.1558,
+    "wall_s": 88.5
+   }
+  },
+  {
+   "n": 31,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 30.740000000000002,
+   "attrs": {
+    "accept": 4.14,
+    "avgB": 11.13,
+    "mem_need_gb": 23.91,
+    "tok_s": 40.2,
+    "tpot95": 0.4446,
+    "wall_s": 68.2
+   }
+  },
+  {
+   "n": 32,
+   "params": {
+    "bmax": 12,
+    "K": 4,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 41.6,
+   "attrs": {
+    "accept": 3.78,
+    "avgB": 9.77,
+    "cached": true,
+    "mem_need_gb": 18.66,
+    "tok_s": 41.6,
+    "tpot95": 0.3419,
+    "wall_s": 65.7
+   }
+  },
+  {
+   "n": 33,
+   "params": {
+    "bmax": 10,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 46.0,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 7.83,
+    "mem_need_gb": 15.55,
+    "tok_s": 46.0,
+    "tpot95": 0.2785,
+    "wall_s": 58.9
+   }
+  },
+  {
+   "n": 34,
+   "params": {
+    "bmax": 14,
+    "K": 3,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 35,
+   "params": {
+    "bmax": 10,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 46.0,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 7.83,
+    "cached": true,
+    "mem_need_gb": 15.55,
+    "tok_s": 46.0,
+    "tpot95": 0.2785,
+    "wall_s": 58.9
+   }
+  },
+  {
+   "n": 36,
+   "params": {
+    "bmax": 10,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 46.0,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 7.83,
+    "cached": true,
+    "mem_need_gb": 15.55,
+    "tok_s": 46.0,
+    "tpot95": 0.2785,
+    "wall_s": 58.9
+   }
+  },
+  {
+   "n": 37,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 9.57,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3157,
+    "wall_s": 54.9
+   }
+  },
+  {
+   "n": 38,
+   "params": {
+    "bmax": 6,
+    "K": 8,
+    "W": 1,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 27.4,
+   "attrs": {
+    "accept": 4.58,
+    "avgB": 5.46,
+    "mem_need_gb": 9.33,
+    "tok_s": 27.4,
+    "tpot95": 0.3338,
+    "wall_s": 96.8
+   }
+  },
+  {
+   "n": 39,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 40,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 48.4,
+   "attrs": {
+    "accept": 4.22,
+    "avgB": 9.83,
+    "mem_need_gb": 20.49,
+    "tok_s": 48.4,
+    "tpot95": 0.3298,
+    "wall_s": 56.7
+   }
+  },
+  {
+   "n": 41,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 48.5,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 9.52,
+    "mem_need_gb": 20.49,
+    "tok_s": 48.5,
+    "tpot95": 0.3359,
+    "wall_s": 56.5
+   }
+  },
+  {
+   "n": 42,
+   "params": {
+    "bmax": 16,
+    "K": 6,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -5.690000000000005,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 11.73,
+    "mem_need_gb": 27.32,
+    "tok_s": 30.9,
+    "tpot95": 0.7159,
+    "wall_s": 88.1
+   }
+  },
+  {
+   "n": 43,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 7.440000000000001,
+   "attrs": {
+    "accept": 4.43,
+    "avgB": 9.84,
+    "mem_need_gb": 22.33,
+    "tok_s": 29.1,
+    "tpot95": 0.5666,
+    "wall_s": 93.4
+   }
+  },
+  {
+   "n": 44,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 12.319999999999993,
+   "attrs": {
+    "accept": 4.43,
+    "avgB": 9.84,
+    "mem_need_gb": 22.33,
+    "tok_s": 30.8,
+    "tpot95": 0.5348,
+    "wall_s": 88.4
+   }
+  },
+  {
+   "n": 45,
+   "params": {
+    "bmax": 6,
+    "K": 8,
+    "W": 4,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 9.430000000000001,
+   "attrs": {
+    "accept": 4.93,
+    "avgB": 5.36,
+    "mem_need_gb": 12.08,
+    "tok_s": 18.6,
+    "tpot95": 0.4417,
+    "wall_s": 143.8
+   }
+  },
+  {
+   "n": 46,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 37.739999999999995,
+   "attrs": {
+    "accept": 4.43,
+    "avgB": 11.17,
+    "mem_need_gb": 26.05,
+    "tok_s": 45.4,
+    "tpot95": 0.4266,
+    "wall_s": 60.8
+   }
+  },
+  {
+   "n": 47,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 39.83,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 11.15,
+    "mem_need_gb": 21.77,
+    "tok_s": 45.3,
+    "tpot95": 0.4047,
+    "wall_s": 60.6
+   }
+  },
+  {
+   "n": 48,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 9.57,
+    "cached": true,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3157,
+    "wall_s": 54.9
+   }
+  },
+  {
+   "n": 49,
+   "params": {
+    "bmax": 6,
+    "K": 8,
+    "W": 1,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 0.909999999999993,
+   "attrs": {
+    "accept": 4.69,
+    "avgB": 5.52,
+    "mem_need_gb": 9.33,
+    "tok_s": 17.9,
+    "tpot95": 0.5199,
+    "wall_s": 147.3
+   }
+  },
+  {
+   "n": 50,
+   "params": {
+    "bmax": 16,
+    "K": 8,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -71.07,
+   "attrs": {
+    "accept": 4.99,
+    "avgB": 11.55,
+    "mem_need_gb": 34.67,
+    "tok_s": 19.4,
+    "tpot95": 1.2547,
+    "wall_s": 140.0
+   }
+  },
+  {
+   "n": 51,
+   "params": {
+    "bmax": 10,
+    "K": 5,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 44.5,
+   "attrs": {
+    "accept": 4.22,
+    "avgB": 7.82,
+    "mem_need_gb": 17.08,
+    "tok_s": 44.5,
+    "tpot95": 0.2874,
+    "wall_s": 60.9
+   }
+  },
+  {
+   "n": 52,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 9.79,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3264,
+    "wall_s": 54.9
+   }
+  },
+  {
+   "n": 53,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 54,
+   "params": {
+    "bmax": 12,
+    "K": 7,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.63,
+    "avgB": 9.53,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3364,
+    "wall_s": 54.3
+   }
+  },
+  {
+   "n": 55,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 56,
+   "params": {
+    "bmax": 12,
+    "K": 8,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 46.190000000000005,
+   "attrs": {
+    "accept": 4.81,
+    "avgB": 9.19,
+    "mem_need_gb": 20.49,
+    "tok_s": 47.1,
+    "tpot95": 0.3591,
+    "wall_s": 57.6
+   }
+  },
+  {
+   "n": 57,
+   "params": {
+    "bmax": 10,
+    "K": 6,
+    "W": 1,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 58,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 59,
+   "params": {
+    "bmax": 14,
+    "K": 7,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 9.18,
+   "attrs": {
+    "accept": 4.63,
+    "avgB": 11.04,
+    "mem_need_gb": 21.77,
+    "tok_s": 33.9,
+    "tpot95": 0.5972,
+    "wall_s": 79.7
+   }
+  },
+  {
+   "n": 60,
+   "params": {
+    "bmax": 12,
+    "K": 7,
+    "W": 1,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 61,
+   "params": {
+    "bmax": 14,
+    "K": 7,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 39.779999999999994,
+   "attrs": {
+    "accept": 4.59,
+    "avgB": 10.91,
+    "mem_need_gb": 23.91,
+    "tok_s": 47.3,
+    "tpot95": 0.4252,
+    "wall_s": 58.0
+   }
+  },
+  {
+   "n": 62,
+   "params": {
+    "bmax": 10,
+    "K": 6,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 63,
+   "params": {
+    "bmax": 12,
+    "K": 5,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 64,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 65,
+   "params": {
+    "bmax": 16,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 42.16,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.68,
+    "mem_need_gb": 24.88,
+    "tok_s": 50.5,
+    "tpot95": 0.4334,
+    "wall_s": 54.4
+   }
+  },
+  {
+   "n": 66,
+   "params": {
+    "bmax": 10,
+    "K": 7,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 45.0,
+   "attrs": {
+    "accept": 4.59,
+    "avgB": 7.91,
+    "mem_need_gb": 17.08,
+    "tok_s": 45.0,
+    "tpot95": 0.2956,
+    "wall_s": 60.2
+   }
+  },
+  {
+   "n": 67,
+   "params": {
+    "bmax": 4,
+    "K": 3,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 68,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 69,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 9.79,
+    "cached": true,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3264,
+    "wall_s": 54.9
+   }
+  },
+  {
+   "n": 70,
+   "params": {
+    "bmax": 10,
+    "K": 3,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 71,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 49.9,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 9.79,
+    "cached": true,
+    "mem_need_gb": 18.66,
+    "tok_s": 49.9,
+    "tpot95": 0.3264,
+    "wall_s": 54.9
+   }
+  },
+  {
+   "n": 72,
+   "params": {
+    "bmax": 10,
+    "K": 7,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 23.990000000000002,
+   "attrs": {
+    "accept": 4.59,
+    "avgB": 8.01,
+    "mem_need_gb": 17.08,
+    "tok_s": 31.5,
+    "tpot95": 0.4251,
+    "wall_s": 85.5
+   }
+  },
+  {
+   "n": 73,
+   "params": {
+    "bmax": 12,
+    "K": 6,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 74,
+   "params": {
+    "bmax": 10,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 39.3,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 7.74,
+    "mem_need_gb": 15.55,
+    "tok_s": 39.3,
+    "tpot95": 0.2792,
+    "wall_s": 68.7
+   }
+  },
+  {
+   "n": 75,
+   "params": {
+    "bmax": 10,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 24.25,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 8.02,
+    "mem_need_gb": 15.55,
+    "tok_s": 30.8,
+    "tpot95": 0.4155,
+    "wall_s": 87.4
+   }
+  },
+  {
+   "n": 76,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 77,
+   "params": {
+    "bmax": 4,
+    "K": 4,
+    "W": 1,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 78,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 79,
+   "params": {
+    "bmax": 16,
+    "K": 7,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -15.55,
+   "attrs": {
+    "accept": 4.63,
+    "avgB": 11.44,
+    "mem_need_gb": 24.88,
+    "tok_s": 30.7,
+    "tpot95": 0.8125,
+    "wall_s": 88.0
+   }
+  },
+  {
+   "n": 80,
+   "params": {
+    "bmax": 6,
+    "K": 8,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 26.2,
+   "attrs": {
+    "accept": 4.81,
+    "avgB": 5.48,
+    "mem_need_gb": 13.0,
+    "tok_s": 26.2,
+    "tpot95": 0.302,
+    "wall_s": 102.3
+   }
+  },
+  {
+   "n": 81,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 82,
+   "params": {
+    "bmax": 16,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 42.16,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.68,
+    "cached": true,
+    "mem_need_gb": 24.88,
+    "tok_s": 50.5,
+    "tpot95": 0.4334,
+    "wall_s": 54.4
+   }
+  },
+  {
+   "n": 83,
+   "params": {
+    "bmax": 4,
+    "K": 3,
+    "W": 5,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 84,
+   "params": {
+    "bmax": 16,
+    "K": 3,
+    "W": 1,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 85,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 86,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 41.010000000000005,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 10.95,
+    "mem_need_gb": 23.91,
+    "tok_s": 47.2,
+    "tpot95": 0.4119,
+    "wall_s": 58.2
+   }
+  },
+  {
+   "n": 87,
+   "params": {
+    "bmax": 16,
+    "K": 6,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 0.5399999999999991,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 11.73,
+    "mem_need_gb": 27.32,
+    "tok_s": 32.9,
+    "tpot95": 0.6736,
+    "wall_s": 82.9
+   }
+  },
+  {
+   "n": 88,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 89,
+   "params": {
+    "bmax": 4,
+    "K": 5,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 90,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 91,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.72,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 11.11,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.5,
+    "tpot95": 0.3578,
+    "wall_s": 52.5
+   }
+  },
+  {
+   "n": 92,
+   "params": {
+    "bmax": 14,
+    "K": 4,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 93,
+   "params": {
+    "bmax": 16,
+    "K": 4,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 94,
+   "params": {
+    "bmax": 16,
+    "K": 5,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 43.01,
+   "attrs": {
+    "accept": 4.2,
+    "avgB": 11.88,
+    "mem_need_gb": 24.88,
+    "tok_s": 50.6,
+    "tpot95": 0.4259,
+    "wall_s": 54.5
+   }
+  },
+  {
+   "n": 95,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 96,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 97,
+   "params": {
+    "bmax": 16,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -45.33,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 12.19,
+    "mem_need_gb": 24.88,
+    "tok_s": 21.5,
+    "tpot95": 1.0183,
+    "wall_s": 126.0
+   }
+  },
+  {
+   "n": 98,
+   "params": {
+    "bmax": 14,
+    "K": 7,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 39.779999999999994,
+   "attrs": {
+    "accept": 4.59,
+    "avgB": 10.91,
+    "cached": true,
+    "mem_need_gb": 23.91,
+    "tok_s": 47.3,
+    "tpot95": 0.4252,
+    "wall_s": 58.0
+   }
+  },
+  {
+   "n": 99,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 100,
+   "params": {
+    "bmax": 16,
+    "K": 5,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 101,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 102,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 103,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 104,
+   "params": {
+    "bmax": 16,
+    "K": 7,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 35.61,
+   "attrs": {
+    "accept": 4.59,
+    "avgB": 11.3,
+    "mem_need_gb": 27.32,
+    "tok_s": 48.0,
+    "tpot95": 0.4739,
+    "wall_s": 57.3
+   }
+  },
+  {
+   "n": 105,
+   "params": {
+    "bmax": 4,
+    "K": 3,
+    "W": 4,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 106,
+   "params": {
+    "bmax": 12,
+    "K": 8,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": -5.220000000000006,
+   "attrs": {
+    "accept": 4.81,
+    "avgB": 9.29,
+    "mem_need_gb": 24.16,
+    "tok_s": 26.4,
+    "tpot95": 0.6662,
+    "wall_s": 102.0
+   }
+  },
+  {
+   "n": 107,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 108,
+   "params": {
+    "bmax": 12,
+    "K": 8,
+    "W": 2,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.RUNNING",
+   "value": null,
+   "attrs": {
+    "mem_need_gb": 20.49
+   }
+  },
+  {
+   "n": 109,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 4,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 41.010000000000005,
+   "attrs": {
+    "accept": 4.44,
+    "avgB": 10.95,
+    "cached": true,
+    "mem_need_gb": 23.91,
+    "tok_s": 47.2,
+    "tpot95": 0.4119,
+    "wall_s": 58.2
+   }
+  },
+  {
+   "n": 110,
+   "params": {
+    "bmax": 4,
+    "K": 8,
+    "W": 5,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 26.5,
+   "attrs": {
+    "accept": 4.99,
+    "avgB": 3.78,
+    "mem_need_gb": 8.67,
+    "tok_s": 26.5,
+    "tpot95": 0.1829,
+    "wall_s": 95.4
+   }
+  },
+  {
+   "n": 111,
+   "params": {
+    "bmax": 16,
+    "K": 5,
+    "W": 2,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 112,
+   "params": {
+    "bmax": 6,
+    "K": 3,
+    "W": 1,
+    "MTP_Q4": "0",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 113,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 9.459999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "mem_need_gb": 21.77,
+    "tok_s": 32.5,
+    "tpot95": 0.5804,
+    "wall_s": 83.9
+   }
+  },
+  {
+   "n": 114,
+   "params": {
+    "bmax": 14,
+    "K": 5,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 115,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 116,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 117,
+   "params": {
+    "bmax": 4,
+    "K": 8,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "1"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 22.9,
+   "attrs": {
+    "accept": 4.83,
+    "avgB": 3.75,
+    "mem_need_gb": 7.44,
+    "tok_s": 22.9,
+    "tpot95": 0.2344,
+    "wall_s": 110.1
+   }
+  },
+  {
+   "n": 118,
+   "params": {
+    "bmax": 16,
+    "K": 6,
+    "W": 2,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.PRUNED",
+   "value": null,
+   "attrs": {
+    "pruned": "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)"
+   }
+  },
+  {
+   "n": 119,
+   "params": {
+    "bmax": 14,
+    "K": 6,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "0",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 51.209999999999994,
+   "attrs": {
+    "accept": 4.37,
+    "avgB": 11.1,
+    "cached": true,
+    "mem_need_gb": 21.77,
+    "tok_s": 52.3,
+    "tpot95": 0.3609,
+    "wall_s": 52.8
+   }
+  },
+  {
+   "n": 120,
+   "params": {
+    "bmax": 14,
+    "K": 7,
+    "W": 3,
+    "MTP_Q4": "1",
+    "DRAFT_GEMV": "1",
+    "DRAFT_SEQ": "0"
+   },
+   "state": "TrialState.COMPLETE",
+   "value": 1.7299999999999933,
+   "attrs": {
+    "accept": 4.59,
+    "avgB": 10.91,
+    "mem_need_gb": 23.91,
+    "tok_s": 31.6,
+    "tpot95": 0.6487,
+    "wall_s": 85.9
+   }
+  }
+ ]
+}

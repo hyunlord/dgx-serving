@@ -62,8 +62,10 @@ CSPEC_RE = re.compile(r"c-spec\s+(\S+)\s+\|\s+(\S+)\s+(\S+)\s+\|\s+(\S+)\s+(\S+)
 
 
 def run_bench(mp: dict, bmax: int, K: int, W: int, lam: float, nreq: int, seed: int,
-              iso: bool = False, cyc: bool = False, timeout_s: int = 900):
+              iso: bool = False, cyc: bool = False, timeout_s: int = 900, extra_env: dict = None):
     env = dict(os.environ, MTP_Q4="1")
+    if extra_env:
+        env.update(extra_env)
     if iso:
         env["ISO"] = "1"
     if cyc:
@@ -97,6 +99,61 @@ def score(res: dict, tpot_cap: float) -> float:
     return res["tok_s"] - max(0.0, res["tpot95"] - tpot_cap) * 100.0
 
 
+# ---------- warm 서버 (Phase 2): 모델 1회 로드, stdin trial 루프 ----------
+# env 축(MTP_Q4/DRAFT_GEMV/DRAFT_SEQ)은 bench 쪽 static 캐시라 프로세스 재시작 그룹 —
+# env key가 바뀔 때만 재시작(1개 상주, 27b weights 중복 방지). 핫 축(B/K/W/λ/seed/nreq)은 stdin.
+class WarmServer:
+    def __init__(self, mp: dict):
+        self.mp, self.proc, self.env_key = mp, None, None
+
+    def _start(self, env_key: tuple):
+        self.stop()
+        env = dict(os.environ, TRIALS="1")
+        env.update(dict(env_key))
+        cmd = [BENCH, self.mp["weights_dir"], self.mp["golden_dir"], str(self.mp["uq"]),
+               "8", "12", "42", "6", "3", "4"]
+        self.proc = subprocess.Popen(cmd, cwd=REPO, env=env, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, text=True, bufsize=1)
+        t0 = time.time()
+        for line in self.proc.stdout:
+            if "TRIALS_READY" in line:
+                break
+            if time.time() - t0 > 300:
+                raise RuntimeError("warm server: no TRIALS_READY in 300s")
+        self.env_key = env_key
+        print(f"  [warm] server up env={dict(env_key)} ({time.time()-t0:.0f}s load)", flush=True)
+
+    def run(self, env_key: tuple, bmax: int, K: int, W: int, lam: float, nreq: int, seed: int,
+            timeout_s: int = 900) -> dict:
+        if self.proc is None or self.proc.poll() is not None or env_key != self.env_key:
+            self._start(env_key)
+        t0 = time.time()
+        self.proc.stdin.write(f"{bmax} {K} {W} {lam} {nreq} {seed}\n")
+        self.proc.stdin.flush()
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("warm server died mid-trial")
+            if line.startswith("TRIAL_ERR"):
+                raise RuntimeError(line.strip())
+            if line.startswith("TRIAL "):
+                f = line.split()
+                return {"tok_s": float(f[1]), "tpot95": float(f[2]), "accept": float(f[3]),
+                        "avgB": float(f[4]), "wall_s": round(time.time() - t0, 1)}
+            if time.time() - t0 > timeout_s:
+                self.stop()
+                raise RuntimeError("warm server trial timeout")
+
+    def stop(self):
+        if self.proc is not None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=30)
+            except Exception:
+                self.proc.kill()
+            self.proc = None
+
+
 # ---------- 프로파일 → 탐색 공간/제약 (STEP B: 하드코딩 제거 — 프로파일만 교체하면 재사용) ----------
 def search_space_from_profiles(mp: dict, dp: dict) -> dict:
     """K/W 범위는 트리 형상 일반 범위, Bmax 상한은 메모리에서 유도:
@@ -109,17 +166,33 @@ def search_space_from_profiles(mp: dict, dp: dict) -> dict:
     return {"bmax": (4, bmax_hi), "K": k_range, "W": w_range}
 
 
+# Phase 2 env 축: 실사 결과 spec 경로에 실효인 런타임 손잡이만(전부 bench static 캐시 → 재시작 그룹).
+# 제외(정직 기록): SMAX·GDN state 타입=컴파일 타임(Phase 2b), chunk 크기·canonical 경계 M·split-K 게이트=env 부재,
+#                 BM16/SPLITK=plain batch-decode 전용(spec 경로 미실행 — 무영향), DQ4=0은 27b accept 붕괴 기지.
+P2_ENV_AXES = {"MTP_Q4": ["1", "0"], "DRAFT_GEMV": ["0", "1"], "DRAFT_SEQ": ["0", "1"]}
+
+
+def params_env_key(params: dict) -> tuple:
+    return tuple(sorted((k, params[k]) for k in P2_ENV_AXES if k in params))
+
+
 # ---------- Optuna study ----------
-def make_objective(mp, dp, args, cache):
+def make_objective(mp, dp, args, cache, server=None):
     import optuna
     space = search_space_from_profiles(mp, dp)
-    print(f"[autotune] 탐색 공간(프로파일 유도): {space}", flush=True)
+    print(f"[autotune] 탐색 공간(프로파일 유도): {space}"
+          + (f" + env축 {list(P2_ENV_AXES)}" if args.phase2 else ""), flush=True)
 
     def objective(trial: "optuna.Trial"):
         bmax = trial.suggest_int("bmax", *space["bmax"], step=2)
         K = trial.suggest_int("K", *space["K"])
         W = trial.suggest_int("W", *space["W"])
-        key = (bmax, K, W)
+        params = {"bmax": bmax, "K": K, "W": W}
+        if args.phase2:
+            for name, choices in P2_ENV_AXES.items():
+                params[name] = trial.suggest_categorical(name, choices)
+        env_key = params_env_key(params)
+        key = (bmax, K, W, env_key)
         # canonical 제약: Nn=K+W>8 (concat-mmq 곱 전 구간 + 단독 spec 자동 일치 = mism 원천 차단)
         if K + W <= 8:
             trial.set_user_attr("pruned", "canonical Nn<=8 (per-slot 폴백 — 곱 손실 영역)")
@@ -132,8 +205,12 @@ def make_objective(mp, dp, args, cache):
         if key in cache:  # TPE 중복 제안 → 재실행 없이 재사용(결정적 목적이라 유효)
             res = cache[key]
             trial.set_user_attr("cached", True)
+        elif server is not None:
+            res = server.run(env_key, bmax, K, W, args.lam, args.nreq, args.seed)
+            cache[key] = res
         else:
-            res, _ = run_bench(mp, bmax, K, W, args.lam, args.nreq, args.seed)
+            res, _ = run_bench(mp, bmax, K, W, args.lam, args.nreq, args.seed,
+                               extra_env=dict(env_key))
             if "tok_s" not in res:
                 trial.set_user_attr("error", res.get("error", "?")[:500])
                 raise optuna.TrialPruned()
@@ -141,7 +218,8 @@ def make_objective(mp, dp, args, cache):
         for k in ("tok_s", "tpot95", "accept", "avgB", "wall_s"):
             trial.set_user_attr(k, res[k])
         s = score(res, args.tpot_cap)
-        print(f"  trial#{trial.number}: B{bmax} K{K} W{W} -> {res['tok_s']:.1f} tok/s "
+        envtag = " ".join(f"{k}={v}" for k, v in env_key) if env_key else ""
+        print(f"  trial#{trial.number}: B{bmax} K{K} W{W} {envtag} -> {res['tok_s']:.1f} tok/s "
               f"tpot {res['tpot95']:.3f} accept {res['accept']:.2f} score {s:.1f}", flush=True)
         return s
 
@@ -159,6 +237,8 @@ def main():
     ap.add_argument("--tpot-cap", type=float, default=0.35)
     ap.add_argument("--study", default=None)
     ap.add_argument("--sampler-seed", type=int, default=7)
+    ap.add_argument("--phase2", action="store_true", help="env 축 확장 + warm 서버 + 상위3 검증")
+    ap.add_argument("--topk", type=int, default=3, help="phase2: 검증할 상위 후보 수")
     args = ap.parse_args()
 
     mp = json.load(open(args.model))
@@ -168,50 +248,88 @@ def main():
 
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study_name = args.study or f"autotune-{mp['name'].replace('/', '_').replace(' ', '')}"
+    study_name = args.study or (f"autotune-p2-{mp['name'].replace('/', '_').replace(' ', '')}"
+                                if args.phase2 else
+                                f"autotune-{mp['name'].replace('/', '_').replace(' ', '')}")
     storage = f"sqlite:///{os.path.join(HERE, 'autotune.db')}"
     study = optuna.create_study(study_name=study_name, storage=storage, load_if_exists=True,
                                 direction="maximize",
-                                sampler=optuna.samplers.TPESampler(seed=args.sampler_seed))
+                                sampler=optuna.samplers.TPESampler(seed=args.sampler_seed,
+                                                                   multivariate=True))
     cache = {}
     # 재개 시 기존 완료 trial을 캐시에 복원(같은 config 재실행 방지)
     for t in study.trials:
         if t.state == optuna.trial.TrialState.COMPLETE and "tok_s" in t.user_attrs:
-            cache[(t.params["bmax"], t.params["K"], t.params["W"])] = dict(t.user_attrs)
+            cache[(t.params["bmax"], t.params["K"], t.params["W"],
+                   params_env_key(t.params))] = dict(t.user_attrs)
     done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     print(f"[autotune] {study_name}: 기존 완료 {done}, 목표 {args.trials} trials "
-          f"(seed={args.seed} λ={args.lam} nreq={args.nreq} tpot_cap={args.tpot_cap})", flush=True)
-    study.optimize(make_objective(mp, dp, args, cache), n_trials=args.trials)
+          f"(seed={args.seed} λ={args.lam} nreq={args.nreq} tpot_cap={args.tpot_cap} "
+          f"phase2={args.phase2})", flush=True)
+    server = WarmServer(mp) if args.phase2 else None
+    try:
+        study.optimize(make_objective(mp, dp, args, cache, server), n_trials=args.trials)
+    finally:
+        if server:
+            server.stop()
 
     best = study.best_trial
     print(f"\n[autotune] BEST trial#{best.number}: {best.params} score {best.value:.1f} "
           f"tok/s {best.user_attrs.get('tok_s')} tpot {best.user_attrs.get('tpot95')}", flush=True)
 
-    # ---- 검증 프로토콜: 다른 seed 재측정(과적합 가드) + full ISO + CYC ----
-    p = best.params
+    # ---- 검증 프로토콜: 상위 K 후보(고유 config) 각각 — 다른 seed + full ISO(해당 스킴) + nreq=60 확정치 ----
+    import optuna.importance
+    comp = [t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+    comp.sort(key=lambda t: t.value, reverse=True)
+    seen, top = set(), []
+    for t in comp:
+        ck = tuple(sorted(t.params.items()))
+        if ck not in seen:
+            seen.add(ck)
+            top.append(t)
+        if len(top) >= (args.topk if args.phase2 else 1):
+            break
     alt_seed = args.seed + 735
-    print(f"[verify] 다른 seed({alt_seed}) 재측정...", flush=True)
-    alt, _ = run_bench(mp, p["bmax"], p["K"], p["W"], args.lam, args.nreq, alt_seed)
-    print(f"[verify] alt-seed: {alt.get('tok_s')} tok/s tpot {alt.get('tpot95')}", flush=True)
-    print("[verify] full ISO(12/12)...", flush=True)
-    iso, _ = run_bench(mp, p["bmax"], p["K"], p["W"], args.lam, 12, args.seed, iso=True)
-    print(f"[verify] {iso.get('iso')}", flush=True)
-    print("[verify] CYC 사이클 리포트...", flush=True)
-    cyc, _ = run_bench(mp, p["bmax"], p["K"], p["W"], args.lam, 30, args.seed, cyc=True)
+    candidates = []
+    for rank, t in enumerate(top, 1):
+        p = t.params
+        eenv = dict(params_env_key(p))
+        print(f"[verify #{rank}] {p} — alt-seed({alt_seed}) / nreq60 / full ISO / CYC...", flush=True)
+        alt, _ = run_bench(mp, p["bmax"], p["K"], p["W"], args.lam, args.nreq, alt_seed, extra_env=eenv)
+        fin, _ = run_bench(mp, p["bmax"], p["K"], p["W"], args.lam, 60, args.seed, extra_env=eenv)
+        iso, _ = run_bench(mp, p["bmax"], p["K"], p["W"], args.lam, 12, args.seed, iso=True, extra_env=eenv)
+        cyc, _ = run_bench(mp, p["bmax"], p["K"], p["W"], args.lam, 30, args.seed, cyc=True, extra_env=eenv)
+        print(f"[verify #{rank}] alt {alt.get('tok_s')} / nreq60 {fin.get('tok_s')} "
+              f"(tpot {fin.get('tpot95')}) / {iso.get('iso')}", flush=True)
+        candidates.append({
+            "rank": rank, "trial": t.number, "params": p, "scheme_env": {"MTP_Q4": "1", **eenv},
+            "objective_measured": {k: t.user_attrs.get(k) for k in ("tok_s", "tpot95", "accept", "avgB")},
+            "alt_seed": {"seed": alt_seed, **{k: alt.get(k) for k in ("tok_s", "tpot95", "accept")}},
+            "nreq60": {k: fin.get(k) for k in ("tok_s", "tpot95", "accept", "avgB")},
+            "iso": iso.get("iso"), "iso_pass": iso.get("iso_pass"),
+            "cyc": cyc.get("cyc_lines", []),
+        })
+    try:
+        importance = {k: round(v, 4) for k, v in
+                      optuna.importance.get_param_importances(study).items()}
+    except Exception as e:
+        importance = {"error": str(e)}
+    print(f"[autotune] 축 중요도: {importance}", flush=True)
 
     art = {
-        "schema": "dgx-serving/autotune-config@1",
+        "schema": "dgx-serving/autotune-config@2",
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "device_profile": dp, "model_profile": mp,
         "objective": {"lam": args.lam, "nreq": args.nreq, "seed": args.seed,
-                      "tpot_cap": args.tpot_cap, "metric": "tok_s - 100*max(0,tpot95-cap)"},
-        "best_config": {"bmax": p["bmax"], "K": p["K"], "W": p["W"], "Nn": p["K"] + p["W"],
-                        "env": {"MTP_Q4": "1"}},
-        "best_measured": {k: best.user_attrs.get(k) for k in ("tok_s", "tpot95", "accept", "avgB")},
-        "verify": {"alt_seed": alt_seed,
-                   "alt_measured": {k: alt.get(k) for k in ("tok_s", "tpot95", "accept")},
-                   "iso": iso.get("iso"), "iso_pass": iso.get("iso_pass"),
-                   "cyc": cyc.get("cyc_lines", [])},
+                      "tpot_cap": args.tpot_cap, "metric": "tok_s - 100*max(0,tpot95-cap)",
+                      "phase2_axes": list(P2_ENV_AXES) if args.phase2 else [],
+                      "excluded_axes": {"compile_time": ["SMAX", "GdnStateT", "MMQ tile"],
+                                        "no_knob": ["chunk size", "canonical M boundary", "splitk gate"],
+                                        "not_in_spec_path": ["BM16", "SPLITK"],
+                                        "known_degenerate": ["DQ4=0 (27b accept collapse)"]}},
+        "candidates": candidates,
+        "param_importance": importance,
         "trials": [{"n": t.number, "params": t.params, "state": str(t.state),
                     "value": t.value, "attrs": t.user_attrs} for t in study.trials],
     }
@@ -219,7 +337,8 @@ def main():
                        f"{study_name}-{datetime.date.today()}.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     json.dump(art, open(out, "w"), indent=1, ensure_ascii=False)
-    print(f"[autotune] 아티팩트: {out}  (ISO {'PASS' if iso.get('iso_pass') else 'FAIL — 아티팩트 무효, 차점 검토'})",
+    ok = candidates and candidates[0]["iso_pass"]
+    print(f"[autotune] 아티팩트: {out}  (top1 ISO {'PASS' if ok else 'FAIL — 무효, 차점 검토'})",
           flush=True)
 
 

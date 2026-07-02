@@ -54,9 +54,34 @@ K7/K8 전 B 무득, plain 1.21×.
   4.20 vs 4.37). Phase 6은 K5W4를 B8에서만 봤음(44.9) — B12에서 동급임은 하네스가 처음 관찰.
 - **판정: 하네스 정합성 검증 성공** — 4모델 확장(프로파일 교체)에 사용 가능.
 
+## Phase 2 — 축 확장 + warm 서버 + 120 trial (결과)
+
+**논거**: 기존 정착값들은 다른 운영점에서 OFAT로 정착(SPLITK auto=plain B16, 경계 M≤16=B=2 실험,
+chunk 512=pre-GDN) — 현 운영점(spec 서빙)에서 전체 공간을 튜너에 넣고 측정이 판정.
+
+- **warm 서버(TRIALS=1)**: bench에 stdin trial 루프 추가(모델 1회 로드, 한 줄="Bmax K W λ nreq seed").
+  trial당 2.5분 → **핫 축 ~40초**. 오염 게이트: 같은 config 재실행 4수치 전부 동일(결정적) 확인 후 본 실행.
+  env 축(bench static 캐시)은 재시작 그룹 — env key 변경 시만 서버 재시작.
+- **축 실사(정직 기록)**: 후보 10+축 중 spec 경로에 실효인 env 축은 **MTP_Q4/DRAFT_GEMV/DRAFT_SEQ 3개뿐**.
+  SMAX·GDN state 타입=컴파일 타임(Phase 2b), chunk·canonical 경계 M·split-K 게이트=env 손잡이 부재,
+  BM16/SPLITK=plain batch-decode 전용(spec 경로 미실행). → 6축(B/K/W + env 3).
+- **120 trial(완료 82 + prune 38, TPE multivariate)** 판정 = **⒜ 새 최적 발견: Bmax 14** — Phase 7 격자(B8/12/16)가
+  안 본 점. nreq60 확정치(같은 seed42, controlled):
+  | 후보 | nreq60 | tpot95 | alt-seed(777) | ISO |
+  |---|---|---|---|---|
+  | **B14 K6W3** | **50.4** | 0.353 | 50.0 | 12/12 PASS |
+  | B14 K5W4 | 50.2 | 0.343 | 51.7 | 12/12 PASS |
+  | B12 K5W4 | 48.8 | **0.309** | 49.1 | 12/12 PASS |
+  현행(Phase 7) B12 K6W3 = 48.1 → **B14 K6W3 = 50.4 (+4.8%)**. tpot 0.32→0.35 소폭 악화(정직 병기) —
+  지연 민감하면 B12 K5W4(48.8, tpot 0.309)가 대안. CYC: verify 68~74%로 비중 구조 불변(B14도 B-불변 법칙 유지,
+  "왜"=B12→14 곱 잔여 스케일, B16은 스케줄 오버헤드·tpot에서 손해).
+- **env 축 전부 현행 기본값 재확인(measured 확정)**: MTP_Q4=1(off는 26.5), DRAFT_GEMV=0(gemv 폴백 31.6),
+  DRAFT_SEQ=0(순차 32.5) — P4/P5의 개별 결론을 튜너가 상호작용 포함 공간에서 독립 재확정.
+- **축 중요도(fANOVA)**: DRAFT_SEQ 0.33 > Bmax 0.31 > DRAFT_GEMV 0.19 > MTP_Q4 0.13 ≫ K 0.03 > W 0.01
+  — draft 경로 커널 스킴이 지배, 트리 형상은 미세 튜닝(4모델 확장 시 공간 축소 prior).
+
 ## 한계 / 다음
 
 - 목적함수가 λ4 단일점(Phase 7에서 λ 포화 확인된 조건) — 부하 프로파일이 다르면 목적 재정의 필요.
-- 탐색 축이 config(B/K/W)뿐 — 커널 파라미터(SPLITK/SMAX 등) 축은 Phase 2 후보.
-- trial당 ~2.5분(27b 로드 포함) — 로드 1회 상주 서버화(warm bench)가 trial 비용 최대 절감 lever.
-- Phase 2 = 4모델 확장(0.8b/기타 프로파일 추가), 장비 프로파일 자동 측정(STREAM/SM probe).
+- 컴파일 타임 축(SMAX/GDN state/타일)은 재빌드 루프 필요 — Phase 2b 후보.
+- Phase 3 = 4모델 확장(0.8b/기타 프로파일 추가), 장비 프로파일 자동 측정(STREAM/SM probe), 다목적(λ1 지연 병기).
