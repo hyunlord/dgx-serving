@@ -287,3 +287,41 @@ SpecSlot { int req;                     // 요청 id (-1=빈 슬롯)
 - **재스윕의 수확**: 챕터9 "W-flat"은 새 전제(accept 4.4대)에서도 유효 — 단 결론이 뒤집힘: W는 accept를 못 늘리므로 **W를 줄이는 게 이득**(verify ∝ Nn). K는 accept 드라이버(K4→6: 3.78→4.37) — depth 유지가 필수.
 - **(b) verify attn/GDN 배칭: 낮은 우선순위 권고(사실상 기각)** — payoff 상한 ~10%(GPU 시간), 그 지배분(GDN 9%)은 state 대역폭 bound로 배칭 이득 제한적(예측). 남은 큰 벽은 **concat-mmq 커널 자체(59.2%)** — 이는 챕터7에서 micro-lever 천장 판정된 영역(FP4 MMA가 toolkit-blocked 해제 시 최대 lever).
 - Phase 6은 config 변경뿐(커널 무변경) — 스윕·계측 결과만 doc/메모리 기록.
+
+## Phase 7 — 극한 config 스윕: Bmax↑ + K연장 + λ포화 + 교차 격자
+
+### STEP 0 — 메모리 가드 정확화 (코드 변경은 이것 하나)
+- B12/B16 진입 시 admission 가드가 오차단: 예산 18.66/24.88GB vs "0.7·free 17.5GB". 원인 = **GB10 unified에서 `cudaMemGetInfo` free가 리눅스 페이지캐시(회수 가능 ~70GB)를 가용으로 안 쳐 과소보고**(실제 MemAvailable 113GB).
+- 수정: `/proc/meminfo MemAvailable`을 병용해 **max(cudaFree, MemAvailable)** 사용 — 가드 완화가 아니라 **정확화**(회수 가능 메모리는 실제로 할당 가능, oversubscribe 판정 기준은 동일 0.7 마진 유지). 수정 후 B16 예산 24.88~27.32GB vs 0.7·free ~69GB — OK, 여유 큼.
+
+### STEP 1 — 축별 스윕 (27b MTP_Q4=1, controlled 같은 seed=42)
+**①Bmax B-scale (K6W3): spec은 B↑로 계속 오르고 plain은 B8에서 포화** — 곱(concat-mmq M=B×Nn, draft gemm_batch M=B)이 B를 계속 흡수:
+| Bmax | plain λ2/λ4 | spec λ2/λ4 | spec/plain(λ4, 같은 Bmax) | spec tpot(λ4) |
+|---|---|---|---|---|
+| 8 (P6) | 40.2 / 40.6 | 44.5 / **44.8** | 1.10× | 0.231 |
+| 12 | 39.1 / 39.8 | 47.3 / **48.1** | **1.21×** | 0.321 |
+| 16 | 39.2 / 40.4 | 48.2 / **48.7** | **1.21×** | 0.424 |
+- plain은 B12/16이 B8보다 오히려 낮음(39.8/40.4 vs 40.6 — 포화+스케줄 오버헤드). spec은 B↑가 e2e로 계속 나옴(44.8→48.1→48.7). **단 B12→16은 +1.2%로 체감이고 tpot 0.32→0.42로 악화 — 실용 스윗스팟 = B12.**
+- **②K 연장(B8, λ4, nreq40): K7 44.7(accept 4.59) / K8 43.5(accept 4.83)** — accept는 계속 오르나(4.41→4.83) verify Nn(10/11) 비용이 이겨서 **throughput 무득**(K6 44.8이 최고). MTP 연쇄 깊이의 accept 증분(K6→8: +0.42)이 노드당 verify 비용 증분을 못 이기는 구조.
+- CYC 사이클 분해(λ4): B8 draft 17.7%/verify 70.2% → **B16 draft 17.0%/verify 69.9%** — **B↑에도 비중 구조 불변**(draft·verify 모두 곱 커널이라 함께 스케일). verify(그 중 concat-mmq)가 여전히 지배 → 다음 lever = FP4 MMA(toolkit-blocked) 유지.
+
+### STEP 2 — 교차 격자 (Bmax×K, W3, λ4): 상호작용 없음
+| | K6 | K7 | K8 |
+|---|---|---|---|
+| B8 | **44.8** | 44.7 | 43.5 |
+| B12 | **48.1** | 47.7 | — |
+| B16 | **48.7** | 48.2 | — |
+- 가설("B↑ → verify 상각 → 최적 K 연장")은 **기각**: 모든 B에서 K6 우세, 순위 이동 없음. accept 증분(4.41→4.59)이 Nn 9→10 verify 비용을 못 이기는 관계가 B와 독립 — verify가 이미 곱(concat-mmq)이라 B가 노드당 비용을 바꾸지 않기 때문. (K8은 B8에서 -1.3 커서 B12/16 교차 생략.)
+
+### STEP 3 — λ 포화 + 정직 좌표
+- **λ 포화 곡선(B12 K6W3, nreq60, tpot 병기)** — spec·plain 모두 λ4~8에서 포화, **용량: spec ≈48.6 vs plain ≈40.1 = 1.21×**(spec이 곱으로 용량 자체가 큼):
+  | λ | plain B12 (tpot) | spec B12 K6W3 (tpot) |
+  |---|---|---|
+  | 2 | 39.1 (0.245) | 47.3 (0.301) |
+  | 4 | 39.8 (0.248) | 48.1 (0.321) |
+  | 8 | 40.0 (0.251) | 48.5 (0.322) |
+  | 12 | **40.1** (0.251) | **48.6** (0.321) |
+- **챕터10 최종 좌표**: 27b spec **48.1(B12 λ4) / 48.6(포화 용량)** vs 같은 Bmax plain 39.8/40.1 → **1.21×**. B16은 48.7로 최고점이나 tpot 0.42로 지연 악화 커서 참고점(B12 권고). tpot는 spec 0.32 vs plain 0.25 — **throughput·용량 우위, 지연 열세**(정직 병기).
+- 무득 축(정직): plain Bmax↑(B8 포화, B12/16 오히려 -1~2%), K7/8(모든 B에서 무득 — accept↑가 verify Nn 비용에 짐), B12→16(+1.2% 체감·tpot 0.32→0.42 악화).
+- ISO 스팟체크(B12 K6W3, nreq12 λ4): **12/12 요청 bit-identical PASS** — Bmax·형상은 config지만 게이트 재확인 완료(스케줄링 출력 영향 0 유지).
+- Phase 7로 **config 축(B/K/W/λ)은 소진** — 남은 lever는 커널 축(FP4 MMA toolkit 해제 대기, GDN state 운반 등)뿐.

@@ -600,7 +600,14 @@ int main(int argc,char**argv){
     size_t per_mtp=(size_t)2*maxlen*NKV*HD*4;
     size_t per_va=(size_t)Nn*ngdn*((size_t)nh*D*D+convd)*4;
     size_t perslot=per_kv+per_mtp+per_va;
-    size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB); double budget=0.7*(double)freeB;
+    size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB);
+    // GB10 unified: cudaMemGetInfo free는 리눅스 페이지캐시(메모리 압박 시 회수 가능)를 가용으로 안 쳐서
+    // 과소보고 — /proc/meminfo MemAvailable(회수 가능 포함)이 실제 가용. 둘 중 큰 값(가드 정확화, 완화 아님).
+    { FILE*f=fopen("/proc/meminfo","r"); if(f){ char line[128];
+        while(fgets(line,sizeof line,f)){ long kb;
+            if(sscanf(line,"MemAvailable: %ld",&kb)==1){ size_t avail=(size_t)kb*1024; if(avail>freeB)freeB=avail; break; } }
+        fclose(f);} }
+    double budget=0.7*(double)freeB;
     printf("[bench_serve_spec] uq=%d dq4=%d Bmax=%d nreq=%d seed=%u K=%d W=%d Nn=%d(%s) maxlen=%d\n",
            uq,dq4,Bmax,nreq,seed,K,W,Nn, Nn>8?"concat-mmq 곱(전 B)":"소트리(B_act≥3 per-slot, 곱 부분)", maxlen);
     printf("  admission 예산: per-slot %.1fMB(KV %.1f + MTP %.1f + VA %.1f) × Bmax %d = %.2fGB vs 0.7·free %.2fGB — %s\n",
