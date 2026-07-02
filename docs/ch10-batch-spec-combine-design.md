@@ -132,7 +132,40 @@ SpecSlot { int req;                     // 요청 id (-1=빈 슬롯)
 - mmq 곱 > sb 곱(MMA가 batched compute amortize↑; sb는 S 컬럼 DP4A라 compute S 비례 → batched M=14가 single M=7의 1.57배 시간, 곱 희석). 단 sb는 단독 정렬 불필요.
 - **가변 B의 진짜 딜레마**: 트리≤8인데 큰 B로 M>16 → sb 한계 초과 mmq 강제, 단독 spec은 sb → flip. 해법 (a)**adaptive**(sb≤16/mmq>16, 경계서 load-dependent-but-valid W4A8 argmax) or (b)**uniform mmq**(단독 mm+MMs 둘 다 mmq 정렬 + B=1 empty-row 페널티). MMQ_FORCE 실험(mm만 게이팅=mism 31)이 "모든 matmul 경로 정렬 필요" 확인. = **축2 설계 결정.**
 
-### 축2/3 = major 빌드 (미착수, STOP-report)
-- **축2 연속 배칭+spec**: ragged verify_batch(슬롯별 다른 Nnodes — 현재 uniform Nnodes 가정) + per-slot MTP draft/accept/promote + 가변 B admission. **vLLM급 ragged speculative continuous batching = dedicated 세션.**
-- **축3 곱→e2e throughput**: 축2 의존(연속 배칭 없이 서빙 throughput 측정 불가).
-- 긴 세션 강행 = mism=0 미검증 위험 → 보고(헌법). **다음 세션: ragged verify_batch(Nnodes_b[]+prefix-offset, per-slot 루프 기존 자산) → bench_serve spec 사이클 → 곱 B-scaling(Nnodes>8로 mism=0 유지 B=2,4,8 — 곱이 B로 커지나) → e2e Poisson(Phase 4).**
+### 축2/3 = major 빌드 (축1 세션 시점 미착수 → 아래서 완결)
+- **축2 연속 배칭+spec**: ragged verify_batch + per-slot MTP draft/accept/promote + 가변 B admission = vLLM급, dedicated 세션으로 미룸 → 아래 "Phase 3 축2 결과"서 완결.
+
+## Phase 3 축2 결과 — ragged spec 연속 배칭 (STEP A/B 완결 + C 측정)
+
+### STEP A — ragged verify_batch (9699c8e)
+- `qwen35_verify_batch`: uniform `int Nnodes` → **슬롯별 `const int *Nnodes_b`**. concat 행 = `off[b]+i`(off=prefix 누적합), M=ΣNnodes_b. per-slot 루프(KV copy/flash_attn/conv tree/GDN ksplit tree/va snapshot) 전부 off[b]·Nnodes_b[b] 인덱싱.
+- **canonical 게이팅의 ragged 일반화**: 전 슬롯 같은 커널 family여야 단독 spec과 bit-identical — 전 슬롯 >8 → concat-mmq(M) / 전 슬롯 2~8 && M≤16 → concat-sb(M) / **혼합·M>16 소트리 → per-slot**(각 슬롯 자기 커널, mism=0 유지, 곱 부분 손실).
+- test_batchspec2 슬롯별 트리 형상(K2/W2 argv). **게이트 전부 mism=0 PASS**: 0.8b 회귀 uniform 7(sb)·10(mmq) + ragged 7/5(concat-sb M=12)·10/12(concat-mmq M=22)·7/10(mixed per-slot)·fp32 7/5; **27b ragged 7/5·10/12도 PASS**.
+
+### STEP B — spec-serving (tools/bench_serve_spec, 76e7413)
+- bench_serve 프로토콜(Poisson/admit/slot 재사용/seed trace/warm-up 제외) 위에 decode 스텝 → **spec 사이클**: 슬롯별 MTP draft(tree K,W) → verify_batch(ragged concat, 활성 B_act 가변) → 슬롯별 accept/promote(**ragged accept**: plen 슬롯별 commit). 슬롯 상태 = per-slot DecodeState+MtpKV+VerifyArtifacts(수명=요청). admission 예산 가드(KV+MTP+VA).
+- **★ISO 게이트(서빙 각 요청 출력 == 단독 spec bit-identical) 12/12 PASS × 3종**: W4A8 K6W4(concat-mmq)/fp32/W4A8 K4W3(소트리 per-slot 폴백). **스케줄링(B_act 요동·슬롯 재사용·도착 순서)이 출력에 영향 없음** — 서빙 spec 정확성 완성.
+
+### STEP C — B-scaling 곱 + 가변 B 결정 + 서빙 A/B (measured)
+- **verify 곱 B-scaling (0.8b W4A8, K6W4 Nn=10, 포화 λ, TIME 버킷, in-engine)**: 곱(B)=B·t(1)/t(B):
+  B=2 **1.48×** / B=3 1.70× / B=4 **1.85×** / B=8 **2.25×** — **곱이 B로 커짐(원천 실증)**, 단 saturating.
+- **가변 B 딜레마의 실전 답(데이터)**: 서빙 기본 트리 **Nn=10(>8) → 모든 B_act서 all_gt8=concat-mmq — flip 자체가 없음**(단독도 mmq, empty-row 없음). accept도 K6W4가 5.2~5.7/사이클로 우수. 소트리(≤8)는 per-slot 폴백이 자동 mism=0(곱 부분). ∴ ⒜adaptive/⒝uniform-mmq 선택 불필요 — **⒞ "트리>8 기본 + 소트리 자동 폴백"**이 flip 원천 제거+곱+mism=0 동시 달성.
+- **0.8b e2e 정직(A/B, 같은 seed/Bmax=8)**: plain c-ch 503.4 tok/s(λ8) vs c-spec 112.4 — **plain 4.5× 우세**. 원인: 0.8b는 body가 싸서 **per-slot 순차 MTP draft(mtp_step마다 호스트 sync+V-logits argmax)가 사이클 지배**(tpot95 0.013 vs 0.093). "draft Phase 초반 순차"가 실측 병목 확정 — **draft 배칭/디바이스화 = Phase 4 lever**.
+- **★draft lm_head 함정(27b accept 붕괴→fix)**: 첫 27b 측정 accept=1.00(퇴화, 1.8 tok/s) — draft logits를 E(embed)-as-lmhead로 계산(0.8b tied=정상, 27b untied=draft 붕괴). fix: mtp_step에 lmq/dq4 복원, uq!=0 기본 dq4=1(진짜 lm_head q4). 재게이트 0.8b ISO 12/12 PASS. **교훈: draft 품질 파라미터는 속도 도구서 필수 켬.**
+- **27b B-scaling (dq4=1, K6W4, 포화 λ, verify TIME 버킷, in-engine)** — 곱(B)=B·t(1)/t(B), t(1)=195.7ms:
+  | B | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+  |---|---|---|---|---|---|---|---|
+  | 곱 | 1.73× | 2.29× | 2.73× | 3.07× | 3.41× | 3.61× | **3.83×** |
+  **곱이 B로 크게 스케일**(0.8b B=8 2.25×보다 훨씬 큼 — 27b DRAM-bound라 weight 재사용 이득↑). accept 4.51(K6W4 > 챕터9 K4W3 2.27~2.86). e2e: 9.1(B1)→18.4(B4)→19.8 tok/s(Bmax=8, avgB 5.04).
+- **★27b 서빙 e2e A/B (Bmax=8, 같은 seed/trace/λ=1,2,4, controlled)**:
+  | λ | plain c-ch | c-spec | 판정 |
+  |---|---|---|---|
+  | 1 | 38.3 | 20.2 | plain 1.9× |
+  | 2 | 40.3 | 20.3 | plain 2.0× |
+  | 4 | **40.7** | **20.4** | **plain 2.0× 우세** |
+  **정직: e2e 서빙 throughput은 spec이 plain에 2.0× 짐.** 병목 분해(측정): 사이클 = verify(M~76, ~0.41s) + **per-slot 순차 MTP draft(~7.6슬롯×~11 mtp_step, 호스트 sync 포함 ≈ 사이클의 ~75-80%)**. verify 곱 3.83×는 실증됐으나 **draft 순차가 e2e서 완전 희석**(tpot95 0.50s vs plain 0.18s). Amdahl: draft 배칭/디바이스화 시 사이클 ~2.3s→~0.65s → **~50 tok/s = plain(40.7) 추월권** — **Phase 4 확정 lever(추측 아님, 사이클 분해 측정)**.
+- 27b 서빙 ISO(dq4=1) 미실행(0.8b ISO 12/12만) — 27b bit-identity는 test_batchspec2 27b 게이트(concat==solo)로 검증, 서빙 iso 27b는 Phase 4 시작 게이트로.
+
+### 축2 종합 (정직)
+- **완성**: ragged spec 연속 배칭 인프라(vLLM급 신규 3개 중 ragged verify+ragged accept 완성, 정확성 mism=0/iso 12/12) + 곱 mechanism B-scaling 실증(verify 3.83×@B8).
+- **미달**: e2e 서빙 throughput(plain 2.0× 우세) — 원인은 batch+spec 결합이 아니라 **draft 파이프라인**(순차+호스트 sync+fp32 MTP body). **Phase 4 = draft 배칭**(슬롯 병렬 mtp_step 배치 forward + top-k 디바이스화)이 곱을 e2e로 옮기는 열쇠.

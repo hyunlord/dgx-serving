@@ -68,7 +68,7 @@ struct MtpKV { float *Kc,*Vc; int n; };
 static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
                     int e_tok, const float*h_post, int rope_pos, bool append,
                     const float*d_cos,const float*d_sin, float*d_own, bool want_logits=true,
-                    std::vector<int>* topk=nullptr, int topw=1){
+                    const QMat* lmq=nullptr, int dq4=0, std::vector<int>* topk=nullptr, int topw=1){
     const int H=c.hidden_size,HD=c.head_dim,NQ=c.num_q_heads,NKV=c.num_kv_heads,FFN=c.intermediate_size,rot=c.rotary_dim,V=c.vocab_size;
     const int qdim2=NQ*HD*2,qdim=NQ*HD,kvdim=NKV*HD; const float eps=c.rms_norm_eps;
     static float* g_ws=nullptr; static size_t g_cap=0; static int* g_de=nullptr;
@@ -105,7 +105,9 @@ static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
     launch_rmsnorm_zc(cur3,m.norm,d_own,1,H,eps);
     int best=-1;
     if(want_logits){
-        launch_gemv_f32(d_own,E,logits,H,V,1);
+        // ★draft lm_head: dq4=1이면 진짜 lm_head(q4) — 27b는 embed 미공유(untied)라 E-as-lmhead는 draft 붕괴(accept→1.0).
+        if(dq4&&lmq) launch_gemv_q4(d_own,lmq->wq,lmq->sc,logits,H,V,1,c.scale_dtype);
+        else         launch_gemv_f32(d_own,E,logits,H,V,1);
         CK(cudaDeviceSynchronize());
         static std::vector<float> hl; hl.resize(V); CK(cudaMemcpy(hl.data(),logits,(size_t)V*4,cudaMemcpyDeviceToHost));
         best=0; float bv=hl[0]; for(int j=1;j<V;j++) if(hl[j]>bv){bv=hl[j];best=j;}
@@ -121,7 +123,7 @@ static int mtp_step(const ModelConfig&c, const MtpW&m, MtpKV&kv, float*E,
 // ── 전역 커널 자산 ──────────────────────────────────────────────────────────
 static ModelConfig c; static QwenWeights w; static MtpW mw; static float* E;
 static float *d_cos,*d_sin;
-static int H,V,rot,NKV,HD, K,W,Nn, uq, maxlen;
+static int H,V,rot,NKV,HD, K,W,Nn, uq, maxlen, dq4;   // dq4: draft lm_head=q4(uq!=0 기본 — 27b untied embed 필수)
 static const std::vector<int>* IDS;
 static int argmaxV(const std::vector<float>&lg,int p){int b=0;float bv=lg[(size_t)p*V];for(int j=1;j<V;j++){float z=lg[(size_t)p*V+j];if(z>bv){bv=z;b=j;}}return b;}
 
@@ -131,11 +133,11 @@ static void draft_tree(MtpKV& kv, int cur, float* h_cur, int base,
     tok.assign(Nn,0); par.assign(Nn,0); pos.assign(Nn,0); owns.clear();
     std::vector<int> top0;
     tok[0]=cur; par[0]=-1; pos[0]=base;
-    { float*own; CK(cudaMalloc(&own,(size_t)H*4)); mtp_step(c,mw,kv,E,cur,h_cur,base,true,d_cos,d_sin,own,true,&top0,W); owns.push_back(own); }
+    { float*own; CK(cudaMalloc(&own,(size_t)H*4)); mtp_step(c,mw,kv,E,cur,h_cur,base,true,d_cos,d_sin,own,true,&w.lm_head,dq4,&top0,W); owns.push_back(own); }
     for(int j=0;j<W;j++){ tok[1+j]=top0[j]; par[1+j]=0; pos[1+j]=base+1; }
     int e_tok=top0[0]; float* h_in=owns[0]; int prev_idx=1;
     for(int i=1;i<K;i++){ float*own; CK(cudaMalloc(&own,(size_t)H*4));
-        int d=mtp_step(c,mw,kv,E,e_tok,h_in,base+i,true,d_cos,d_sin,own,true); owns.push_back(own);
+        int d=mtp_step(c,mw,kv,E,e_tok,h_in,base+i,true,d_cos,d_sin,own,true,&w.lm_head,dq4); owns.push_back(own);
         int idx=W+i; tok[idx]=d; par[idx]=prev_idx; pos[idx]=base+1+i; prev_idx=idx; e_tok=d; h_in=own; }
     anc.assign(Nn,0);
     for(int j=0;j<Nn;j++){ unsigned mm=0; for(int x=j;x>=0;x=par[x]) mm|=(1u<<x); anc[j]=mm; }
@@ -344,6 +346,7 @@ int main(int argc,char**argv){
     if(lambdas.empty()) lambdas={1,2,4,8};
     g_time=(getenv("TIME")&&atoi(getenv("TIME"))>0)?1:0;
     int iso=(getenv("ISO")&&atoi(getenv("ISO"))>0)?1:0;
+    dq4=(uq!=0)?1:0; if(getenv("DQ4")) dq4=atoi(getenv("DQ4"));   // draft lm_head=q4 기본(uq!=0) — 27b untied embed서 필수(E-as-lmhead=accept 붕괴)
     int pmax=getenv("PMAX")?atoi(getenv("PMAX")):32;
     c=load_config_qwen((WD+"/manifest.json").c_str());
     H=c.hidden_size; V=c.vocab_size; rot=c.rotary_dim; NKV=c.num_kv_heads; HD=c.head_dim;
@@ -369,8 +372,8 @@ int main(int argc,char**argv){
     size_t per_va=(size_t)Nn*ngdn*((size_t)nh*D*D+convd)*4;
     size_t perslot=per_kv+per_mtp+per_va;
     size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB); double budget=0.7*(double)freeB;
-    printf("[bench_serve_spec] uq=%d Bmax=%d nreq=%d seed=%u K=%d W=%d Nn=%d(%s) maxlen=%d\n",
-           uq,Bmax,nreq,seed,K,W,Nn, Nn>8?"concat-mmq 곱(전 B)":"소트리(B_act≥3 per-slot, 곱 부분)", maxlen);
+    printf("[bench_serve_spec] uq=%d dq4=%d Bmax=%d nreq=%d seed=%u K=%d W=%d Nn=%d(%s) maxlen=%d\n",
+           uq,dq4,Bmax,nreq,seed,K,W,Nn, Nn>8?"concat-mmq 곱(전 B)":"소트리(B_act≥3 per-slot, 곱 부분)", maxlen);
     printf("  admission 예산: per-slot %.1fMB(KV %.1f + MTP %.1f + VA %.1f) × Bmax %d = %.2fGB vs 0.7·free %.2fGB — %s\n",
            perslot/1e6,per_kv/1e6,per_mtp/1e6,per_va/1e6,Bmax,(double)Bmax*perslot/1e9,budget/1e9,
            (double)Bmax*perslot<=budget?"OK":"초과(중단)");
