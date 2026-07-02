@@ -11,6 +11,7 @@ build/
 /tools/bench
 /tools/bench_batch
 /tools/bench_serve
+/tools/bench_serve_spec
 /tools/bench_w4a8_sb
 /tools/memdiag
 /tools/ncu_*
