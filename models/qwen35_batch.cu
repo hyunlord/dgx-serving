@@ -253,8 +253,13 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
                 //   (mmq row-독립: tools/probe_mmq_rowdep + in-context golden dump로 concat[slot]==solo max|d|=0.0 확정).
                 //   weight 1운반이 B슬롯 전부 서빙(현 per-slot은 슬롯마다 weight 재적재). matmul 배칭 이득 = 곱의 원천.
                 launch_gemm_mmq_w4a8(xqs,xss,m.wq,m.sc,Y,M,OUT,IN,sdtype);
+            } else if(Nnodes>=2 && M<=16){
+                // ★곱(≤8 트리, Phase3 축1): concat-sb(M=B*Nnodes) 1콜. sb는 grid=OUT warps(S무관, weight 1적재)+컬럼-독립
+                //   → per-slot sb(B콜=B적재)와 bit-identical하되 weight B적재→1 = 곱. 단독 spec(2≤S≤8)도 sb라 canonical 일치
+                //   (mism=0, borderline flip 없음). ≤8 트리 곱을 canonical 딜레마·empty-row 낭비 없이 실현. sb SMAX=16 한계라 M≤16.
+                launch_gemv_w4a8_sb(xqs,xss,m.wq,m.sc,Y,IN,OUT,M,sdtype);
             } else {
-                // Nnodes≤8: 단독 spec이 sb(또는 mlp) → concat mmq는 borderline flip. per-slot로 커널 일치(bit-identical). 곱은 Phase3(단독 mmq 정렬 필요).
+                // Nnodes==1(단독=mlp) 또는 M>16(sb 범위 밖): per-slot로 커널 일치(bit-identical).
                 for(int b=0;b<B;b++){
                     const int8_t *xb=xqs+(size_t)b*Nnodes*IN; const float *sb=xss+(size_t)b*Nnodes*IN/QBLK;
                     float *Yb=Y+(size_t)b*Nnodes*OUT;
@@ -272,6 +277,8 @@ void qwen35_verify_batch(const ModelConfig &c, const QwenWeights &w, DecodeState
             launch_quantize_x_q8(X,xq,xs,xsm,IN,M);            // per-row 양자화(M행) — 슬롯별 offset과 bit-identical
             if(Nnodes>8){
                 launch_gemm_mmq_w4a8(xq,xs,m.wq,m.sc,Y,M,OUT,IN,sdtype);   // ★곱: concat mmq(M) — 단독 mmq(Nnodes)와 row-독립 bit-identical
+            } else if(Nnodes>=2 && M<=16){
+                launch_gemv_w4a8_sb(xq,xs,m.wq,m.sc,Y,IN,OUT,M,sdtype);     // ★곱(≤8): concat-sb(M) — 단독 sb(Nnodes)와 컬럼-독립 bit-identical, weight 1적재
             } else {
                 for(int b=0;b<B;b++){
                     const int8_t *xb=xq+(size_t)b*Nnodes*IN; const float *sb=xs+(size_t)b*Nnodes*IN/QBLK;
