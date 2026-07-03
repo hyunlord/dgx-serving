@@ -16,6 +16,7 @@
 #include "../kernels/attention.cuh"
 #include "../kernels/attention_flash.cuh"  // FA.2: batch도 single과 같은 attention(정밀도 일치)
 #include "../kernels/swiglu.cuh"
+#include "moe_block.cuh"   // MoE batch: moe_mlp_block(S=B) — prefill/single decode 공유 블록(naive S×top_k 루프)
 #include "../kernels/elementwise.cuh"
 #include "../kernels/gdn.cuh"
 
@@ -183,9 +184,14 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             mmb(L.out_p,normed,gout,vdim,H); launch_add(after,x,gout,(int)BH);
         }
         launch_rmsnorm_zc(after,L.post_ln,n2,B,H,eps);
-        mmb(L.gate,n2,gm,H,FFN); mmb(L.up,n2,um,H,FFN);
-        launch_swiglu(gm,um,act,(size_t)B*FFN);
-        mmb(L.down,act,dbuf,FFN,H); launch_add(x,after,dbuf,(int)BH);
+        if(c.num_experts>0){                      // MoE 분기(qwen35.cu:122·qwen35_decode.cu:211과 동형, config 주도, ③=0)
+            moe_mlp_block(c,L,n2,dbuf,B);          // naive S=B×top_k 루프(정확성 우선 — 그룹핑은 성능 판단 후)
+        } else {
+            mmb(L.gate,n2,gm,H,FFN); mmb(L.up,n2,um,H,FFN);
+            launch_swiglu(gm,um,act,(size_t)B*FFN);
+            mmb(L.down,act,dbuf,FFN,H);
+        }
+        launch_add(x,after,dbuf,(int)BH);
     }
     launch_rmsnorm_zc(x,w.final_norm,fn,B,H,eps);
     mmb(w.lm_head,fn,d_logits,H,V);

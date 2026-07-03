@@ -33,7 +33,7 @@ int main(int argc,char**argv){
     std::vector<float> cl=rf("rope_cos_long.bin",(size_t)128*rot), sl=rf("rope_sin_long.bin",(size_t)128*rot);
     float *d_cos,*d_sin; CK(cudaMalloc(&d_cos,cl.size()*4));CK(cudaMalloc(&d_sin,sl.size()*4));
     CK(cudaMemcpy(d_cos,cl.data(),cl.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(d_sin,sl.data(),sl.size()*4,cudaMemcpyHostToDevice));
-    QwenWeights w=load_weights_qwen(WD.c_str(),c,1,1);
+    QwenWeights w=load_weights_qwen(WD.c_str(),c,1,uq==0?1:0);   // q4 always; fp32는 uq=0(fp32 모드)일 때만(q4-only 모델 지원)
 
     // ---- batch decode ----
     BatchDecodeState bst=alloc_batch_decode_state(c,B,maxlen);
