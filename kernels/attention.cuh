@@ -81,47 +81,54 @@ static inline void launch_attn(const float *Q, const float *K, const float *V, f
 //   Q: [Sq, NQ, HD] (decode Sq=1, verify Sq=K+1). Kc/Vc: [Lc, NKV, HD] cache (신규토큰 이미 append됨).
 //   query i (절대위치 base+i) 는 cache[0 .. base+i] 를 causal attend. scale=1/sqrt(HD), GQA.
 //   block=(query i, head h), blockDim=HD. dynamic shared: qs[HD] + scores[base+Sq] (>= 최대 attendlen).
+//   scale: 0 → 1/sqrt(HD) 기본. window: 0 → 무제한 causal; w>0 → sliding(key pos j ∈ [qpos-w+1, qpos]).
+//   (scale/window는 인자 — 모델 분기 아님. Gemma4 sliding/global 층에 config로 주입.)
 static __global__ void attn_decode_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
-                                   int Sq, int NQ, int NKV, int HD, int base) {
+                                   int Sq, int NQ, int NKV, int HD, int base, float scale, int window) {
     int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     int GRP = NQ / NKV, kv = h / GRP;
-    int attendlen = base + i + 1;
+    int qpos = base + i;
+    int attendlen = qpos + 1;
+    int lo = (window > 0 && qpos - window + 1 > 0) ? qpos - window + 1 : 0;   // sliding window 하한
     extern __shared__ float sm[];
     float *qs = sm;                 // [HD]
     float *scores = sm + HD;        // [attendlen]
     if (d < HD) qs[d] = Q[((size_t)i * NQ + h) * HD + d];
     __syncthreads();
-    // scores[j] = (q · Kc[j,kv]) / sqrt(HD), j=0..attendlen-1 (thread가 strided j 담당, 각 full dot)
+    // scores[j] = (q · Kc[j,kv]) * scale, j=lo..attendlen-1 (window 밖은 skip)
     for (int j = d; j < attendlen; j += blockDim.x) {
+        if (j < lo) { scores[j] = -FLT_MAX; continue; }
         const float *kp = Kc + ((size_t)j * NKV + kv) * HD;
         float dot = 0.f;
         for (int t = 0; t < HD; t++) dot += qs[t] * kp[t];
-        scores[j] = dot / sqrtf((float)HD);
+        scores[j] = dot * scale;
     }
     __syncthreads();
     __shared__ float ssum;
     if (d == 0) {
         float m = -FLT_MAX;
-        for (int j = 0; j < attendlen; j++) m = fmaxf(m, scores[j]);
+        for (int j = lo; j < attendlen; j++) m = fmaxf(m, scores[j]);
         float s = 0.f;
-        for (int j = 0; j < attendlen; j++) { scores[j] = expf(scores[j] - m); s += scores[j]; }
+        for (int j = lo; j < attendlen; j++) { scores[j] = expf(scores[j] - m); s += scores[j]; }
         ssum = s;
     }
     __syncthreads();
     // out[d] = Σ_j (scores[j]/sum) * Vc[j,kv,d]
     if (d < HD) {
         float acc = 0.f;
-        for (int j = 0; j < attendlen; j++) acc += scores[j] * Vc[((size_t)j * NKV + kv) * HD + d];
+        for (int j = lo; j < attendlen; j++) acc += scores[j] * Vc[((size_t)j * NKV + kv) * HD + d];
         O[((size_t)i * NQ + h) * HD + d] = acc / ssum;
     }
 }
 
 static inline void launch_attn_decode(const float *Q, const float *Kc, const float *Vc, float *O,
-                                      int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0) {
+                                      int Sq, int NQ, int NKV, int HD, int base, cudaStream_t st = 0,
+                                      float scale = 0.f, int window = 0) {
     dim3 grid(Sq, NQ);
     size_t shmem = (size_t)(HD + base + Sq) * sizeof(float);
     attn_smem_guard((const void *)attn_decode_kernel, shmem, "attn_decode", base + Sq);
-    attn_decode_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, HD, base);
+    float sc = (scale > 0.f) ? scale : rsqrtf((float)HD);
+    attn_decode_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, HD, base, sc, window);
 }
 
 // ---- batch decode attention (챕터3): B개 독립 시퀀스, 각 1토큰(위치 base), 각자 KV 캐시 ----

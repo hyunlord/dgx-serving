@@ -32,7 +32,35 @@
 - **메모리 사고 기록**: 초기 full-depth 스트리밍이 112GB(가드 초과)까지 누수 → 즉시 kill(시스템 보호).
   경계 8층 + RSS 하드가드(78GB)로 안전 재실행. [[gb10-unified-memory-crash]] 원칙 준수.
 
-## STEP A — 서빙 경로 연결 + sliding KV (예정)
+## STEP A — 서빙/decode 경로 (A-1 완결, A-2/3 진행)
+
+### A-1: gemma4_decode + decode 골든 (PASS, 유연성 2라운드)
+
+**gemma4_decode**(models/gemma4_decode.cu ~130줄): GDN 없어 **프리필+decode 통합**(base=0=프리필, base>0=decode
+스텝 — 27b는 state 경로로 분리, Gemma4는 하나로). G4DecodeState(KV 캐시 fp32)만. 공용 커널만(1라운드 자산
+geglu/scale/softcap/rmsnorm_noscale 재사용).
+
+**2단 게이트 PASS**:
+- (1) **프리필 재현**(test_gemma4_decode): gemma4_decode(base=0) vs golden 통과 gemma4_forward = logits maxabs
+  **2.5e-4**(GPU 재현성)·argmax 전위치 일치 → KV append+attn_decode 배선 정확.
+- (2) **decode 연속성**(test_gemma4_gen): 프리필(S=5)+12스텝 teacher-forcing decode(전체 위치 rope 골든) →
+  **argmax 12/12 HF greedy 일치**. KV 이어받기·sliding/full 혼합·dual-rope 위치·k_eq_v 전부 정확.
+
+**버그 1건(배선, 커널 아님)**: 초기 1/12 — test가 rope에 pos offset 미리 더해 넘기고 decode가 또 base offset
+= 이중 오프셋(프리필 base=0은 무영향, decode만 터짐). test가 전체 테이블 시작만 넘기도록 수정 → 12/12.
+pred=in 패턴→rope 위치 의심으로 격리(golden-debug).
+
+**3분류(서빙판)**: ② `attn_decode`에 scale+window 인자(기본값 보존, qwen35 회귀 PASS) — Gemma4 scaling=1.0+
+sliding, 인자이지 모델분기 아님. ① gemma4_decode(graph)+G4DecodeState+manifest_gemma4 신규 모델별. **③ 서빙
+코어 모델분기 = 0건**(decode/state는 Gemma4 전용 파일, 공유 코어 무오염).
+
+### A-2 / A-3 (진행 예정)
+- A-2: sliding KV **링버퍼 캡**(현 alloc은 캡 크기 반영하나 append는 선형 base — 긴 시퀀스는 modulo 필요) +
+  캡 유/무 golden 불변 증명(경계) + KV bytes 예산 전/후.
+- A-3: bench 모델-중립화(Qwen 하드코딩 bench_serve.cu:45/170/185 해소) + gemma4_decode_batch + RSS 가드 + 스모크.
+
+---
+### (원 산정 기록 — A-1로 상당 부분 해소)
 
 **모델-중립성 시험 결과(코드 조사, 파일:라인)**: `bench_serve.cu`는 **모델-중립 아님** —
 `step_forward`가 `qwen35_decode_batch`(models/qwen35_batch.cu) 직접 호출, `load_config_qwen`·`load_weights_qwen`
