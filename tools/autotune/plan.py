@@ -120,18 +120,46 @@ def estimate_params(m: dict) -> float:
     return attn + gdn + ffn + embed
 
 
+# ---------- MoE 활성 파라미터(decode 1토큰이 실제 이동하는 weight) ----------
+def active_params(mp: dict) -> float:
+    """MoE decode 활성 파라미터 = lm_head + Σlayer(attn/GDN + router + shared_ffn + top_k·expert_ffn).
+    전체 params(모든 expert 상주)와 구분 — decode bytes 지배는 활성분(A3B의 핵심). manifest 형상 근거."""
+    H, L, V = mp["hidden_size"], mp["num_layers"], mp["vocab_size"]
+    nfull = mp.get("num_full_layers", L // (mp.get("full_attention_interval") or 1))
+    ngdn = L - nfull
+    NQ, NKV, HD = mp["num_q_heads"], mp["num_kv_heads"], mp["head_dim"]
+    attn_per = H * NQ * HD + 2 * H * NKV * HD + NQ * HD * H          # q+kv+o (full 층)
+    kdim = mp.get("linear_num_key_heads", 0) * mp.get("linear_key_head_dim", 0)
+    vdim = mp.get("linear_num_value_heads", 0) * mp.get("linear_value_head_dim", 0)
+    gdn_per = H * (2 * kdim + 2 * vdim) + vdim * H + H * vdim         # qkvz 근사 + out (gdn 층)
+    router = H * mp["num_experts"]
+    shared = 3 * H * mp["shared_expert_intermediate_size"]
+    experts = mp["top_k"] * 3 * H * mp["moe_intermediate_size"]      # ★활성 top_k expert만
+    lm_head = V * H                                                  # 매 토큰 logits 읽기
+    return lm_head + nfull * attn_per + ngdn * gdn_per + L * (router + shared + experts)
+
+
 # ---------- roofline 상한 추정기 ----------
 def roofline(dp: dict, mp: dict, accept: float = 4.4, batch: int = 12) -> dict:
-    """상한 = BW ÷ 토큰당-이동바이트 (×accept for spec). 예측이 아니라 천장 — 달성률로 오차 명시."""
+    """상한 = BW ÷ 토큰당-이동바이트 (×accept for spec). 예측이 아니라 천장 — 달성률로 오차 명시.
+    MoE는 활성 파라미터(active_params) 기준 — decode bytes=활성분(전체 상주≠이동)."""
     bw = dp["bandwidth_gbps"] * 1e9
-    pb = mp["params_b"] * 1e9
     bytes_w = {"w4a8": 0.5 * 1.0625, "fp16": 2.0, "fp32": 4.0}.get(mp.get("quant", "w4a8"), 0.5 * 1.0625)
-    per_tok = pb * bytes_w  # weight 이동 지배 가정(KV/act은 소항 — 상한이므로 무시가 보수적 아님을 명시)
+    is_moe = bool(mp.get("moe"))
+    pb = (active_params(mp) if is_moe else mp["params_b"] * 1e9)
+    per_tok = pb * bytes_w
     single = bw / per_tok
+    assumptions = {"bandwidth_gbps": dp["bandwidth_gbps"], "quant": mp.get("quant"),
+                   "bytes_per_param": round(bytes_w, 4),
+                   "note": "weight 이동만 계상(KV/activation/GDN-state 제외) — 상한이며 예측 아님"}
+    if is_moe:
+        assumptions["moe"] = {"total_params_b": mp["params_b"], "active_params_b": round(pb / 1e9, 2),
+                              "top_k": mp["top_k"], "num_experts": mp["num_experts"],
+                              "note": "decode bytes=활성분(top_k expert+shared+attn/GDN+lm_head). 전체 상주는 128GB unified."}
+    else:
+        assumptions["params_b"] = mp["params_b"]
     return {
-        "assumptions": {"bandwidth_gbps": dp["bandwidth_gbps"], "params_b": mp["params_b"],
-                        "quant": mp.get("quant"), "bytes_per_param": round(bytes_w, 4),
-                        "note": "weight 이동만 계상(KV/activation 제외) — 상한이며 예측 아님"},
+        "assumptions": assumptions,
         "single_decode_upper_tok_s": round(single, 1),
         "batch_upper_tok_s": {"B": batch, "value": round(single * batch, 1),
                               "note": "weight 1운반/배치 이상적 가정 — 실제는 draft/스케줄/attn per-slot로 하회"},
@@ -200,7 +228,7 @@ def strategy(dp: dict, mp: dict, constraints: dict = None) -> dict:
         traits.append("small(<2B)")
         axes.append(("sync/host 오버헤드 축(draft 배칭·디바이스화)", "0.8b 실측: sync가 지배(258 t/s 개선 사례)"))
     else:
-        traits.append(f"large dense({mp['params_b']}B)")
+        traits.append(f"large {'MoE' if mp.get('moe') else 'dense'}({mp['params_b']}B)")
         if spec:
             axes.append(("bytes/token 축(양자화·MTP spec — 분모 축소)", "27b 실측: MTP q4+spec으로 plain 추월(P5)"))
         else:
