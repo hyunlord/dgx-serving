@@ -22,6 +22,7 @@ static double mae(const std::vector<float>&a,const std::vector<float>&b){double 
 
 int main(int argc,char**argv){
     WD=argc>1?argv[1]:"artifacts/gemma4-31b/weights"; GD=(argc>2?argv[2]:"artifacts/gemma4-31b/golden")+std::string("/");
+    int uq=argc>3?atoi(argv[3]):1;   // 1=q4(가중치만 양자화), 2=W4A8(가중치 q4 + 활성화 int8) — 골든은 공통(q4 weights)
     ModelConfig c=load_config_gemma4((WD+"/manifest.json").c_str());
     const int H=c.hidden_size,V=c.vocab_size,L=c.num_layers;
     const int hd_f=c.global_head_dim?c.global_head_dim:c.head_dim;
@@ -50,7 +51,8 @@ int main(int argc,char**argv){
     std::vector<float> hidden((size_t)(L+1)*SH), logits((size_t)S*V);
     auto am=[&](const std::vector<float>&lg,int pos){int b=0;float bv=lg[(size_t)pos*V];for(int j=1;j<V;j++){float x=lg[(size_t)pos*V+j];if(x>bv){bv=x;b=j;}}return b;};
 
-    gemma4_forward(c,w,d_ids,S,d_cf,d_sf,d_cs,d_ss,d_logits,d_hidden,/*use_q4=*/1);
+    printf("[mode] use_q4=%d (%s)\n", uq, uq==2?"W4A8(활성화 int8)":"q4(활성화 fp32)");
+    gemma4_forward(c,w,d_ids,S,d_cf,d_sf,d_cs,d_ss,d_logits,d_hidden,/*use_q4=*/uq);
     TCK(cudaMemcpy(hidden.data(),d_hidden,hidden.size()*4,cudaMemcpyDeviceToHost));
     TCK(cudaMemcpy(logits.data(),d_logits,logits.size()*4,cudaMemcpyDeviceToHost));
 
@@ -81,11 +83,13 @@ int main(int argc,char**argv){
     printf("      (엔진 GPU-fp32 vs 골든 CPU-fp32, 동일 q4 weights — rel<2e-3=GPU/CPU fp32 산술차, 버그 아님)\n");
     printf("  (b) full-depth argmax(bf16 골든): %s | logits maxabs=%.3e | last eng=%d gold=%d\n",
            amok?"ALL 일치":"MISMATCH", el_bf16, am(logits,S-1), am(gl,S-1));
-    // 게이트: 상대오차 <2e-3(GPU/CPU fp32 산술차 상한, Gemma 대규모 hidden 정규화) + full-depth argmax 전위치.
-    bool fp32_ok = (fp32_n>0) && (rel_worst < 2e-3);
+    // 게이트: q4=rel<2e-3(GPU/CPU fp32 산술차 상한). W4A8=활성화 int8(QBLK=32) 양자화 노이즈 포함 → rel 임계 완화
+    //   (27b W4A8 스킴과 동일 문화: 활성화 양자화는 근사, 게이트=op-level rel<임계 + argmax 전위치 일치).
+    double rel_gate = (uq==2)? 1.5e-2 : 2e-3;   // W4A8 측정 worst 6.5e-3(활성화 int8) → 1.5e-2=2.3× 마진(회귀 감지력 유지)
+    bool fp32_ok = (fp32_n>0) && (rel_worst < rel_gate);
     bool pass = fp32_ok && amok;
-    printf("[test_gemma4] %s (게이트=op-level fp32 %d층 rel<2e-3 + full-depth argmax)\n",
-           pass?"PASS":"FAIL", fp32_n);
+    printf("[test_gemma4] %s (게이트=op-level fp32 %d층 rel<%.0e[%s] + full-depth argmax)\n",
+           pass?"PASS":"FAIL", fp32_n, rel_gate, uq==2?"W4A8":"q4");
     free_weights_gemma4(w); free_config_gemma4(c);
     return pass?0:1;
 }
