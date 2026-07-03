@@ -40,6 +40,24 @@ def per_slot_bytes(mp: dict, K: int, W: int, pmax: int = None) -> int:
     return per_kv + per_mtp + per_va
 
 
+def per_slot_bytes_plain(mp: dict, maxlen: int = 384) -> int:
+    """plain(GDN·MTP 無, Gemma4류) per-slot KV bytes = bench_serve_gemma4/decode_state_gemma4 per_seq_bytes 재현.
+    full 층(hd_f·nkv_f) + sliding 층(hd_s·nkv_s), 선형 캡(max_len), ×2(K,V)×4(fp32)."""
+    L = mp["num_layers"]
+    ap = mp.get("attn_pattern", {})
+    nfull = ap.get("full_layers", L)
+    nsliding = ap.get("sliding_layers", L - nfull)
+    hd_s, nkv_s = mp["head_dim"], mp["num_kv_heads"]
+    hd_f = mp.get("global_head_dim", hd_s)
+    nkv_f = mp.get("num_global_key_value_heads", nkv_s)
+    return nfull * maxlen * nkv_f * hd_f * 2 * 4 + nsliding * maxlen * nkv_s * hd_s * 2 * 4
+
+
+def per_slot_bytes_auto(mp: dict, K: int = 0, W: int = 0) -> int:
+    """모델 유형 자동 분기: spec(mtp) → 기존 per_slot_bytes(K/W/MTP), plain → per_slot_bytes_plain(KV only)."""
+    return per_slot_bytes(mp, K, W) if mp.get("mtp") else per_slot_bytes_plain(mp)
+
+
 def mem_available_bytes() -> int:
     """가드 정확화(Phase 7): MemAvailable(페이지캐시 등 회수 가능 포함)이 unified 실제 가용."""
     with open("/proc/meminfo") as f:

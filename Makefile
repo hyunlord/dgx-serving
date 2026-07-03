@@ -102,6 +102,10 @@ tools/serve_gemma4: tools/serve_gemma4.cu models/gemma4_batch.cu runtime/weights
 tools/bench_gemma4: tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
 
+# M4 STEP C: Gemma4 plain 서빙 튜닝 스윕(λ×Bmax, dummy rope, 메모리 필터). 사용법: ./tools/bench_serve_gemma4 <w> [uq] [nreq] [seed] [pmax] [maxlen] [B..] -- [λ..]
+tools/bench_serve_gemma4: tools/bench_serve_gemma4.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_serve_gemma4.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
+
 # 챕터10 축2: spec-serving 벤치(연속배칭+슬롯별 spec 사이클, ragged verify_batch). ISO=1 iso게이트, TIME=1 곱 B버킷.
 #   사용법: ./tools/bench_serve_spec [w] [g] [uq] [Bmax] [nreq] [seed] [K] [W] [λ...]
 tools/bench_serve_spec: tools/bench_serve_spec.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
