@@ -1,8 +1,8 @@
 meta:
   schema: dgx-recipe/v0
-  created: '2026-07-03T09:41:09'
+  created: '2026-07-03T11:23:37'
   tool: dgx-serving autotune phase2b
-  engine_commit: '8764391'
+  engine_commit: ec4d7a1
 target:
   device:
     name: GB10
@@ -67,7 +67,7 @@ settings:
         K: 7
         W: 2
       backend_env:
-        DRAFT_MW: '0'
+        DRAFT_MW: '1'
     - when:
         lam: 8.0
         short_ratio: 0.9
@@ -172,20 +172,20 @@ claims:
     bmax: 16
     K: 7
     W: 2
-  scheme: w4a8+mtp_q4+concat-mmq(Nn>8)+draft_gemm_batch
+  scheme: w4a8+mtp_q4+concat-mmq(Nn>8)+draft_mw1
   measured:
     screen:
       conditions:
         nreq: 12
         seed: 42
-      tok_s: 45.7
-      tpot95: 0.355
+      tok_s: 47.6
+      tpot95: null
     final:
       conditions:
         nreq: 60
         seed: 42
-      tok_s: 51.7
-      tpot95: 0.3354
+      tok_s: 53.2
+      tpot95: 0.3238
       accept: 4.61
 - regime:
     lam: 8.0
@@ -232,8 +232,8 @@ claims:
       tpot95: 0.3362
       accept: 4.61
 provenance:
-  source_artifact: regime-table-Qwen3.5-27B-2026-07-03.json
-  source_sha256_16: 560711e1082fd562
+  source_artifact: regime-table-Qwen3.5-27B-2026-07-03-mw1.json
+  source_sha256_16: 805b57f2c9e0cbc7
   trial_db: tools/autotune/autotune.db (not distributed)
   verification: regime winners full ISO 12/12 PASS ×2 (long B16K7W2 mw0, short B6K7W3
     mw1)

@@ -1,0 +1,537 @@
+{
+ "schema": "dgx-serving/autotune-regime-table@1",
+ "created": "2026-07-03T15:30:00",
+ "device_profile": {
+  "name": "GB10 (DGX Spark, sm_121)",
+  "arch": "sm_121",
+  "compile_arch": "sm_120",
+  "bandwidth_gbps": 273,
+  "unified_memory": true,
+  "mem_total_gb": 128,
+  "mem_probe": "max(cudaMemGetInfo.free, /proc/meminfo MemAvailable)",
+  "mem_guard_margin": 0.7,
+  "toolkit": {
+   "cuda_version": "13.0",
+   "cp_async": true,
+   "mma_int8": true,
+   "fp4_mma": false,
+   "fp4_blocked_reason": "ptxas PTX 9.0 cannot emit mxf4 (needs >=9.2)"
+  }
+ },
+ "model_profile": {
+  "name": "Qwen3.5-27B",
+  "weights_dir": "artifacts/qwen35-27b/weights",
+  "golden_dir": "artifacts/qwen35-27b/mtp_golden",
+  "uq": 2,
+  "params_b": 27,
+  "gdn": true,
+  "tied_lm_head": false,
+  "moe": false,
+  "quant": "w4a8",
+  "num_layers": 64,
+  "full_attention_interval": 4,
+  "num_kv_heads": 4,
+  "head_dim": 256,
+  "linear_num_key_heads": 16,
+  "linear_num_value_heads": 48,
+  "linear_key_head_dim": 128,
+  "linear_value_head_dim": 128,
+  "linear_conv_kernel": 4,
+  "pmax_default": 32
+ },
+ "objective": {
+  "screen_nreq": 12,
+  "final_nreq": 60,
+  "seed": 42,
+  "tpot_cap": 0.35,
+  "fixed_env": {
+   "MTP_Q4": "1",
+   "DRAFT_GEMV": "0",
+   "DRAFT_SEQ": "0"
+  }
+ },
+ "regime_table": [
+  {
+   "regime": {
+    "lam": 1.0,
+    "shortp": 0.9
+   },
+   "best": {
+    "params": {
+     "bmax": 6,
+     "K": 7,
+     "W": 3,
+     "DRAFT_MW": "1"
+    },
+    "screen": {
+     "tok_s": 28.4,
+     "tpot95": 0.2377
+    },
+    "nreq60": {
+     "tok_s": 36.4,
+     "tpot95": 0.186,
+     "accept": 4.97,
+     "avgB": 3.48
+    }
+   },
+   "latency_alt": {
+    "params": {
+     "bmax": 4,
+     "K": 7,
+     "W": 3,
+     "DRAFT_MW": "1"
+    },
+    "screen": {
+     "tok_s": 28.4,
+     "tpot95": 0.169
+    },
+    "nreq60": {
+     "tok_s": 35.3,
+     "tpot95": 0.1515,
+     "accept": 4.97,
+     "avgB": 3.19
+    }
+   },
+   "candidates": [
+    {
+     "params": {
+      "bmax": 6,
+      "K": 7,
+      "W": 3,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 28.4,
+      "tpot95": 0.2377
+     },
+     "nreq60": {
+      "tok_s": 36.4,
+      "tpot95": 0.186,
+      "accept": 4.97,
+      "avgB": 3.48
+     }
+    },
+    {
+     "params": {
+      "bmax": 4,
+      "K": 7,
+      "W": 3,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 28.4,
+      "tpot95": 0.169
+     },
+     "nreq60": {
+      "tok_s": 35.3,
+      "tpot95": 0.1515,
+      "accept": 4.97,
+      "avgB": 3.19
+     }
+    }
+   ]
+  },
+  {
+   "regime": {
+    "lam": 1.0,
+    "shortp": 0.3
+   },
+   "best": {
+    "params": {
+     "bmax": 16,
+     "K": 7,
+     "W": 2,
+     "DRAFT_MW": "0"
+    },
+    "screen": {
+     "tok_s": 38.1,
+     "tpot95": 0.3123
+    },
+    "nreq60": {
+     "tok_s": 51.6,
+     "tpot95": 0.3187,
+     "accept": 4.61,
+     "avgB": 9.95
+    }
+   },
+   "latency_alt": {
+    "params": {
+     "bmax": 12,
+     "K": 8,
+     "W": 2,
+     "DRAFT_MW": "1"
+    },
+    "screen": {
+     "tok_s": 37.4,
+     "tpot95": 0.3145
+    },
+    "nreq60": {
+     "tok_s": 50.9,
+     "tpot95": 0.2524,
+     "accept": 4.84,
+     "avgB": 8.46
+    }
+   },
+   "candidates": [
+    {
+     "params": {
+      "bmax": 16,
+      "K": 7,
+      "W": 2,
+      "DRAFT_MW": "0"
+     },
+     "screen": {
+      "tok_s": 38.1,
+      "tpot95": 0.3123
+     },
+     "nreq60": {
+      "tok_s": 51.6,
+      "tpot95": 0.3187,
+      "accept": 4.61,
+      "avgB": 9.95
+     }
+    },
+    {
+     "params": {
+      "bmax": 12,
+      "K": 8,
+      "W": 2,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 37.4,
+      "tpot95": 0.3145
+     },
+     "nreq60": {
+      "tok_s": 50.9,
+      "tpot95": 0.2524,
+      "accept": 4.84,
+      "avgB": 8.46
+     }
+    }
+   ]
+  },
+  {
+   "regime": {
+    "lam": 4.0,
+    "shortp": 0.9
+   },
+   "best": {
+    "params": {
+     "bmax": 4,
+     "K": 7,
+     "W": 2,
+     "DRAFT_MW": "0"
+    },
+    "screen": {
+     "tok_s": 35.6,
+     "tpot95": 0.1929
+    },
+    "nreq60": {
+     "tok_s": 33.2,
+     "tpot95": 0.1458,
+     "accept": 5.0,
+     "avgB": 3.88
+    }
+   },
+   "latency_alt": null,
+   "candidates": [
+    {
+     "params": {
+      "bmax": 4,
+      "K": 7,
+      "W": 2,
+      "DRAFT_MW": "0"
+     },
+     "screen": {
+      "tok_s": 35.6,
+      "tpot95": 0.1929
+     },
+     "nreq60": {
+      "tok_s": 33.2,
+      "tpot95": 0.1458,
+      "accept": 5.0,
+      "avgB": 3.88
+     }
+    },
+    {
+     "params": {
+      "bmax": 4,
+      "K": 7,
+      "W": 3,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 35.6,
+      "tpot95": 0.1921
+     },
+     "nreq60": {
+      "tok_s": 32.5,
+      "tpot95": 0.1489,
+      "accept": 4.97,
+      "avgB": 3.89
+     }
+    }
+   ]
+  },
+  {
+   "regime": {
+    "lam": 4.0,
+    "shortp": 0.3
+   },
+   "best": {
+    "params": {
+     "bmax": 16,
+     "K": 7,
+     "W": 2,
+     "DRAFT_MW": "1"
+    },
+    "screen": {
+     "tok_s": 47.6,
+     "tpot95": null
+    },
+    "nreq60": {
+     "tok_s": 53.2,
+     "tpot95": 0.3238,
+     "accept": 4.61,
+     "avgB": 11.75
+    }
+   },
+   "latency_alt": {
+    "params": {
+     "bmax": 10,
+     "K": 8,
+     "W": 2,
+     "DRAFT_MW": "1"
+    },
+    "screen": {
+     "tok_s": 44.2,
+     "tpot95": 0.3432
+    },
+    "nreq60": {
+     "tok_s": 47.3,
+     "tpot95": 0.2193,
+     "accept": 4.84,
+     "avgB": 8.29
+    }
+   },
+   "candidates": [
+    {
+     "params": {
+      "bmax": 16,
+      "K": 7,
+      "W": 2,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 47.6,
+      "tpot95": null
+     },
+     "nreq60": {
+      "tok_s": 53.2,
+      "tpot95": 0.3238,
+      "accept": 4.61,
+      "avgB": 11.75
+     }
+    },
+    {
+     "params": {
+      "bmax": 16,
+      "K": 7,
+      "W": 2,
+      "DRAFT_MW": "0"
+     },
+     "screen": {
+      "tok_s": 45.7,
+      "tpot95": 0.355
+     },
+     "nreq60": {
+      "tok_s": 51.7,
+      "tpot95": 0.3354,
+      "accept": 4.61,
+      "avgB": 11.75
+     }
+    },
+    {
+     "params": {
+      "bmax": 10,
+      "K": 8,
+      "W": 2,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 44.2,
+      "tpot95": 0.3432
+     },
+     "nreq60": {
+      "tok_s": 47.3,
+      "tpot95": 0.2193,
+      "accept": 4.84,
+      "avgB": 8.29
+     }
+    }
+   ]
+  },
+  {
+   "regime": {
+    "lam": 8.0,
+    "shortp": 0.9
+   },
+   "best": {
+    "params": {
+     "bmax": 6,
+     "K": 7,
+     "W": 3,
+     "DRAFT_MW": "1"
+    },
+    "screen": {
+     "tok_s": 35.7,
+     "tpot95": 0.2365
+    },
+    "nreq60": {
+     "tok_s": 38.0,
+     "tpot95": 0.2089,
+     "accept": 4.97,
+     "avgB": 5.66
+    }
+   },
+   "latency_alt": {
+    "params": {
+     "bmax": 4,
+     "K": 7,
+     "W": 3,
+     "DRAFT_MW": "1"
+    },
+    "screen": {
+     "tok_s": 34.9,
+     "tpot95": 0.1927
+    },
+    "nreq60": {
+     "tok_s": 31.6,
+     "tpot95": 0.1482,
+     "accept": 4.97,
+     "avgB": 3.89
+    }
+   },
+   "candidates": [
+    {
+     "params": {
+      "bmax": 6,
+      "K": 7,
+      "W": 3,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 35.7,
+      "tpot95": 0.2365
+     },
+     "nreq60": {
+      "tok_s": 38.0,
+      "tpot95": 0.2089,
+      "accept": 4.97,
+      "avgB": 5.66
+     }
+    },
+    {
+     "params": {
+      "bmax": 4,
+      "K": 7,
+      "W": 3,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 34.9,
+      "tpot95": 0.1927
+     },
+     "nreq60": {
+      "tok_s": 31.6,
+      "tpot95": 0.1482,
+      "accept": 4.97,
+      "avgB": 3.89
+     }
+    }
+   ]
+  },
+  {
+   "regime": {
+    "lam": 8.0,
+    "shortp": 0.3
+   },
+   "best": {
+    "params": {
+     "bmax": 16,
+     "K": 7,
+     "W": 2,
+     "DRAFT_MW": "0"
+    },
+    "screen": {
+     "tok_s": 45.9,
+     "tpot95": 0.3574
+    },
+    "nreq60": {
+     "tok_s": 51.7,
+     "tpot95": 0.3362,
+     "accept": 4.61,
+     "avgB": 11.86
+    }
+   },
+   "latency_alt": {
+    "params": {
+     "bmax": 10,
+     "K": 8,
+     "W": 2,
+     "DRAFT_MW": "1"
+    },
+    "screen": {
+     "tok_s": 45.0,
+     "tpot95": 0.3374
+    },
+    "nreq60": {
+     "tok_s": 47.8,
+     "tpot95": 0.2228,
+     "accept": 4.84,
+     "avgB": 8.35
+    }
+   },
+   "candidates": [
+    {
+     "params": {
+      "bmax": 16,
+      "K": 7,
+      "W": 2,
+      "DRAFT_MW": "0"
+     },
+     "screen": {
+      "tok_s": 45.9,
+      "tpot95": 0.3574
+     },
+     "nreq60": {
+      "tok_s": 51.7,
+      "tpot95": 0.3362,
+      "accept": 4.61,
+      "avgB": 11.86
+     }
+    },
+    {
+     "params": {
+      "bmax": 10,
+      "K": 8,
+      "W": 2,
+      "DRAFT_MW": "1"
+     },
+     "screen": {
+      "tok_s": 45.0,
+      "tpot95": 0.3374
+     },
+     "nreq60": {
+      "tok_s": 47.8,
+      "tpot95": 0.2228,
+      "accept": 4.84,
+      "avgB": 8.35
+     }
+    }
+   ]
+  }
+ ],
+ "note": "mw1 갱신판(M4 STEP 0): λ4 long-heavy 승자 mw0→mw1 — nreq60 seed42 53.2/seed777 53.9(mw0 51.0 대비 +4.3~5.7%), full ISO 12/12 PASS. 원본 provenance 참조물은 보존(regime-table-...-07-03.json)"
+}
