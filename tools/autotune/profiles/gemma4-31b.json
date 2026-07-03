@@ -32,5 +32,8 @@
   },
   "multimodal_wrapper": true,
   "quant": "w4a8",
-  "mtp": false
+  "mtp": false,
+  "weights_dir": "artifacts/gemma4-31b/weights",
+  "golden_dir": "artifacts/gemma4-31b/golden",
+  "uq": 2
 }

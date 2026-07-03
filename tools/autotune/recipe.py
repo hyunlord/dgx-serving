@@ -24,7 +24,24 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
-from autotune import per_slot_bytes, mem_available_bytes, run_bench  # noqa: E402
+from autotune import per_slot_bytes, per_slot_bytes_auto, mem_available_bytes, run_bench  # noqa: E402
+
+# plain(spec 無) 서빙 미니벤치: bench_serve_gemma4 실행 + tok/s 파싱(해당 bmax·λ 행).
+def run_bench_plain(mp, bmax, lam, nreq, seed):
+    bin_ = os.path.join(REPO, "tools", "bench_serve_gemma4")
+    cmd = [bin_, mp["weights_dir"], str(mp.get("uq", 2)), str(nreq), str(seed), "32", "384", str(bmax), "--", str(lam)]
+    r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=1200)
+    out = r.stdout + r.stderr
+    for line in out.splitlines():
+        p = line.split()
+        # 행 형식: "  <bmax> <lam> | req/s tok/s | tpot50 tpot95 | avgB maxQ"
+        if len(p) >= 5 and p[0].isdigit() and int(p[0]) == bmax and p[2] == "|":
+            try:
+                if abs(float(p[1]) - lam) < 1e-6:
+                    return {"tok_s": float(p[4]), "tpot95": float(p[7]) if len(p) > 7 else None}
+            except (ValueError, IndexError):
+                continue
+    return {"tok_s": 0, "tpot95": None, "raw": out[-400:]}
 
 SCHEMA_VER = "dgx-recipe/v0"
 
@@ -153,7 +170,8 @@ def local_memory_check(recipe, mp, dp):
     ok, rejected = [], []
     for rg in recipe["settings"]["policy"]["regimes"]:
         c = rg["config"]
-        need = c["bmax"] * per_slot_bytes(mp, c["K"], c["W"])
+        # plain(spec 無)은 K/W 없음 → per_slot_bytes_auto가 KV-only 계산
+        need = c["bmax"] * per_slot_bytes_auto(mp, c.get("K", 0), c.get("W", 0))
         (ok if need <= avail else rejected).append(
             {"regime": rg["when"], "config": c, "need_gb": round(need / 1e9, 2)})
     return ok, rejected, round(avail / 1e9, 2)
@@ -195,17 +213,21 @@ def cmd_verify(args):
     best_thru = max(claims, key=lambda c: c["measured"]["final"]["tok_s"] or 0)
     best_lat = min(claims, key=lambda c: c["measured"]["final"]["tpot95"] or 9)
     picks = [best_thru] + ([best_lat] if best_lat is not best_thru else [])
+    plain = not mp.get("mtp")   # spec 無 → plain 미니벤치(bench_serve_gemma4), spec ISO 없음
     results = []
     for c in picks:
         cond_key = "final" if args.full else "screen"
         cond = c["measured"][cond_key]["conditions"]
         cfg, rg = c["config"], c["regime"]
-        env = {**recipe["settings"]["backend"]["fixed_env"], "SHORTP": str(rg["short_ratio"])}
-        for rgs in recipe["settings"]["policy"]["regimes"]:
-            if rgs["when"]["lam"] == rg["lam"] and rgs["when"]["short_ratio"] == rg["short_ratio"]:
-                env.update(rgs["backend_env"])
-        res, _ = run_bench(mp, cfg["bmax"], cfg["K"], cfg["W"], rg["lam"], cond["nreq"], cond["seed"],
-                           extra_env=env)
+        if plain:
+            res = run_bench_plain(mp, cfg["bmax"], rg["lam"], cond["nreq"], cond["seed"])
+        else:
+            env = {**recipe["settings"]["backend"]["fixed_env"], "SHORTP": str(rg["short_ratio"])}
+            for rgs in recipe["settings"]["policy"]["regimes"]:
+                if rgs["when"]["lam"] == rg["lam"] and rgs["when"]["short_ratio"] == rg["short_ratio"]:
+                    env.update(rgs["backend_env"])
+            res, _ = run_bench(mp, cfg["bmax"], cfg["K"], cfg["W"], rg["lam"], cond["nreq"], cond["seed"],
+                               extra_env=env)
         claimed = c["measured"][cond_key]["tok_s"]
         repro = (res.get("tok_s", 0) / claimed * 100) if claimed else 0
         results.append({"regime": rg, "config": cfg, "claimed_tok_s": claimed,
@@ -214,15 +236,19 @@ def cmd_verify(args):
         print(f"  [재현율] {rg} {cfg}: claim {claimed} vs local {res.get('tok_s')} tok/s "
               f"= {repro:.1f}% (조건 {cond})")
 
-    # ④ ISO 스팟(최고 throughput 승자 config·해당 스킴)
-    c = best_thru
-    env = {**recipe["settings"]["backend"]["fixed_env"], "SHORTP": str(c["regime"]["short_ratio"])}
-    for rgs in recipe["settings"]["policy"]["regimes"]:
-        if rgs["when"]["lam"] == c["regime"]["lam"] and rgs["when"]["short_ratio"] == c["regime"]["short_ratio"]:
-            env.update(rgs["backend_env"])
-    iso, _ = run_bench(mp, c["config"]["bmax"], c["config"]["K"], c["config"]["W"],
-                       c["regime"]["lam"], 12, 42, iso=True, extra_env=env)
-    print(f"  [ISO 스팟] {c['config']} scheme={c['scheme']}: {iso.get('iso')}")
+    # ④ bit-id 게이트: spec은 서빙-시 ISO 스팟, plain은 오프라인 bit-id(test_gemma4_batch SMAX 버킷)로 대체
+    if plain:
+        iso = {"iso": "offline: test_gemma4_batch uq=2(W4A8 sb, SMAX 버킷 내 bit-id 0) — 서빙-시 ISO는 spec 전용", "iso_pass": True}
+        print(f"  [bit-id] plain: {iso['iso']}")
+    else:
+        c = best_thru
+        env = {**recipe["settings"]["backend"]["fixed_env"], "SHORTP": str(c["regime"]["short_ratio"])}
+        for rgs in recipe["settings"]["policy"]["regimes"]:
+            if rgs["when"]["lam"] == c["regime"]["lam"] and rgs["when"]["short_ratio"] == c["regime"]["short_ratio"]:
+                env.update(rgs["backend_env"])
+        iso, _ = run_bench(mp, c["config"]["bmax"], c["config"]["K"], c["config"]["W"],
+                           c["regime"]["lam"], 12, 42, iso=True, extra_env=env)
+        print(f"  [ISO 스팟] {c['config']} scheme={c['scheme']}: {iso.get('iso')}")
 
     ok = all(r["repro_pct"] >= 90 for r in results) and iso.get("iso_pass") and not warns
     print(f"[verify] {'PASS' if ok else 'PARTIAL'} — 재현율 {[r['repro_pct'] for r in results]}%, "

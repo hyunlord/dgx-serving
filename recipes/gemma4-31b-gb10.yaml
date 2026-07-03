@@ -1,0 +1,97 @@
+meta:
+  schema: dgx-recipe/v0
+  created: '2026-07-04T01:48:16'
+  tool: dgx-serving autotune STEP C (plain, model 2호)
+  engine_commit: 568bda7
+  note: |
+    Gemma4는 MTP 부재 → plain 서빙(spec 없음). 27b 레시피와 달리 config=bmax 단일 축
+    (K/W/DRAFT/MTP 축 제거 — plan.py strategy가 spec_capable=false로 정직 축소).
+    scheme=W4A8 + batch dispatch(SMAX 버킷). bit-id는 버킷 내에서만(경계=스킴 변경).
+target:
+  device:
+    name: GB10
+    gpu_probe: NVIDIA GB10
+    bandwidth_gbps: 273
+    mem_total_gb: 128
+    unified_memory: true
+    toolkit_required:
+      cp_async: true
+      mma_int8: true
+      fp4_mma: false
+    tolerance:
+      bandwidth_pct: 10
+      mem_total_pct: 10
+  model:
+    id: Gemma4-31B-it
+    params_b: 29.6
+    gdn: false
+    tied_lm_head: true
+    moe: false
+    mtp: false
+    quant: w4a8
+  user_constraints:
+    quant_bits: 4
+    tpot95_cap_s: 0.35
+settings:
+  policy:
+    type: static_regime_lookup
+    note: |
+      plain 서빙(spec 사이클 없음) — regime=λ만(gen mix 70%short/30%long 고정, short_ratio 축 미스윕:
+      한계로 기록). tpot95 cap 0.35s 내 throughput-max로 Bmax 선택. 저부하(λ≤1)는 B16이 역효과
+      (tpot 2× + throughput↓) → B8. 고부하(λ≥4)는 B16이 throughput 우위.
+    regimes:
+    - when:
+        lam: 1.0
+        short_ratio: 0.7
+      config:
+        bmax: 8
+      backend_env: {}
+    - when:
+        lam: 4.0
+        short_ratio: 0.7
+      config:
+        bmax: 16
+      backend_env: {}
+    - when:
+        lam: 16.0
+        short_ratio: 0.7
+      config:
+        bmax: 16
+      backend_env: {}
+  backend:
+    engine_bin: tools/bench_serve_gemma4
+    uq: 2
+    fixed_env: {}
+    quant_path:
+      prefill: q4(gemm_tiled)
+      decode: w4a8(sb dispatch)
+    note: |
+      프리필 q4(gemm_tiled 75 t/s) · decode W4A8(sb 9.26 single) 혼용이 CYC 최적
+      (W4A8 통짜 프리필 12.7은 gemv라 느림 — 프리필은 q4 GEMM 경로).
+claims:
+- regime: {lam: 1.0, short_ratio: 0.7}
+  config: {bmax: 8}
+  scheme: w4a8+sb(SMAX8 버킷, B≤8) — bit-id within bucket
+  measured:
+    screen: {tok_s: 35.6, tpot95: 0.136, conditions: {nreq: 48, seed: 42, maxlen: 384}}
+    final: {tok_s: 35.6, tpot95: 0.136, conditions: {nreq: 48, seed: 42, maxlen: 384}}
+- regime: {lam: 4.0, short_ratio: 0.7}
+  config: {bmax: 16}
+  scheme: w4a8+gemm_batch_w4a8(B16 특수화, else 분기) — bit-id within scheme
+  measured:
+    screen: {tok_s: 40.3, tpot95: 0.223, conditions: {nreq: 48, seed: 42, maxlen: 384}}
+    final: {tok_s: 40.3, tpot95: 0.223, conditions: {nreq: 48, seed: 42, maxlen: 384}}
+- regime: {lam: 16.0, short_ratio: 0.7}
+  config: {bmax: 16}
+  scheme: w4a8+gemm_batch_w4a8(B16 특수화, else 분기) — bit-id within scheme
+  measured:
+    screen: {tok_s: 41.3, tpot95: 0.224, conditions: {nreq: 48, seed: 42, maxlen: 384}}
+    final: {tok_s: 41.3, tpot95: 0.224, conditions: {nreq: 48, seed: 42, maxlen: 384}}
+verification:
+  scope: plain 서빙(spec 비교 없음 — MTP 부재). context maxlen=384(sliding 링버퍼 전 짧은 범위).
+  golden: W4A8 op-level rel 6.5e-3 + full-depth argmax(test_gemma4 uq=2, STEP1). batch bit-id SMAX 버킷 내(test_gemma4_batch uq=2 B=4).
+  engine_bin: tools/bench_serve_gemma4 (dummy rope 타이밍 — 값 무관, 현실 길이). warm 프로토콜 필수.
+  caveats: |
+    - short_ratio 축 미스윕(gen mix 고정 70/30) — regime은 λ만.
+    - avgB<Bmax(λ16 B16서 12) → 서빙 tok/s(41)는 raw same-length batch(76)보다 낮음(정직).
+    - 긴 context(>1024)는 sliding KV 링버퍼 미구현으로 범위 밖.
