@@ -53,7 +53,10 @@ provenance:      # source_artifact+sha256, trial DB 참조, 검증 프로토콜 
 
 ## v0 한계 / v1 후보
 
-- warm-start 훅은 안내 문구 수준(v1: 레시피 config를 Optuna enqueue_trial로 주입).
-- 장비 지문이 프로파일 파일 기반(로컬 자동 프로브는 STREAM/SM probe와 함께 v1).
+- ~~warm-start 훅은 안내 문구 수준~~ → **M2에서 실체화**: `autotune.py --warmstart recipe.yaml`이 regime
+  승자 config를 Optuna `enqueue_trial`로 주입(공간 밖 config는 스킵 보고). 효과는 controlled A/B로 정량
+  (docs/autotune-harness.md M2 STEP C).
+- ~~장비 지문이 프로파일 파일 기반~~ → **M2에서 해소**: `probe.py`가 STREAM/deviceProp/meminfo/toolkit 컴파일
+  시험으로 자동 생성, GB10 수동본 대조 PASS. `verify --device <auto.json>`로 그대로 사용 가능.
 - 정책이 정적 룩업(요청-경계 핫스위치·온라인 컨트롤러는 스킴 경계 해결 후).
 - 서명(무결성)은 provenance sha256 수준(암호학적 서명은 배포 채널 정할 때).

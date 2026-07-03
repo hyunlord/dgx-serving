@@ -1,0 +1,24 @@
+{
+  "name": "NVIDIA GB10",
+  "arch": "sm_121(=sm_121 호환)",
+  "compile_arch": "sm_120",
+  "sm_count": 48,
+  "bandwidth_gbps": 256,
+  "bandwidth_copy_gbps": 229,
+  "bandwidth_note": "STREAM read-only 실측(달성 가능 상한) — 수동본의 spec peak와 다른 의미",
+  "unified_memory": true,
+  "mem_total_gb": 129,
+  "mem_probe": "max(cudaMemGetInfo.free, /proc/meminfo MemAvailable)",
+  "mem_guard_margin": 0.7,
+  "toolkit": {
+    "cuda_version": "13.0",
+    "cp_async": true,
+    "mma_int8": true,
+    "fp4_mma": false,
+    "fp4_blocked_reason": "ptxas fatal   : Ptx assembly aborted due to errors"
+  },
+  "probe": {
+    "generated_by": "probe.py",
+    "stream_raw": "copy(R+W) 4.29 GB 2x: 37.442 ms -> 229.4 GB/s (84% of 273)"
+  }
+}

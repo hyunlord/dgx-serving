@@ -48,3 +48,4 @@ __pycache__/
 tools/autotune/autotune.db
 !tools/autotune/artifacts/
 !tools/autotune/artifacts/*.json
+tools/bw_stream

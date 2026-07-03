@@ -125,8 +125,69 @@ gemm_batch B{1..16} 특수화·canonical 게이팅이 원형. 산출물은 "최�
 - **regime 승자 full ISO 게이트: long-heavy B16 K7W2 mw0 = 12/12 PASS, short-heavy B6 K7W3 mw1 = 12/12 PASS**
   (각 스킴 내 배칭==단독 bit-identical — 고정 config 운영 시 정확성 보증).
 
+## M2 — Probe 자동화 + Plan 골격 + warm-start (검증 원리 = ground truth 대조)
+
+### STEP A: probe.py — 장비 지문 자동 측정기
+
+`tools/autotune/probe.py --out <auto.json> --compare profiles/gb10.json`
+- 측정 4종: ①STREAM 대역폭 실측(bw_stream 재사용 — copy R+W와 read-only 둘 다 기록) ②cudaDeviceProp
+  (이름/SM/arch/integrated) ③/proc/meminfo(MemTotal·MemAvailable — 기존 가드와 동일 방식)
+  ④toolkit caps **컴파일 시험**(cp.async/mma.s8/FP4 미니 커널을 nvcc로 실제 컴파일 — 문서 아닌 measured).
+- **대역폭 의미 구분(정직)**: 수동본 273은 spec peak, probe는 실측. `bandwidth_gbps`=read-only 실측
+  (decode GEMV는 read-지배)로 기록하고 주석 명시. GB10 실측: copy 229.4(84%), **read 255.8(94%)**.
+- **GB10 ground truth 대조 PASS**: read 256 vs peak 273 = 6.2%(recipe tolerance 10% 이내), mem ±2GB 내,
+  caps 3종 일치 — **fp4_mma 컴파일 실패(ptxas abort)가 자동으로 재확인됨**(toolkit-blocked ground truth).
+- 자동 프로파일을 `recipe.py verify --device <auto.json> --skip-bench`에 물려도 PASS(지문 경고 0) —
+  recipe-schema v0 한계("지문이 수동 파일 기반")를 해소.
+- 산출물: `tools/autotune/artifacts/gb10-auto-2026-07-03.json`.
+
+### STEP B: plan.py — 모델 해부 + roofline 상한 + 제약 + 전략 규칙 v0
+
+- **anatomy**: manifest.json(또는 HF config.json)→model profile 자동 생성. 27b 대조 PASS(구조 필드 전부
+  일치; params_b는 형상 기반 추정이라 ±10% 정합으로 판정 — auto 28 vs manual 27).
+- **roofline**: 상한 = BW ÷ (params×bytes/param) [×accept, ×B]. **상한이지 예측이 아님** — 27b 실측 대조
+  (`roofline --validate-27b`)로 달성률을 명시:
+
+  | 모드 | 상한(t/s) | 실측 | 달성률 |
+  |---|---|---|---|
+  | single non-spec | 19.0 | 11.9 | 62.5% |
+  | single spec(tree K4W3, accept 2.27) | 43.2 | 21.3 | 49.3% |
+  | batch B16 non-spec | 304.5 | 93.3 | 30.6% |
+  | spec serving B16 K7W2 | 304.5 | 51.7 | 17.0% |
+
+  하회 요인은 실측 근거로 명시(batch: GDN state per-slot 운반, spec: draft/MTP 오버헤드+accept<천장).
+- **constraints**: quant_bits 4=OK(w4a8 canonical), **2/1bit=정직 거부**(커널/스킴 부재+사유), tpot/ttft
+  SLO는 목적함수 페널티로 반영, fixed_* 축 고정.
+- **strategy v0**: 특성→우선 축(대형 dense=bytes축, 하이브리드=state축, untied=dq4 필수, MoE=expert축[미실측
+  명시]) — 각 축에 실측 챕터 근거 병기. fANOVA prior(DRAFT_SEQ 0.33>Bmax 0.31≫K 0.03>W 0.01)로 예산 배분,
+  multi-fidelity 계획(P2b 검증된 스크리닝→확정). **27b 생성 계획이 실측으로 밟은 경로(MTP q4/spec→bf16
+  state→B스케일, K/W는 미세)와 정합.**
+
+### STEP C: warm-start 훅 — 레시피→Optuna enqueue_trial
+
+- `--warmstart recipe.yaml`: regime 승자 config(중복 제거, 공간 밖 스킵 보고)를 `enqueue_trial`로 주입 —
+  지문 불일치 장비의 transfer 경로("레시피를 prior로 재튜닝") 실체화.
+- `--ab-warmstart`: 유/무 controlled A/B(같은 공간·예산·sampler seed·regime, 결정적 목적함수라 config 캐시
+  공유 — 비교 유효성 불변). 결과는 아래.
+
+**A/B 결과(27b, λ4 long-heavy SHORTP 0.3, 팔당 예산 20 trial[유효 warm 11/cold 9 — 나머지 prune], screen nreq12, sampler seed 동일)**:
+
+| 팔 | 레시피 수준(44.8) 도달 | 통합 최고의 99%(47.1) 도달 | best |
+|---|---|---|---|
+| **warm** | **유효 trial 2**(주입된 레시피 승자 B16 K7W2 mw0 즉시) | **유효 trial 9** (47.6 발견) | **B16 K7W2 mw1 = 47.6** |
+| cold | 유효 trial 9(예산 마지막에야) | 미도달 | B16 K7W2 mw0 = 44.8 |
+
+- **warm-start 효과 2중**: ①레시피 수준 도달이 9 trial→2 trial(즉시 — enqueue 설계 그대로), ②같은 예산에서
+  TPE가 레시피 승자 근방을 더 파고들어 **mw1 variant(47.6, 레시피 mw0 대비 +6.3% screening)**까지 발견 —
+  cold는 예산 내 미도달. 두 팔 모두 B16 K7W2 형상으로 수렴(regime 테이블과 정합 — 도구 재검증).
+- 정직 명시: 47.6/44.8은 **screening(nreq12) 충실도** — nreq60 확정치(51.7)와 직접 비교 금지. 단일 sampler
+  seed 1회 비교(추세 확인용 소예산 — 브리프 스코프). 1차 10-trial 예비판도 같은 방향(warm 2 trial 도달,
+  cold 미도달/best -18%).
+
 ## 한계 / 다음
 
 - 컴파일 타임 잔여 축(mmq 타일/regs — 정착 존중, GDN state 타입)은 build-in-the-loop 필요 시 별도.
 - 핫스위치 요청-경계 전환(슬롯별 형상, ragged Nn 활용) = per-request ISO 유지하는 정책 전환의 다음 단계.
-- Phase 3 = 4모델 확장(프로파일 교체), 장비 프로파일 자동 측정(STREAM/SM probe).
+- Phase 3 = 4모델 확장(프로파일 교체 + plan.py strategy로 초기 계획 자동 생성).
+- roofline은 weight-이동 상한만(KV/act/state 미계상) — 달성률 17~63%가 말하듯 예측 도구가 아님. per-mode
+  보정(state/draft 항 추가)은 필요해질 때.

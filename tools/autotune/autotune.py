@@ -318,6 +318,107 @@ def run_phase2b(mp, dp, args):
     return table
 
 
+# ---------- M2 STEP C: warm-start 훅(레시피 → enqueue_trial) ----------
+def recipe_warmstart_configs(recipe_path: str) -> list:
+    """recipe.yaml의 regime 승자 config들 → Optuna enqueue용 param dict(중복 제거).
+    transfer 경로 실체화: 불일치 장비에서 레시피를 prior로 재튜닝할 때 첫 trial들이 여기서 시작."""
+    import yaml
+    r = yaml.safe_load(open(recipe_path))
+    cfgs, seen = [], set()
+    for rg in r["settings"]["policy"]["regimes"]:
+        c = rg["config"]
+        mw = str((rg.get("backend_env") or {}).get("DRAFT_MW", "0"))
+        key = (c["bmax"], c["K"], c["W"], mw)
+        if key not in seen:
+            seen.add(key)
+            cfgs.append({"bmax": c["bmax"], "K": c["K"], "W": c["W"], "DRAFT_MW": mw})
+    return cfgs
+
+
+def enqueue_warmstart(study, cfgs, space, with_mw: bool, phase2_env: bool):
+    """탐색 공간 밖 config(예: bmax 상한 초과)는 건너뛰고 정직 보고."""
+    n = 0
+    for c in cfgs:
+        if not (space["bmax"][0] <= c["bmax"] <= space["bmax"][1] and c["bmax"] % 2 == 0
+                and space["K"][0] <= c["K"] <= space["K"][1]
+                and space["W"][0] <= c["W"] <= space["W"][1]):
+            print(f"[warmstart] 공간 밖 → 스킵: {c}", flush=True)
+            continue
+        p = {"bmax": c["bmax"], "K": c["K"], "W": c["W"]}
+        if with_mw:
+            p["DRAFT_MW"] = c["DRAFT_MW"]
+        if phase2_env:
+            p.update({"MTP_Q4": "1", "DRAFT_GEMV": "0", "DRAFT_SEQ": "0"})
+        study.enqueue_trial(p, skip_if_exists=True)
+        n += 1
+    print(f"[warmstart] {n}개 config enqueue(레시피 regime 승자)", flush=True)
+    return n
+
+
+def run_warmstart_ab(mp, dp, args):
+    """warm-start 유/무 controlled A/B — 같은 공간·예산·sampler seed·regime(λ, SHORTP), in-memory study 2개.
+    목적함수는 결정적(같은 trace seed)이므로 config→결과 캐시를 두 팔이 공유(재실행 절약 — 비교 유효성 불변).
+    지표: 두 팔 통합 최고 score의 99% 도달까지 trial 수."""
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    space = search_space_from_profiles(mp, dp)
+    fixed_env = {"MTP_Q4": "1", "DRAFT_GEMV": "0", "DRAFT_SEQ": "0"}
+    cfgs = recipe_warmstart_configs(args.ab_warmstart)
+    print(f"[A/B] regime λ={args.lam} SHORTP={args.shortp}, 팔당 {args.trials} trials "
+          f"(screen nreq={args.screen_nreq}), 레시피 후보 {len(cfgs)}개", flush=True)
+    server = WarmServer(mp)
+    cache = {}
+
+    def make_obj():
+        def objective(trial):
+            bmax = trial.suggest_int("bmax", *space["bmax"], step=2)
+            K = trial.suggest_int("K", *space["K"])
+            W = trial.suggest_int("W", *space["W"])
+            mw = trial.suggest_categorical("DRAFT_MW", P2B_ENV_AXES["DRAFT_MW"])
+            if K + W <= 8:
+                raise optuna.TrialPruned()
+            ok, need_gb, _ = mem_filter(mp, dp, bmax, K, W)
+            if not ok:
+                raise optuna.TrialPruned()
+            key = (bmax, K, W, mw)
+            if key not in cache:
+                env_key = tuple(sorted({**fixed_env, "DRAFT_MW": mw, "SHORTP": str(args.shortp)}.items()))
+                cache[key] = server.run(env_key, bmax, K, W, args.lam, args.screen_nreq, args.seed)
+            res = cache[key]
+            for k in ("tok_s", "tpot95"):
+                trial.set_user_attr(k, res[k])
+            return score(res, args.tpot_cap)
+        return objective
+
+    arms = {}
+    try:
+        for name, warm in (("warm", True), ("cold", False)):
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=args.sampler_seed, multivariate=True))
+            if warm:
+                enqueue_warmstart(study, cfgs, space, with_mw=True, phase2_env=False)
+            study.optimize(make_obj(), n_trials=args.trials)
+            hist = [(t.number, t.value) for t in study.trials
+                    if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+            arms[name] = {"history": hist, "best": study.best_trial.params,
+                          "best_score": study.best_value}
+            print(f"[A/B {name}] best {study.best_trial.params} score {study.best_value:.1f}", flush=True)
+    finally:
+        server.stop()
+
+    target = 0.99 * max(a["best_score"] for a in arms.values())
+    print(f"\n[A/B 결과] 목표 = 통합 최고 score의 99% ({target:.1f})")
+    for name, a in arms.items():
+        reach = next((i + 1 for i, (_, v) in enumerate(a["history"]) if v >= target), None)
+        a["trials_to_target"] = reach
+        curve = " ".join(f"{v:.1f}" for _, v in a["history"])
+        reach_s = str(reach) if reach else "미도달(/%d)" % len(a["history"])
+        print(f"  {name}: 도달 trial 수 = {reach_s} | "
+              f"best {a['best_score']:.1f} {a['best']} | curve: {curve}")
+    return arms
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.path.join(HERE, "profiles", "qwen35-27b.json"))
@@ -334,12 +435,19 @@ def main():
     ap.add_argument("--phase2b", action="store_true", help="regime 격자(λ×mix)별 튜닝 + variant 축 + multi-fidelity")
     ap.add_argument("--regime-trials", type=int, default=20, help="phase2b: regime당 스크리닝 trial 수")
     ap.add_argument("--screen-nreq", type=int, default=12, help="phase2b: 저충실도 nreq(in-engine)")
+    ap.add_argument("--warmstart", help="recipe.yaml — regime 승자 config를 enqueue_trial로 주입(transfer warm-start)")
+    ap.add_argument("--ab-warmstart", help="recipe.yaml — warm-start 유/무 controlled A/B(같은 공간·예산·seed)")
+    ap.add_argument("--shortp", type=float, default=0.3, help="A/B regime의 SHORTP(mix)")
     args = ap.parse_args()
 
     mp = json.load(open(args.model))
     dp = json.load(open(args.device))
     if not os.path.exists(BENCH):
         sys.exit(f"bench 바이너리 없음: {BENCH} (make 먼저)")
+
+    if args.ab_warmstart:
+        run_warmstart_ab(mp, dp, args)
+        return
 
     if args.phase2b:
         table = run_phase2b(mp, dp, args)
@@ -374,6 +482,9 @@ def main():
         if t.state == optuna.trial.TrialState.COMPLETE and "tok_s" in t.user_attrs:
             cache[(t.params["bmax"], t.params["K"], t.params["W"],
                    params_env_key(t.params))] = dict(t.user_attrs)
+    if args.warmstart:
+        enqueue_warmstart(study, recipe_warmstart_configs(args.warmstart),
+                          search_space_from_profiles(mp, dp), with_mw=False, phase2_env=args.phase2)
     done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     print(f"[autotune] {study_name}: 기존 완료 {done}, 목표 {args.trials} trials "
           f"(seed={args.seed} λ={args.lam} nreq={args.nreq} tpot_cap={args.tpot_cap} "
