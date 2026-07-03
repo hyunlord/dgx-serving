@@ -54,10 +54,32 @@ pred=in 패턴→rope 위치 의심으로 격리(golden-debug).
 sliding, 인자이지 모델분기 아님. ① gemma4_decode(graph)+G4DecodeState+manifest_gemma4 신규 모델별. **③ 서빙
 코어 모델분기 = 0건**(decode/state는 Gemma4 전용 파일, 공유 코어 무오염).
 
-### A-2 / A-3 (진행 예정)
-- A-2: sliding KV **링버퍼 캡**(현 alloc은 캡 크기 반영하나 append는 선형 base — 긴 시퀀스는 modulo 필요) +
-  캡 유/무 golden 불변 증명(경계) + KV bytes 예산 전/후.
-- A-3: bench 모델-중립화(Qwen 하드코딩 bench_serve.cu:45/170/185 해소) + gemma4_decode_batch + RSS 가드 + 스모크.
+### A-2: sliding KV 캡 — 예산 정량(완료) + 링버퍼(별도)
+
+**KV bytes 예산(fp32 KV; bf16이면 절반)** — per-token: full 10층 160KB + sliding 50층 1600KB = 1760KB
+(sliding이 지배: 층수 5배 + NKV 16 vs 4). sliding 캡(w=1024) 이득:
+
+| context | 캡 전(MB) | 캡 후(MB) | 절감 |
+|---|---|---|---|
+| 1024 | 1845 | 1845 | 0% |
+| 2048 | 3691 | 2013 | 45% |
+| 4096 | 7382 | 2349 | 68% |
+| 8192 | 14764 | 3020 | 80% |
+| 16384 | 29528 | 4362 | 85% |
+| 32768 | 59056 | 7046 | 88% |
+
+→ **sliding 캡이 이 모델 서빙의 핵심 lever**: 긴 context·큰 B에서 KV가 GB10 unified 예산을 지배하는데,
+50/60층을 O(w) 고정으로 묶어 8K에서 80%·32K에서 88% 절감(bf16이면 절반) — 그만큼 B/context 여유.
+
+**링버퍼 구현(별도)**: 정확성 미묘함 = **프리필은 전체 KV 필요**(각 쿼리 위치가 서로 다른 window를 봄 —
+병렬), **decode만 링버퍼**(순차, 최근 w개). 이 경계(프리필→decode 전환 시 sliding 층 마지막 w개만 유지)
+처리 + attn_decode 물리-슬롯(j%cap) 재작성 + >w golden(또는 작은-w config override 자체대조)이 필요.
+현 alloc은 안전판(전부 max_len 선형)으로 OOB 원천 제거. window **마스크** 정확성은 A-1 test_gemma4_gen
+(sliding 층 window=1024로 12/12)에서 이미 검증 — 남은 건 물리 슬롯 인덱싱뿐.
+
+### A-3: bench 모델-중립화 (별도)
+Qwen 하드코딩 해소(bench_serve.cu:45 qwen35_decode_batch / :170 load_config_qwen / :185 load_weights_qwen)
++ gemma4_decode_batch(B 슬롯) + RSS 가드 + 스모크. plain 경로(spec 無).
 
 ---
 ### (원 산정 기록 — A-1로 상당 부분 해소)

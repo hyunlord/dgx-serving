@@ -28,10 +28,10 @@ G4DecodeState alloc_g4_decode_state(const ModelConfig &c, int max_len) {
     for(int l=0;l<c.num_layers;l++){
         int full=c.layer_is_full?c.layer_is_full[l]:1;
         int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
-        // A-2: sliding 층은 min(max_len, sliding_window)로 캡. A-1(sliding_window==0 취급 or full)은 max_len.
-        int cap = (!full && c.sliding_window>0) ? (c.sliding_window<max_len?c.sliding_window:max_len) : max_len;
-        s.kv_cap[l]=cap;
-        s.Kc[l]=g4d_dm((size_t)cap*nkv*hd); s.Vc[l]=g4d_dm((size_t)cap*nkv*hd);
+        // 현 append=선형 base offset → 캡은 반드시 max_len(안전). sliding 링버퍼(min(max_len,w) modulo)는
+        // attn_decode 물리-슬롯 재작성 + >w golden 필요 → A-2 별도. 캡<max_len + 선형 append = OOB이므로 금지.
+        s.kv_cap[l]=max_len;
+        s.Kc[l]=g4d_dm((size_t)max_len*nkv*hd); s.Vc[l]=g4d_dm((size_t)max_len*nkv*hd);
     }
     return s;
 }
