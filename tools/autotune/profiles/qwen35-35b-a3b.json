@@ -27,5 +27,6 @@
   "linear_key_head_dim": 128,
   "linear_value_head_dim": 128,
   "linear_conv_kernel": 4,
-  "pmax_default": 32
+  "pmax_default": 32,
+  "serving_bench": "bench_serve"
 }

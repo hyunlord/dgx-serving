@@ -1,0 +1,88 @@
+meta:
+  schema: dgx-recipe/v0
+  created: '2026-07-04T04:52:15'
+  tool: dgx-serving autotune (MoE, 파이프 3호)
+  engine_commit: 4ae84ad
+  note: |
+    Qwen3.5-35B-A3B MoE(GDN+full 혼합, 256 experts top-8, MTP 無=plain 서빙). config=bmax 단일 축
+    (spec 축 K/W/DRAFT 없음 — plan.py spec_capable=false). scheme=device-fused MoE(grouped gemv, k-order
+    누산=naive bit-identical) + W4A8 backbone/q4 experts + GDN. ★서빙 throughput≪raw batch(정직 분해: caveats).
+target:
+  device:
+    name: GB10
+    gpu_probe: NVIDIA GB10
+    bandwidth_gbps: 273
+    mem_total_gb: 128
+    unified_memory: true
+    toolkit_required:
+      cp_async: true
+      mma_int8: true
+      fp4_mma: false
+    tolerance:
+      bandwidth_pct: 10
+      mem_total_pct: 10
+  model:
+    id: Qwen3.5-35B-A3B
+    params_b: 35
+    active_params_b: 3.11
+    gdn: true
+    tied_lm_head: false
+    moe: true
+    mtp: false
+    num_experts: 256
+    top_k: 8
+    quant: w4a8
+  user_constraints:
+    quant_bits: 4
+    tpot95_cap_s: 0.35
+settings:
+  policy:
+    type: static_regime_lookup
+    note: |
+      plain 서빙(spec 없음). regime=λ(gen mix 70%short/30%long 고정, short_ratio 미스윕). ★Bmax8이 최적 운영점:
+      Bmax16이 throughput +3%(63→65)에 tpot95 2×(0.113→0.251) — latency 대비 무가치. Bmax8은 λ4서 이미 포화
+      (avgB 6.9, throughput λ4~32 62.7~62.9 평탄). 고throughput 필요 시 Bmax16(65, tpot 0.25) 옵션.
+    regimes:
+    - when: {lam: 4.0, short_ratio: 0.7}
+      config: {bmax: 8}
+      backend_env: {MOE_FUSED: '1'}
+    - when: {lam: 8.0, short_ratio: 0.7}
+      config: {bmax: 8}
+      backend_env: {MOE_FUSED: '1'}
+    - when: {lam: 16.0, short_ratio: 0.7}
+      config: {bmax: 8}
+      backend_env: {MOE_FUSED: '1'}
+    - when: {lam: 32.0, short_ratio: 0.7}
+      config: {bmax: 8}
+      backend_env: {MOE_FUSED: '1'}
+  backend:
+    engine_bin: tools/bench_serve
+    uq: 2
+    fixed_env: {MOE_FUSED: '1'}
+    scheme_detail:
+      moe: device-fused(grouped gemv, k-order reduce = naive bit-identical, MOE_FUSED=1 default)
+      quant: W4A8 backbone(sb dispatch) / q4 experts(fused gemv) / fp32 router
+      attn: GDN(linear) 30 + full 10 (interval-4, 27B 동형)
+claims:
+- regime: {lam: 4.0, short_ratio: 0.7}
+  config: {bmax: 8}
+  scheme: fused-moe(k-order bit-id)+w4a8(sb)+gdn
+  measured:
+    screen: {tok_s: 62.7, tpot95: 0.112, conditions: {nreq: 40, seed: 42, maxlen: 256}}
+    final: {tok_s: 62.7, tpot95: 0.112, conditions: {nreq: 40, seed: 42, maxlen: 256}}
+- regime: {lam: 32.0, short_ratio: 0.7}
+  config: {bmax: 8}
+  scheme: fused-moe(k-order bit-id)+w4a8(sb)+gdn
+  measured:
+    screen: {tok_s: 62.9, tpot95: 0.113, conditions: {nreq: 40, seed: 42, maxlen: 256}}
+    final: {tok_s: 62.9, tpot95: 0.113, conditions: {nreq: 40, seed: 42, maxlen: 256}}
+verification:
+  scope: plain 서빙(spec 비교 없음 — MTP 부재). fused MoE(bit-id) default. maxlen=256(짧은 range).
+  golden: test_35b argmax ALL(fused==naive rel 6.64e-2)·test_router idx=0·test_moe_expert 6.99e-7·batch bit-id.
+  engine_bin: tools/bench_serve(QwenBackend — qwen 계열 모델-중립, 코드 변경 0으로 MoE 서빙). warm 프로토콜.
+  caveats: |
+    - ★서빙 throughput ~63 tok/s ≪ raw batch aggr 195(B16)/169(B8): 큰 격차. 원인 = chunked prefill이 decode를
+      차단(prefill-decode 간섭 — 단순 continuous 스케줄러) + ragged decode(슬롯별 위치) + Poisson idle. tpot 113ms/token
+      (raw fused 5.9ms/token 대비). = 스케줄러 개선(prefill 분리/continuous batching 성숙도) 여지 큼, 커널 아님.
+    - single decode raw 51.8(29.8% of roofline 165.3). 서빙은 스케줄러-bound(커널 아님).
+    - short_ratio 미스윕(gen mix 고정). 긴 context는 별도.

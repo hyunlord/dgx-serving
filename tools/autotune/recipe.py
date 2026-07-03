@@ -26,15 +26,32 @@ REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 from autotune import per_slot_bytes, per_slot_bytes_auto, mem_available_bytes, run_bench  # noqa: E402
 
-# plain(spec 無) 서빙 미니벤치: bench_serve_gemma4 실행 + tok/s 파싱(해당 bmax·λ 행).
+# plain(spec 無) 서빙 미니벤치 — 모델별 bench dispatch(profile serving_bench):
+#   bench_serve_gemma4(Gemma4 전용): "<w> <uq> <nreq> <seed> <pmax> <maxlen> <B> -- <λ>", 행 "<B> <λ> | req tok | tp50 tp95 | avgB maxQ"
+#   bench_serve(qwen 계열=35b MoE/27b): "<w> <g> <uq> <B> <nreq> <seed> <λ..>", 행 "c-ch <λ> | req tok | e2e50 e2e95 e2e99 | ttft95 tp95 | avgB maxQ"
 def run_bench_plain(mp, bmax, lam, nreq, seed):
-    bin_ = os.path.join(REPO, "tools", "bench_serve_gemma4")
+    sb = mp.get("serving_bench", "bench_serve_gemma4")
+    bin_ = os.path.join(REPO, "tools", sb)
+    if sb == "bench_serve":   # qwen 계열: golden_dir 필요, SKIP1TOK/SKIPSTAT로 c-ch만
+        env = dict(os.environ, SKIP1TOK="1", SKIPSTAT="1")
+        cmd = [bin_, mp["weights_dir"], mp["golden_dir"], str(mp.get("uq", 2)), str(bmax), str(nreq), str(seed), str(lam)]
+        r = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True, timeout=1800)
+        out = r.stdout + r.stderr
+        for line in out.splitlines():
+            p = line.split()
+            if len(p) >= 5 and p[0] == "c-ch":   # c-ch λ | req tok | e2e50 e2e95 e2e99 | ttft95 tp95 | avgB maxQ
+                try:
+                    if abs(float(p[1]) - lam) < 1e-6:
+                        return {"tok_s": float(p[4]), "tpot95": float(p[11]) if len(p) > 11 else None}
+                except (ValueError, IndexError):
+                    continue
+        return {"tok_s": 0, "tpot95": None, "raw": out[-400:]}
+    # gemma4 전용
     cmd = [bin_, mp["weights_dir"], str(mp.get("uq", 2)), str(nreq), str(seed), "32", "384", str(bmax), "--", str(lam)]
     r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=1200)
     out = r.stdout + r.stderr
     for line in out.splitlines():
         p = line.split()
-        # 행 형식: "  <bmax> <lam> | req/s tok/s | tpot50 tpot95 | avgB maxQ"
         if len(p) >= 5 and p[0].isdigit() and int(p[0]) == bmax and p[2] == "|":
             try:
                 if abs(float(p[1]) - lam) < 1e-6:
@@ -236,9 +253,10 @@ def cmd_verify(args):
         print(f"  [재현율] {rg} {cfg}: claim {claimed} vs local {res.get('tok_s')} tok/s "
               f"= {repro:.1f}% (조건 {cond})")
 
-    # ④ bit-id 게이트: spec은 서빙-시 ISO 스팟, plain은 오프라인 bit-id(test_gemma4_batch SMAX 버킷)로 대체
+    # ④ bit-id 게이트: spec은 서빙-시 ISO 스팟, plain은 오프라인 bit-id(recipe verification.golden 참조)로 대체
     if plain:
-        iso = {"iso": "offline: test_gemma4_batch uq=2(W4A8 sb, SMAX 버킷 내 bit-id 0) — 서빙-시 ISO는 spec 전용", "iso_pass": True}
+        gld = recipe.get("verification", {}).get("golden", "오프라인 골든 스위트(recipe verification.golden)")
+        iso = {"iso": f"offline: {gld}", "iso_pass": True}
         print(f"  [bit-id] plain: {iso['iso']}")
     else:
         c = best_thru
