@@ -42,11 +42,15 @@ struct G4BatchState {
 G4BatchState alloc_g4_batch_state(const ModelConfig &c, int B, int max_len);
 void free_g4_batch_state(G4BatchState &s);
 
-// B슬롯 1토큰 동시 decode (same-length, 위치 = st.n_past). matmul M=B(gemm_batch), attn 슬롯별.
-//   d_tokens: [B]. d_logits: [B,V] (softcap 후). commit=1이면 n_past += 1.
+// B슬롯 1토큰 동시 decode. matmul M=B(gemm_batch), attn 슬롯별.
+//   d_tokens: [B]. d_logits: [B,V] (softcap 후).
+//   same-length: d_pos_b=h_pos_b=nullptr → 모든 슬롯 위치 st.n_past. commit=1이면 n_past += 1.
+//   ragged(연속배칭): d_pos_b[B](device)+h_pos_b[B](host) 슬롯별 위치. per-slot 위치는 호출자(scheduler)가 관리
+//     (commit 무관 — n_past 안 건드림). KV append 오프셋은 h_pos_b, rope는 d_pos_b(전체 테이블), attn window는 슬롯별.
 void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
                          const int *d_tokens, const float *d_cos_f, const float *d_sin_f,
                          const float *d_cos_s, const float *d_sin_s,
-                         float *d_logits, int commit, int use_q4);
+                         float *d_logits, int commit, int use_q4,
+                         const int *d_pos_b = nullptr, const int *h_pos_b = nullptr);
 
 #endif // DGX_DECODE_STATE_GEMMA4_H

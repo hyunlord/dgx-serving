@@ -134,13 +134,16 @@ static inline void launch_attn_decode(const float *Q, const float *Kc, const flo
 // ---- batch decode attention (챕터3): B개 독립 시퀀스, 각 1토큰(위치 base), 각자 KV 캐시 ----
 //   Q,O: [B, NQ, HD]. Kc/Vc: [B, max_len, NKV, HD] (시퀀스별), kv_stride = max_len*NKV*HD.
 //   각 row b는 자기 KV[b][0..base] attend (attendlen = base+1 공통, same-length).
-//   scale: 0 → 1/sqrt(HD). window: 0 → 무제한; w>0 → sliding [qpos-w+1, qpos] (qpos=base, same-length 배치).
+//   scale: 0 → 1/sqrt(HD). window: 0 → 무제한; w>0 → sliding [qpos-w+1, qpos].
+//   base_b: nullptr → 모든 슬롯 위치 base(same-length). 아니면 슬롯 b 위치 = base_b[b] (ragged 연속배칭).
 static __global__ void attn_decode_batch_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
-                                   int NQ, int NKV, int HD, int base, long kv_stride, float scale, int window) {
+                                   int NQ, int NKV, int HD, int base, long kv_stride, float scale, int window,
+                                   const int *base_b) {
     int b = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     int GRP = NQ / NKV, kv = h / GRP;
-    int attendlen = base + 1;
-    int lo = (window > 0 && base - window + 1 > 0) ? base - window + 1 : 0;
+    int qpos = base_b ? base_b[b] : base;
+    int attendlen = qpos + 1;
+    int lo = (window > 0 && qpos - window + 1 > 0) ? qpos - window + 1 : 0;
     const float *Kcb = Kc + (size_t)b * kv_stride;     // 시퀀스 b의 KV
     const float *Vcb = Vc + (size_t)b * kv_stride;
     extern __shared__ float sm[];
@@ -167,14 +170,15 @@ static __global__ void attn_decode_batch_kernel(const float *Q, const float *Kc,
         O[((size_t)b * NQ + h) * HD + d] = acc / ssum;
     }
 }
+//   base: same-length면 공통 위치. ragged면 base=max(base_b)(shmem 크기용) + base_b[] per-slot.
 static inline void launch_attn_decode_batch(const float *Q, const float *Kc, const float *Vc, float *O,
                                             int B, int NQ, int NKV, int HD, int base, long kv_stride, cudaStream_t st = 0,
-                                            float scale = 0.f, int window = 0) {
+                                            float scale = 0.f, int window = 0, const int *base_b = nullptr) {
     dim3 grid(B, NQ);
-    size_t shmem = (size_t)(HD + base + 1) * sizeof(float);
+    size_t shmem = (size_t)(HD + base + 1) * sizeof(float);   // base=최대 attendlen 커버
     attn_smem_guard((const void *)attn_decode_batch_kernel, shmem, "attn_decode_batch", base + 1);
     float sc = (scale > 0.f) ? scale : rsqrtf((float)HD);
-    attn_decode_batch_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, NQ, NKV, HD, base, kv_stride, sc, window);
+    attn_decode_batch_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, NQ, NKV, HD, base, kv_stride, sc, window, base_b);
 }
 
 #endif // DGX_ATTENTION_CUH

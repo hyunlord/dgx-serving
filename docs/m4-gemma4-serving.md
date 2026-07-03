@@ -109,8 +109,23 @@ A-3-2 same-length를 넘는 추가 구현. 그 위에:
 - chunked prefill batch slot(Gemma4판) + RSS 상시 가드.
 
 **세션 판정**: A-3-2(batch decode 정확성 + 누수 안전 = 서빙의 정확성/안전 토대)가 이번 핵심 성과.
-full bench 결합은 ragged decode_batch + 서빙코어 추상화(각 대규모, golden 필요)로 별도 세션. STEP B(성능)는
-서빙 없이도 single/same-length-batch decode로 부분 측정 가능(연속배칭 throughput은 A-3 완성 후).
+full bench 결합은 ragged decode_batch + 서빙코어 추상화(각 대규모, golden 필요)로 별도 세션.
+
+## STEP 1 (2라운드 본편) — ragged decode_batch (PASS)
+
+연속 배칭 본질 = 슬롯별 다른 위치(ragged). gemma4_decode_batch에 `d_pos_b/h_pos_b` 추가(nullptr=same-length):
+- rope: ragged면 **rope_partial_pos**(행별 위치 pos[s], 전체 테이블 — 27b tree 자산 재사용, 신규 커널 0),
+  same-length면 rope_partial_batch.
+- attn: attn_decode_batch에 **base_b[]** 인자(② 기본값 보존) — 슬롯별 attendlen/window/lo.
+- KV append: 슬롯별 h_pos_b[b] 위치. commit: ragged면 n_past 안 건드림(scheduler 관리).
+
+**게이트 PASS**(test_gemma4_ragged, B=2 staggered — 슬롯0=위치 t, 슬롯1=위치 t-1):
+- 슬롯0 vs single[t] **max|Δ|=0**, 슬롯1 vs single[t-1] **max|Δ|=0** (서로 다른 위치 각각 bit-identical).
+- argmax 15/15. 슬롯별 rope·attendlen·KV 전부 정확.
+- 버그 1건(테스트 시나리오): t=1 시작 시 슬롯0 위치0 KV 누락 → t=0 워밍 스텝 추가. 커널 무결(슬롯1이 먼저
+  max|Δ|=0으로 증명). same-length 회귀 + qwen35 회귀 PASS.
+- **3분류**: ② attn base_b(기본값 보존) / rope_partial_pos 재사용(신규 0) / ① gemma4_batch ragged 분기.
+  **③ 커널 모델분기 0**.
 
 ---
 ### (원 산정 기록 — A-1로 상당 부분 해소)
