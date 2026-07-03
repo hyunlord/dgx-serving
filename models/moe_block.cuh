@@ -18,15 +18,24 @@
 
 static inline float *moe_dmalloc(size_t n) { float *p; MOEK(cudaMalloc(&p, n * 4)); return p; }
 
+// ★persistent scratch (nsys: 호출당 malloc/free의 cudaFree가 API 41.8% — 동기화 직렬화). grow-on-demand 재사용
+//   (기존 qwen35_batch g_bxq 패턴). 각 버퍼는 매 호출 커널 출력으로 완전 덮어써진 뒤 읽힘(누산기 out은 memset 0)
+//   → 재사용해도 수학 불변(골든/bit-id 게이트로 증명). static inline라 TU별(prefill/decode/batch) 자체 버퍼(정확).
+static inline float *moe_grow(float *&p, size_t &cap, size_t n) {
+    if (cap < n) { if (p) cudaFree(p); MOEK(cudaMalloc(&p, n * 4)); cap = n; } return p;
+}
+
 static inline void moe_mlp_block(const ModelConfig &c, const QLayer &L, const float *n2, float *out, int S) {
     const int H=c.hidden_size, E=c.num_experts, K=c.num_experts_per_tok;
     const int MI=c.moe_intermediate_size, SI=c.shared_expert_intermediate_size;
     const int sdtype=c.scale_dtype;
     const size_t gu_w=(size_t)2*MI*H, dn_w=(size_t)H*MI;   // expert당 weight 수
     const size_t sc_elem_sz = (sdtype==1) ? 2 : 4;  // scale 원소 크기 (fp16=2, fp32=4)
-    float *rlog=moe_dmalloc((size_t)S*E), *dw=moe_dmalloc((size_t)S*K);
-    int *didx; MOEK(cudaMalloc(&didx,(size_t)S*K*4));
-    float *gu=moe_dmalloc(2*MI), *hh=moe_dmalloc(MI), *eo=moe_dmalloc(H);
+    static float *rlog=nullptr,*dw=nullptr,*gu=nullptr,*hh=nullptr,*eo=nullptr,*sg=nullptr,*su=nullptr,*sh=nullptr,*so=nullptr,*glog=nullptr; static int *didx=nullptr;
+    static size_t c_rlog=0,c_dw=0,c_gu=0,c_hh=0,c_eo=0,c_sg=0,c_su=0,c_sh=0,c_so=0,c_glog=0,c_didx=0;
+    moe_grow(rlog,c_rlog,(size_t)S*E); moe_grow(dw,c_dw,(size_t)S*K);
+    if(c_didx<(size_t)S*K){ if(didx)cudaFree(didx); MOEK(cudaMalloc(&didx,(size_t)S*K*4)); c_didx=(size_t)S*K; }
+    moe_grow(gu,c_gu,2*MI); moe_grow(hh,c_hh,MI); moe_grow(eo,c_eo,H);
     // router: gemv_f32(fp32 weight) → top-k
     launch_gemv_f32(n2, L.router, rlog, H, E, S);
     launch_router_topk(rlog, didx, dw, S, E, K);
@@ -42,14 +51,13 @@ static inline void moe_mlp_block(const ModelConfig &c, const QLayer &L, const fl
         launch_axpy_acc(out+(size_t)s*H, wk, eo, H);              // out[s] += wk*eo
     }
     // shared expert (항상): SwiGLU → sigmoid(H→1) 게이트로 스케일 후 누적
-    float *sg=moe_dmalloc((size_t)S*SI), *su=moe_dmalloc((size_t)S*SI), *sh=moe_dmalloc((size_t)S*SI);
-    float *so=moe_dmalloc((size_t)S*H), *glog=moe_dmalloc((size_t)S);
+    moe_grow(sg,c_sg,(size_t)S*SI); moe_grow(su,c_su,(size_t)S*SI); moe_grow(sh,c_sh,(size_t)S*SI);
+    moe_grow(so,c_so,(size_t)S*H); moe_grow(glog,c_glog,(size_t)S);
     launch_gemv_q4(n2, L.shared_gate.wq, L.shared_gate.sc, sg, H, SI, S, sdtype);
     launch_gemv_q4(n2, L.shared_up.wq,   L.shared_up.sc,   su, H, SI, S, sdtype);
     launch_swiglu(sg, su, sh, (size_t)S*SI);
     launch_gemv_q4(sh, L.shared_down.wq, L.shared_down.sc, so, SI, H, S, sdtype);
     launch_gemv_f32(n2, L.shared_gate_w, glog, H, 1, S);          // [S,1] logit
     launch_moe_shared_add(out, so, glog, S, H);                   // out[s] += sigmoid(glog[s])*so[s]
-    for (float *p : {rlog,dw,gu,hh,eo,sg,su,sh,so,glog}) cudaFree(p);
-    cudaFree(didx);
+    // ★free 없음 — persistent scratch(다음 호출 재사용). cudaFree 41.8% API 오버헤드 제거.
 }
