@@ -30,9 +30,28 @@
 
 ## STEP A — 서빙 경로 연결 + sliding KV (예정)
 
-**모델-중립성 시험 결과(사전 조사)**: `bench_serve.cu`는 **모델-중립 아님** — `qwen35_decode_batch`/`load_config_qwen`/
-`load_weights_qwen` 하드코딩. Gemma4 서빙 연결 = 신규 `gemma4_decode`(KV 캐시 증분, GDN 제거+sliding-KV-cap+
-층별 dual-rope+k_eq_v) + `gemma4_decode_batch` + bench dispatch 필요. **이것이 자동화 갭**(3분류 ①로 흡수 가능하나
-분량 큼 — qwen35_decode 288줄+batch 385줄 상당). sliding KV 캡(50/60층 w=1024)이 이 모델 구조적 lever.
+**모델-중립성 시험 결과(코드 조사, 파일:라인)**: `bench_serve.cu`는 **모델-중립 아님** —
+`step_forward`가 `qwen35_decode_batch`(models/qwen35_batch.cu) 직접 호출, `load_config_qwen`·`load_weights_qwen`
+하드코딩(bench_serve.cu:45,170,185). decode/서빙 스택 전체가 QwenWeights/DecodeState(GDN 필드 포함) 타입에 결합.
 
-<!-- STEPA_RESULT -->
+**Gemma4 서빙 연결에 필요한 것(정밀 산정)**:
+1. `gemma4_decode`(증분 KV, 단일스텝) — qwen35_decode(288줄) 골격, GDN 경로 제거(더 단순) + **sliding-window
+   decode attention**(현 flash decode는 full causal — window 인자 추가 = 커널 인터페이스 조정 ②) + 층별
+   dual-rope(full/sliding cos·sin 2세트) + k_eq_v(full 층 V=v_norm(k_proj)).
+2. `alloc/free G4DecodeState` — full 10층 [max_len] KV, sliding 50층 **[min(max_len,w)] 링버퍼** KV 캡.
+3. `gemma4_decode_batch`(≈qwen35_batch 385줄, GDN 슬롯 제거) + bench dispatch(모델 선택).
+4. **decode 골든**(HF generate 다토큰 argmax) — 정확성 게이트(prefill 골든과 별개).
+→ 총 ~600줄 신규 + 검증. **plain 서빙**(spec 없음, MTP 부재). sliding KV 캡 = 이 모델 구조적 lever
+   (긴 context·큰 B에서 KV bytes 대폭↓: full만 O(len), sliding은 O(w=1024) 고정).
+
+**세션 판정(정직)**: STEP 0(게이트, 전제)은 완결·커밋(f3801f8). STEP A는 검증-필요 대규모 decode 구현이고
+STEP B(성능)·C(튜닝/레시피)가 이에 의존 — 메모리 사고로 예산 소모한 이 세션에서 검증 없이 몰아치면
+"커밋 위생=golden 통과분만" 위반. **STEP A~C는 별도 집중 세션 권고**(gemma4_decode+골든부터). = 파이프
+end-to-end의 **자동화 갭 = decode/서빙 경로가 모델별 구현 필요**(프리필 graph는 config로 흡수됐으나 서빙
+스택은 아직 Qwen 결합). 이것이 이번 세션의 정직한 산출(브리프 "자동화 갭 기록" 요구 충족).
+
+## STEP B / C — 블록됨 (STEP A 의존)
+
+성능 실측(roofline 17.4 t/s 달성률)·CYC 병목·오토튜너·cross-model warm-start·Gemma4 레시피는 모두
+서빙 경로(STEP A) 완성 후. plan.py 전략 생성(spec 無→튜닝 공간 축소: K/W 없음, Bmax/chunk/sliding-KV 중심)은
+STEP A 없이도 리턴 가능하나, 실측 없는 전략은 미검증이라 STEP A와 묶어 진행.
