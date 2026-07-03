@@ -175,3 +175,54 @@ end-to-end의 **자동화 갭 = decode/서빙 경로가 모델별 구현 필요*
 성능 실측(roofline 17.4 t/s 달성률)·CYC 병목·오토튜너·cross-model warm-start·Gemma4 레시피는 모두
 서빙 경로(STEP A) 완성 후. plan.py 전략 생성(spec 無→튜닝 공간 축소: K/W 없음, Bmax/chunk/sliding-KV 중심)은
 STEP A 없이도 리턴 가능하나, 실측 없는 전략은 미검증이라 STEP A와 묶어 진행.
+
+---
+
+## 라운드2 — 서빙코어 모델-중립 추상화 완결 (eb6af01, c8bee83)
+
+위 "자동화 갭"(서빙 스택이 Qwen 결합)을 해소. **결론: 서빙 코어는 모델-무지가 됐고, Gemma4가 두 번째 backend로 관통.**
+
+### 설계 — ModelBackend 훅 5개 (serving_backend.h)
+`ServingBackend` 순수 추상 인터페이스: `has_spec / per_seq_bytes / alloc_state / free_state / reset_slot / prefill_slot / decode_step`.
+backend가 모든 device 전송·rope·weight·상태 버퍼를 소유 → 코어는 host 배열만 다룸(모델·CUDA 타입 무지).
+
+### 코어 추출 — serving_core.h (모델 식별자 0건)
+`bench_serve.cu`의 스케줄링(Poisson trace·admit/slot 재사용·continuous/static·warm-up·백분위 통계·admission 예산)을
+`serving_core.h`로 이동(로직 불변). qwen 결합 6지점 → `QwenBackend`(bench_serve.cu 내). **grep 검증: serving_core.h에
+qwen/gemma/gdn/mtp/spec/BatchDecodeState 식별자 0건 = 완전 모델-무지.**
+
+### 무회귀 measured (리팩터 완료 조건)
+qwen 27b plain continuous λ4, 같은 seed/trace, **warm GPU 교차 back-to-back**(old=HEAD 바이너리 vs new):
+| | rep1 | rep2 | avg |
+|---|---|---|---|
+| OLD | 50.8 | 50.8 | 50.8 |
+| NEW | 51.0 | 50.6 | 50.8 |
+
+tok/s Δ<0.8%(노이즈), avgB 12.66·maxQ 29·latency 백분위 일치 = **순수 코드 이동, 회귀 0**.
+※ 초기 앵커 40.4는 **GPU cold-클럭 교란**(동일 OLD 바이너리 cold 40.4 → warm 50.8)으로 격리·기각.
+"기준선 없이 리팩터 금지 / back-to-back controlled" 규율이 오판을 막음.
+qwen spec 경로(bench_serve_spec.cu) ISO 12/12 PASS·λ4 53.0 tok/s(baseline, 경로 미변경 → 무회귀 자동).
+
+### Gemma4 backend 등록 + full 서빙 스모크 PASS (serve_gemma4.cu)
+`Gemma4Backend`(plain: has_spec=false, reset_slot=no-op[위치독립 KV 덮어쓰기+attn pos-bound], per_seq_bytes=KV only,
+decode_step=ragged gemma4_decode_batch commit=0). chunked prefill은 gemma4 prefill_batch_slot 아날로그 부재로 abort
+(스모크는 chunked=false=STEP 1 검증 ragged 경로). golden rope 17위치 내 짧은 길이(rope 근사 0)로:
+- (1) 결정성 PASS(완료수 동일+makespan 상대오차 0.032%<1% — 시뮬 clock=스텝 wall 누적, admission=arrival≤simt →
+  본질적 wall-통계 재현. forward는 test_gemma4_ragged가 bit-id 증명).
+- (2) 완료 24/24 PASS. (3) 누수 PASS(서빙 state 창 GPU free 감소 없음·RSS Δ=1MB).
+회귀: test_gemma4_ragged PASS(max|Δ|=0, argmax 15/15).
+
+### ③ 최종 집계 (유연성 2라운드 판정표)
+| 라운드 | 대상 | ③(모델 내부 분기) | 판정 |
+|---|---|---|---|
+| 1 | 커널 라이브러리 | 0 | 커널 모델-독립(config/graph 흡수) |
+| 2 | 서빙 코어(serving_core.h) | 0 | 코어 모델-무지(backend 훅 뒤로 격리) |
+
+**헌법 실증**: 커널·서빙 코어 양쪽 모두 모델 분기 0. 모델 확장 실비용 = 얇은 backend(QwenBackend/Gemma4Backend) + graph.
+
+### 미완(정직) — spec 서빙코어는 별도
+`bench_serve_spec.cu`(693줄, 살아있는 53 tok/s)는 **미변경**. spec 사이클(draft tree→verify_batch ragged→슬롯별
+accept/promote)은 plain decode와 스텝 구조가 근본적으로 다르고(슬롯당 가변 accept 전진), in-place 접합 시
+살아있는 경로 회귀 또는 코어 spec-분기(③ 위반) 위험. `has_spec()`로 확장점만 열어둠(decode_step이 슬롯당 가변
+accept를 out-배열로 반환 → 코어 slot-advance가 읽으면 spec-core도 같은 코어 플러그인 가능). Gemma4는 MTP head
+부재로 plain이라 이번 범위 밖 불필요. Gemma4 chunked prefill(prefill_batch_slot 아날로그)도 추후.
