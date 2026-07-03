@@ -25,6 +25,10 @@
   op 정확성을 fp32로 직접 확인. **한계(정직)**: full-depth fp32는 메모리 가드(층별 업캐스트가 mmap+anon
   누적으로 112GB 근접 → kill)로 첫 8층만. full 깊이는 argmax가 커버. "27b급"에 근접하나 full-depth
   fp32는 아님(메모리 구조적 제약).
+- **프롬프트 다양성 확인**: prompt-2("def fibonacci(n):", S=6, 다른 토큰 분포)도 **PASS** — op-level fp32
+  worst **rel=1.6e-4**(prompt-1의 2.3e-4와 일관), full-depth argmax 6/6 일치. 게이트 서명이 프롬프트 무관하게
+  견고(GPU/CPU fp32 산술차 수준). 부수 관찰: prompt-2에서 golden_q4 argmax가 golden_base와 pos-2에서 다름
+  (240017 vs 123466) — q4 양자화 자체 차이(엔진과 무관, 게이트는 엔진 vs golden_q4 비교라 영향 없음).
 - **메모리 사고 기록**: 초기 full-depth 스트리밍이 112GB(가드 초과)까지 누수 → 즉시 kill(시스템 보호).
   경계 8층 + RSS 하드가드(78GB)로 안전 재실행. [[gb10-unified-memory-crash]] 원칙 준수.
 
