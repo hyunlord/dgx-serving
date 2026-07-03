@@ -1,0 +1,239 @@
+meta:
+  schema: dgx-recipe/v0
+  created: '2026-07-03T09:41:09'
+  tool: dgx-serving autotune phase2b
+  engine_commit: '8764391'
+target:
+  device:
+    name: GB10
+    gpu_probe: NVIDIA GB10
+    bandwidth_gbps: 273
+    mem_total_gb: 128
+    unified_memory: true
+    toolkit_required:
+      cp_async: true
+      mma_int8: true
+      fp4_mma: false
+    tolerance:
+      bandwidth_pct: 10
+      mem_total_pct: 10
+  model:
+    id: Qwen3.5-27B
+    params_b: 27
+    gdn: true
+    tied_lm_head: false
+    moe: false
+    quant: w4a8
+  user_constraints:
+    quant_bits: 4
+    tpot95_cap_s: 0.35
+settings:
+  policy:
+    type: static_regime_lookup
+    note: 요청-경계 핫스위치는 미구현(사이클 전환은 스킴 경계로 bit-ISO 미보장 — Phase 2b 실측)
+    regimes:
+    - when:
+        lam: 1.0
+        short_ratio: 0.9
+      config:
+        bmax: 6
+        K: 7
+        W: 3
+      backend_env:
+        DRAFT_MW: '1'
+    - when:
+        lam: 1.0
+        short_ratio: 0.3
+      config:
+        bmax: 16
+        K: 7
+        W: 2
+      backend_env:
+        DRAFT_MW: '0'
+    - when:
+        lam: 4.0
+        short_ratio: 0.9
+      config:
+        bmax: 4
+        K: 7
+        W: 2
+      backend_env:
+        DRAFT_MW: '0'
+    - when:
+        lam: 4.0
+        short_ratio: 0.3
+      config:
+        bmax: 16
+        K: 7
+        W: 2
+      backend_env:
+        DRAFT_MW: '0'
+    - when:
+        lam: 8.0
+        short_ratio: 0.9
+      config:
+        bmax: 6
+        K: 7
+        W: 3
+      backend_env:
+        DRAFT_MW: '1'
+    - when:
+        lam: 8.0
+        short_ratio: 0.3
+      config:
+        bmax: 16
+        K: 7
+        W: 2
+      backend_env:
+        DRAFT_MW: '0'
+  backend:
+    name: dgx-serving
+    engine_bin: tools/bench_serve_spec
+    fixed_env:
+      MTP_Q4: '1'
+      DRAFT_GEMV: '0'
+      DRAFT_SEQ: '0'
+    variant_axes:
+      DRAFT_MW:
+      - '0'
+      - '1'
+      - '2'
+claims:
+- regime:
+    lam: 1.0
+    short_ratio: 0.9
+  config:
+    bmax: 6
+    K: 7
+    W: 3
+  scheme: w4a8+mtp_q4+concat-mmq(Nn>8)+draft_mw1
+  measured:
+    screen:
+      conditions:
+        nreq: 12
+        seed: 42
+      tok_s: 28.4
+      tpot95: 0.2377
+    final:
+      conditions:
+        nreq: 60
+        seed: 42
+      tok_s: 36.4
+      tpot95: 0.186
+      accept: 4.97
+- regime:
+    lam: 1.0
+    short_ratio: 0.3
+  config:
+    bmax: 16
+    K: 7
+    W: 2
+  scheme: w4a8+mtp_q4+concat-mmq(Nn>8)+draft_gemm_batch
+  measured:
+    screen:
+      conditions:
+        nreq: 12
+        seed: 42
+      tok_s: 38.1
+      tpot95: 0.3123
+    final:
+      conditions:
+        nreq: 60
+        seed: 42
+      tok_s: 51.6
+      tpot95: 0.3187
+      accept: 4.61
+- regime:
+    lam: 4.0
+    short_ratio: 0.9
+  config:
+    bmax: 4
+    K: 7
+    W: 2
+  scheme: w4a8+mtp_q4+concat-mmq(Nn>8)+draft_gemm_batch
+  measured:
+    screen:
+      conditions:
+        nreq: 12
+        seed: 42
+      tok_s: 35.6
+      tpot95: 0.1929
+    final:
+      conditions:
+        nreq: 60
+        seed: 42
+      tok_s: 33.2
+      tpot95: 0.1458
+      accept: 5.0
+- regime:
+    lam: 4.0
+    short_ratio: 0.3
+  config:
+    bmax: 16
+    K: 7
+    W: 2
+  scheme: w4a8+mtp_q4+concat-mmq(Nn>8)+draft_gemm_batch
+  measured:
+    screen:
+      conditions:
+        nreq: 12
+        seed: 42
+      tok_s: 45.7
+      tpot95: 0.355
+    final:
+      conditions:
+        nreq: 60
+        seed: 42
+      tok_s: 51.7
+      tpot95: 0.3354
+      accept: 4.61
+- regime:
+    lam: 8.0
+    short_ratio: 0.9
+  config:
+    bmax: 6
+    K: 7
+    W: 3
+  scheme: w4a8+mtp_q4+concat-mmq(Nn>8)+draft_mw1
+  measured:
+    screen:
+      conditions:
+        nreq: 12
+        seed: 42
+      tok_s: 35.7
+      tpot95: 0.2365
+    final:
+      conditions:
+        nreq: 60
+        seed: 42
+      tok_s: 38.0
+      tpot95: 0.2089
+      accept: 4.97
+- regime:
+    lam: 8.0
+    short_ratio: 0.3
+  config:
+    bmax: 16
+    K: 7
+    W: 2
+  scheme: w4a8+mtp_q4+concat-mmq(Nn>8)+draft_gemm_batch
+  measured:
+    screen:
+      conditions:
+        nreq: 12
+        seed: 42
+      tok_s: 45.9
+      tpot95: 0.3574
+    final:
+      conditions:
+        nreq: 60
+        seed: 42
+      tok_s: 51.7
+      tpot95: 0.3362
+      accept: 4.61
+provenance:
+  source_artifact: regime-table-Qwen3.5-27B-2026-07-03.json
+  source_sha256_16: 560711e1082fd562
+  trial_db: tools/autotune/autotune.db (not distributed)
+  verification: regime winners full ISO 12/12 PASS ×2 (long B16K7W2 mw0, short B6K7W3
+    mw1)
