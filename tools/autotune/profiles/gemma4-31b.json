@@ -31,5 +31,6 @@
     }
   },
   "multimodal_wrapper": true,
-  "quant": "w4a8"
+  "quant": "w4a8",
+  "mtp": false
 }

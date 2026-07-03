@@ -195,29 +195,54 @@ FANOVA_PRIOR_27B = {"DRAFT_SEQ": 0.33, "bmax": 0.31, "DRAFT_GEMV": 0.19, "MTP_Q4
 
 def strategy(dp: dict, mp: dict, constraints: dict = None) -> dict:
     traits, axes = [], []
+    spec = bool(mp.get("mtp"))   # MTP head 있어야 draft/spec 가능 — 없으면 spec축(K/W/DRAFT/accept) 전부 무의미
     if mp["params_b"] <= 2:
         traits.append("small(<2B)")
         axes.append(("sync/host 오버헤드 축(draft 배칭·디바이스화)", "0.8b 실측: sync가 지배(258 t/s 개선 사례)"))
     else:
         traits.append(f"large dense({mp['params_b']}B)")
-        axes.append(("bytes/token 축(양자화·MTP spec — 분모 축소)", "27b 실측: MTP q4+spec으로 plain 추월(P5)"))
+        if spec:
+            axes.append(("bytes/token 축(양자화·MTP spec — 분모 축소)", "27b 실측: MTP q4+spec으로 plain 추월(P5)"))
+        else:
+            axes.append(("bytes/token 축(양자화만 — MTP 부재로 spec 불가)",
+                         "Gemma4: W4A8 weight 4bit 고정, decode matmul-bound(single 9.26=53.3%)"))
     if mp.get("gdn"):
         traits.append("hybrid(GDN+full)")
         axes.append(("GDN state 축(bf16 state·k-split — state 운반 bound)", "챕터9: bf16 state로 batch 1.42→1.02×"))
     if mp.get("moe"):
         traits.append("MoE")
         axes.append(("expert 축(활성 expert 스파시티 — bytes/token↓)", "35b-a3b 대상(미실측 — prior 없음)"))
-    if not mp.get("tied_lm_head"):
+    if spec and not mp.get("tied_lm_head"):
         axes.append(("draft lm_head 품질 축(dq4 필수 — untied)", "27b P4: dq4=0이 accept 붕괴"))
+    if not spec:
+        traits.append("plain(MTP 無 — spec 불가)")
+        axes.append(("Bmax 축(★주 lever — batch가 weight 적재 amortize)",
+                     "Gemma4 이식: W4A8 sb dispatch로 gemm_batch B4포화 돌파 → B16 aggr 76(2.0×)"))
+        axes.append(("경로별 양자화 mix 축(프리필 q4·decode W4A8)",
+                     "Gemma4 CYC: 프리필 gemm_tiled 75 t/s ≫ W4A8 gemv 12.7 / decode는 W4A8 sb 9.26"))
     cons = check_constraints(constraints or {})
+    if spec:
+        search_space = {"bmax": "메모리 유도 상한(4..16 step2)", "K": "3..8", "W": "1..5",
+                        "env": ["MTP_Q4", "DRAFT_GEMV", "DRAFT_SEQ", "DRAFT_MW"],
+                        "canonical_constraint": "K+W>8(concat-mmq)"}
+        fanova = {"source": "27b Phase2(120 trial)", "importances": FANOVA_PRIOR_27B,
+                  "guidance": "draft 커널 스킴 축 우선 탐색·형상(K/W)은 미세 — 예산 후반 배정"}
+    else:
+        # ★spec 無 정직 공간 축소: K/W/DRAFT/MTP축 전부 제거. 남는 실질 lever는 Bmax(주)+양자화 mix.
+        search_space = {"bmax": "메모리 유도 상한(4..16 step2) — ★주 lever(유일 실측 스케일 축)",
+                        "quant_path": "prefill=q4(gemm_tiled)/decode=W4A8(sb) — CYC 유도 고정(스윕 아님)",
+                        "env": [],
+                        "removed_axes": "K/W/DRAFT_*/MTP_Q4/accept — MTP 부재로 spec 경로 없음(정직 축소)",
+                        "scheme_note": "W4A8 sb는 SMAX 버킷 내 bit-id — 버킷 경계(B≥9)/split-K는 스킴 변경"}
+        fanova = {"source": "27b(spec) — spec축(DRAFT/K/W/MTP)은 Gemma4에 transfer 불가(공간 밖)",
+                  "importances": {"bmax": "주(27b서도 0.31 — 유일 transfer 후보 축)"},
+                  "guidance": "spec축 스킵. Bmax를 메모리 상한까지 스윕 + regime(λ×mix)별 최적 Bmax 확정."}
     plan = {
         "traits": traits,
+        "spec_capable": spec,
         "priority_axes": [{"axis": a, "evidence": e} for a, e in axes],
-        "search_space": {"bmax": "메모리 유도 상한(4..16 step2)", "K": "3..8", "W": "1..5",
-                         "env": ["MTP_Q4", "DRAFT_GEMV", "DRAFT_SEQ", "DRAFT_MW"],
-                         "canonical_constraint": "K+W>8(concat-mmq)"},
-        "fanova_prior": {"source": "27b Phase2(120 trial)", "importances": FANOVA_PRIOR_27B,
-                         "guidance": "draft 커널 스킴 축 우선 탐색·형상(K/W)은 미세 — 예산 후반 배정"},
+        "search_space": search_space,
+        "fanova_prior": fanova,
         "budget": {"screen_trials_per_regime": 20, "screen_nreq": 12, "final_nreq": 60,
                    "fidelity": "multi-fidelity(스크리닝→top2 확정) — Phase2b 검증됨"},
         "constraints": cons,
