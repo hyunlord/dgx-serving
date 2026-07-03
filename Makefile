@@ -93,6 +93,11 @@ tests/test_cbatch_prod: tests/test_cbatch_prod.cu models/qwen35.cu models/qwen35
 tools/bench_serve: tools/bench_serve.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_serve.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
+# M4 라운드2: Gemma4 full 서빙 스모크(serving_core.h 모델-무지 코어 + Gemma4Backend). 결정성+완료+누수 게이트.
+#   사용법: ./tools/serve_gemma4 [w] [g] [uq] [Bmax] [nreq] [seed] [λ]
+tools/serve_gemma4: tools/serve_gemma4.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_gemma4.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
+
 # 챕터10 축2: spec-serving 벤치(연속배칭+슬롯별 spec 사이클, ragged verify_batch). ISO=1 iso게이트, TIME=1 곱 B버킷.
 #   사용법: ./tools/bench_serve_spec [w] [g] [uq] [Bmax] [nreq] [seed] [K] [W] [λ...]
 tools/bench_serve_spec: tools/bench_serve_spec.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
