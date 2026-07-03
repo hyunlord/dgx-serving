@@ -20,8 +20,11 @@ static std::vector<int> ri(const std::string&p){FILE*f=fopen((GD+p).c_str(),"rb"
 
 int main(int argc,char**argv){
     WD=argc>1?argv[1]:"artifacts/gemma4-31b/weights"; GD=(argc>2?argv[2]:"artifacts/gemma4-31b/golden")+std::string("/");
+    int uq=argc>3?atoi(argv[3]):1;   // 1=q4(gemm_batch) / 2=W4A8(sb dispatch). bit-id는 같은 SMAX 버킷 내(B≤8=SMAX8).
+    int Bt=argc>4?atoi(argv[4]):4;   // 비교 배치 크기(B=1과 같은 버킷이어야 bit-id — B≤8 권장)
     ModelConfig c=load_config_gemma4((WD+"/manifest.json").c_str());
     const int H=c.hidden_size,V=c.vocab_size;
+    printf("[mode] uq=%d(%s) B=%d (bit-id 게이트=B와 B=1이 같은 SMAX 버킷일 때)\n", uq, uq==2?"W4A8":"q4", Bt);
     const int hd_f=c.global_head_dim?c.global_head_dim:c.head_dim, hd_s=c.head_dim;
     std::vector<int> full=ri("gen_tokens.bin"); int total=full.size();
     std::vector<int> prompt=ri("token_ids.bin"); int S=prompt.size();
@@ -32,7 +35,7 @@ int main(int argc,char**argv){
     G4Weights w=load_weights_gemma4(WD.c_str(),c,1,0);
     auto am=[&](const float*lg){int b=0;float bv=lg[0];for(int j=1;j<V;j++)if(lg[j]>bv){bv=lg[j];b=j;}return b;};
 
-    const int B=4;
+    const int B=Bt;
     G4BatchState s4=alloc_g4_batch_state(c, B, total+4);
     G4BatchState s1=alloc_g4_batch_state(c, 1, total+4);
     int *d_t4; TCK(cudaMalloc(&d_t4,B*4)); int *d_t1; TCK(cudaMalloc(&d_t1,4));
@@ -45,8 +48,8 @@ int main(int argc,char**argv){
         int tok=full[t];
         std::vector<int> t4(B,tok); TCK(cudaMemcpy(d_t4,t4.data(),B*4,cudaMemcpyHostToDevice));
         TCK(cudaMemcpy(d_t1,&tok,4,cudaMemcpyHostToDevice));
-        gemma4_decode_batch(c,w,s4,d_t4,d_cf,d_sf,d_cs,d_ss,d_l4,1,1);
-        gemma4_decode_batch(c,w,s1,d_t1,d_cf,d_sf,d_cs,d_ss,d_l1,1,1);
+        gemma4_decode_batch(c,w,s4,d_t4,d_cf,d_sf,d_cs,d_ss,d_l4,1,uq);
+        gemma4_decode_batch(c,w,s1,d_t1,d_cf,d_sf,d_cs,d_ss,d_l1,1,uq);
         TCK(cudaMemcpy(l4.data(),d_l4,l4.size()*4,cudaMemcpyDeviceToHost));
         TCK(cudaMemcpy(l1.data(),d_l1,V*4,cudaMemcpyDeviceToHost));
         // (a) 슬롯 서로
@@ -61,7 +64,7 @@ int main(int argc,char**argv){
     { G4BatchState sr=alloc_g4_batch_state(c,B,64); int tk=full[0]; std::vector<int> t4(B,tk);
       int *dt; TCK(cudaMalloc(&dt,B*4)); TCK(cudaMemcpy(dt,t4.data(),B*4,cudaMemcpyHostToDevice));
       float *dl; TCK(cudaMalloc(&dl,(size_t)B*V*4));
-      for(int r=0;r<30;r++) gemma4_decode_batch(c,w,sr,dt,d_cf,d_sf,d_cs,d_ss,dl,0,1);  // commit=0(n_past 고정, 반복)
+      for(int r=0;r<30;r++) gemma4_decode_batch(c,w,sr,dt,d_cf,d_sf,d_cs,d_ss,dl,0,uq);  // commit=0(n_past 고정, 반복)
       cudaFree(dt); cudaFree(dl); free_g4_batch_state(sr); }
     size_t free1=0,tot1=0; TCK(cudaMemGetInfo(&free1,&tot1));
     long leak=(long)free0-(long)free1;   // >0 = free 감소 = 누수. <0/소량 = 드라이버 캐싱(정상).

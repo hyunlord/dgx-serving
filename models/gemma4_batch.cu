@@ -5,6 +5,9 @@
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemm_batch.cuh"
+#include "../kernels/gemv_w4a8.cuh"   // W4A8 batch: B≤8 SB 커널(27b 축1 이식)
+#include "../kernels/gemm_mmq.cuh"    // W4A8 batch: BM=16 split-K(B≥14 opt-in)
+#include "../kernels/quantize_x.cuh"  // W4A8: 활성화 int8 양자화
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
@@ -33,10 +36,27 @@ void free_g4_batch_state(G4BatchState &s){
     free(s.Kc); free(s.Vc); free(s.kv_cap); s.Kc=s.Vc=nullptr; s.kv_cap=nullptr;
 }
 
-// batch matmul: X[B,IN] × W[OUT,IN] → Y[B,OUT]. q4 weight × fp32 act (gemm_batch_q4, B-무관 canonical).
-static int gb_sdtype;
+// batch matmul: X[B,IN] × W[OUT,IN] → Y[B,OUT].
+//   use_q4==2 (W4A8): 활성화 int8 양자화 + B-gating(27b qwen35_batch 축1 결정표 이식, qwen과 동일 커널).
+//     B≤8 → gemv_w4a8_sb(SMAX dispatch, 1적재) / B≥14 opt-in split-K(BM16, borderline flip=스킴 변경) / else gemm_batch_w4a8.
+//     ★bit-identical은 같은 SB family 내(SMAX 버킷 동일)서 성립 — 버킷/커널 경계 넘으면 W4A8 스킴 변경(flip 가능).
+//   use_q4!=2 (q4): gemm_batch_q4(B-무관 canonical, 기존 경로 무변경).
+static int gb_sdtype, gb_use_q4;
+static int8_t *gb_xq=nullptr; static float *gb_xs=nullptr; static int32_t *gb_xsum=nullptr; static size_t gb_xcap=0;
 static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT, int B){
-    launch_gemm_batch_q4(X, m.wq, m.sc, Y, IN, OUT, B, gb_sdtype);
+    if(gb_use_q4==2){
+        size_t n=(size_t)B*IN;
+        if(gb_xcap<n){ if(gb_xq)cudaFree(gb_xq); if(gb_xs)cudaFree(gb_xs); if(gb_xsum)cudaFree(gb_xsum);
+            BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; }
+        launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,B);          // B행 X 양자화(1 launch)
+        static int USE_BM16 = getenv("BM16") ? atoi(getenv("BM16")) : 0;
+        if(B<=8)                     launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);
+        else if(USE_BM16 && B>=14)   launch_gemm_bm16_splitk(gb_xq,gb_xs,m.wq,m.sc,Y,B,OUT,IN,gb_sdtype);  // opt-in(스킴 변경)
+        else if(B<=15)               launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);
+        else                         launch_gemm_batch_w4a8(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);   // B=16 특수화
+    } else {
+        launch_gemm_batch_q4(X, m.wq, m.sc, Y, IN, OUT, B, gb_sdtype);
+    }
 }
 
 void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
@@ -44,7 +64,7 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
                          const float *d_cos_s, const float *d_sin_s,
                          float *d_logits, int commit, int use_q4,
                          const int *d_pos_b, const int *h_pos_b) {
-    gb_sdtype=c.scale_dtype;
+    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
     const int B=st.B, H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;

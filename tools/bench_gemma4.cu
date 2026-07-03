@@ -91,8 +91,8 @@ int main(int argc,char**argv){
         for(int s=0;s<ngen;s++) gemma4_decode(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1);
         CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
         double ms=ev(t0,t1); double ts=ngen/(ms/1000.0);
-        printf("  %-6s single decode: %.2f t/s (%.3f ms/%d스텝) — roofline 17.4 대비 %.1f%%%s\n",
-               sq==2?"W4A8":"q4", ts, ms, ngen, 100.0*ts/17.4, sq==2?"  [perf-preview, correctness 미검증]":"  [검증 경로]");
+        printf("  %-6s single decode: %.2f t/s (%.3f ms/%d스텝) — roofline 17.4 대비 %.1f%%  [검증 경로]\n",
+               sq==2?"W4A8":"q4", ts, ms, ngen, 100.0*ts/17.4);   // W4A8 골든 PASS(test_gemma4 uq=2, STEP1) — 둘 다 검증
         cudaFree(d1); free_g4_decode_state(st);
     }
 
