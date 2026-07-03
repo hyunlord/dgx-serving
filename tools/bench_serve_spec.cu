@@ -107,8 +107,13 @@ static inline void draft_mm_f32(const float*X,const float*W,float*Y,int IN,int O
     if(draft_gemv_on()) launch_gemv_f32(X,W,Y,IN,OUT,M);
     else                launch_gemm_batch_f32(X,W,Y,IN,OUT,M);
 }
+// P2b variant dispatch: DRAFT_MW{0=gemm_batch(기존),1=mw 타일1(NW↑행2),2=mw 타일2(행4)} — draft q4 matmul만.
+// draft 스킴 변경은 제안 토큰만 바꿀 수 있고(accept 변동 가능) 출력은 verify가 보증(spec==greedy) → ISO 게이트 그대로 유효.
+static int g_draft_mw=-1;
+static inline int draft_mw_on(){ if(g_draft_mw<0) g_draft_mw=getenv("DRAFT_MW")?atoi(getenv("DRAFT_MW")):0; return g_draft_mw; }
 static inline void draft_mm_q4(const float*X,const uint8_t*wq,const void*sc,float*Y,int IN,int OUT,int M,int sdt){
     if(draft_gemv_on()) launch_gemv_q4(X,wq,sc,Y,IN,OUT,M,sdt);
+    else if(draft_mw_on() && launch_gemm_mw_q4(X,wq,sc,Y,IN,OUT,M,sdt,0,draft_mw_on())) {}
     else                launch_gemm_batch_q4(X,wq,sc,Y,IN,OUT,M,sdt);
 }
 
@@ -353,20 +358,30 @@ static void slot_prefill(SpecSlot&s, const std::vector<int>&prompt){
 }
 
 // ── spec-serving continuous scheduler ───────────────────────────────────────
+// P2b 런타임 전환 최소판: HOTSWITCH="K1,W1,K2,W2,thr" — B_act 이동평균(EMA)<thr → 형상1, ≥thr → 형상2.
+//   전환은 사이클 경계(트리는 사이클마다 새로 생성, 슬롯 상태=KV/plen뿐 — 형상 무관)라 안전.
+//   출력은 spec==greedy 성질로 형상 무관 불변 → 기존 ISO 게이트가 전환 하에서도 유효.
+static int hs_on=0; static int hsK[2],hsW[2]; static double hs_thr=0;
+static inline void hs_init(){ static int done=0; if(done)return; done=1;
+    const char*h=getenv("HOTSWITCH");
+    if(h&&sscanf(h,"%d,%d,%d,%d,%lf",&hsK[0],&hsW[0],&hsK[1],&hsW[1],&hs_thr)==5) hs_on=1; }
 static Stats run_spec_continuous(std::vector<Req> reqs,int Bmax,std::vector<std::vector<int>>*iso_out=nullptr){
     int R=reqs.size();
+    hs_init();
+    int NnH = hs_on ? std::max(hsK[0]+hsW[0], hsK[1]+hsW[1]) : Nn;   // 할당은 최악 형상 기준(전환 OOB 방지)
     std::vector<SpecSlot> slot(Bmax);
     for(int b=0;b<Bmax;b++){
         slot[b].st=alloc_decode_state(c,maxlen);
         CK(cudaMalloc(&slot[b].kv.Kc,(size_t)maxlen*NKV*HD*4)); CK(cudaMalloc(&slot[b].kv.Vc,(size_t)maxlen*NKV*HD*4)); slot[b].kv.n=0;
         CK(cudaMalloc(&slot[b].h_cur,(size_t)H*4));
-        slot[b].va=alloc_verify_artifacts(c,Nn); slot[b].hpn.resize((size_t)Nn*H);
+        slot[b].va=alloc_verify_artifacts(c,NnH); slot[b].hpn.resize((size_t)NnH*H);
     }
     float *d_own; CK(cudaMalloc(&d_own,(size_t)H*4));
-    float *vl,*vpn; CK(cudaMalloc(&vl,(size_t)Bmax*Nn*V*4)); CK(cudaMalloc(&vpn,(size_t)Bmax*Nn*H*4));
+    float *vl,*vpn; CK(cudaMalloc(&vl,(size_t)Bmax*NnH*V*4)); CK(cudaMalloc(&vpn,(size_t)Bmax*NnH*H*4));
     int *d_tokb,*d_parb,*d_posb; unsigned *d_ancb;
-    CK(cudaMalloc(&d_tokb,(size_t)Bmax*Nn*4)); CK(cudaMalloc(&d_parb,(size_t)Bmax*Nn*4));
-    CK(cudaMalloc(&d_posb,(size_t)Bmax*Nn*4)); CK(cudaMalloc(&d_ancb,(size_t)Bmax*Nn*4));
+    CK(cudaMalloc(&d_tokb,(size_t)Bmax*NnH*4)); CK(cudaMalloc(&d_parb,(size_t)Bmax*NnH*4));
+    CK(cudaMalloc(&d_posb,(size_t)Bmax*NnH*4)); CK(cudaMalloc(&d_ancb,(size_t)Bmax*NnH*4));
+    double hs_ema=0; long hs_sw=0;
     std::deque<int> queue; int nextArr=0, completed=0; double simt=0; long stepN=0; double sumB=0,maxq=0;
     double acc_sum=0; long acc_n=0;
     // 사이클 임시(슬롯별 draft 결과)
@@ -392,6 +407,11 @@ static Stats run_spec_continuous(std::vector<Req> reqs,int Bmax,std::vector<std:
         int Ba=(int)act.size();
         if(Ba==0){ if(nextArr<R){ simt=reqs[nextArr].arrival; continue; } else break; }
         if((double)queue.size()>maxq) maxq=queue.size();
+        if(hs_on){   // 사이클 경계 핫스위치: B_act EMA → regime 형상 룩업(전역 K/W/Nn 갱신)
+            hs_ema = 0.7*hs_ema + 0.3*Ba;
+            int i = hs_ema>=hs_thr ? 1 : 0;
+            if(hsK[i]!=K||hsW[i]!=W){ K=hsK[i]; W=hsW[i]; Nn=K+W; hs_sw++; }
+        }
         // ── spec 사이클(활성 슬롯) ──
         auto t0=clk::now();
         // 1) MTP draft — P4: 슬롯 배치(1 forward=M행, sync K회). DRAFT_SEQ=1이면 순차(A/B·게이트용).
@@ -560,8 +580,10 @@ static std::vector<int> solo_spec(const std::vector<int>& prompt, int gen){
 static std::vector<Req> gen_trace(double lambda,int nreq,unsigned seed,int pmax){
     std::mt19937 rng(seed); std::exponential_distribution<double> ia(lambda);
     std::uniform_int_distribution<int> pP(8,pmax), gS(16,48), gL(96,192); std::uniform_real_distribution<double> u(0,1);
+    // P2b regime 축: SHORTP=short 요청 비율(기본 0.7). short-heavy 0.9 / long-heavy 0.3 등 — trace 형상만 바꿈(스킴 불변).
+    static double shortp=-1; if(shortp<0){ shortp=getenv("SHORTP")?atof(getenv("SHORTP")):0.7; }
     std::vector<Req> v(nreq); double t=0;
-    for(int i=0;i<nreq;i++){ t+=ia(rng); v[i].arrival=t; v[i].P=pP(rng); v[i].gen=(u(rng)<0.7)?gS(rng):gL(rng); }
+    for(int i=0;i<nreq;i++){ t+=ia(rng); v[i].arrival=t; v[i].P=pP(rng); v[i].gen=(u(rng)<shortp)?gS(rng):gL(rng); }
     return v;
 }
 
@@ -580,7 +602,7 @@ int main(int argc,char**argv){
     int trials=(getenv("TRIALS")&&atoi(getenv("TRIALS"))>0)?1:0;   // warm 서버 모드(오토튜닝): 모델 1회 로드, stdin에서 trial 반복
     c=load_config_qwen((WD+"/manifest.json").c_str());
     H=c.hidden_size; V=c.vocab_size; rot=c.rotary_dim; NKV=c.num_kv_heads; HD=c.head_dim;
-    maxlen=pmax+192+(trials?8+13:K+Nn)+16; if(maxlen<288) maxlen=288;   // TRIALS: 최악 형상(K8,Nn13) 기준 고정(형상 갱신에도 rope/KV 안전)
+    maxlen=pmax+192+((trials||getenv("HOTSWITCH"))?8+13:K+Nn)+16; if(maxlen<288) maxlen=288;   // TRIALS/HOTSWITCH: 최악 형상(K8,Nn13) 기준 고정(형상 갱신에도 rope/KV 안전)
     static std::vector<int> ids=ri("token_ids.bin"); IDS=&ids;
     // rope: ext 테이블 우선(bench_serve와 동일)
     std::vector<float> cl,sl;

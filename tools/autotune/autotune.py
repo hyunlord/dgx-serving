@@ -171,6 +171,12 @@ def search_space_from_profiles(mp: dict, dp: dict) -> dict:
 #                 BM16/SPLITK=plain batch-decode 전용(spec 경로 미실행 — 무영향), DQ4=0은 27b accept 붕괴 기지.
 P2_ENV_AXES = {"MTP_Q4": ["1", "0"], "DRAFT_GEMV": ["0", "1"], "DRAFT_SEQ": ["0", "1"]}
 
+# Phase 2b: draft matmul 커널 variant(mw 타일 — 컴파일 축의 dispatch화, fat binary에 전 variant 탑재).
+# P2에서 measured 확정된 축(MTP_Q4=1, DRAFT_GEMV=0, DRAFT_SEQ=0)은 고정하고 variant+형상만 탐색.
+P2B_ENV_AXES = {"DRAFT_MW": ["0", "1", "2"]}
+# regime 격자: λ{1,4,8} × mix{short-heavy 0.9, long-heavy 0.3} = 6 regime.
+P2B_REGIMES = [{"lam": l, "shortp": s} for l in (1.0, 4.0, 8.0) for s in (0.9, 0.3)]
+
 
 def params_env_key(params: dict) -> tuple:
     return tuple(sorted((k, params[k]) for k in P2_ENV_AXES if k in params))
@@ -226,6 +232,92 @@ def make_objective(mp, dp, args, cache, server=None):
     return objective
 
 
+# ---------- Phase 2b: regime별 튜닝(multi-fidelity) → regime→config 테이블 ----------
+def run_phase2b(mp, dp, args):
+    """regime(λ×mix)마다 소형 TPE study(핫 축 bmax/K/W + variant DRAFT_MW, 스크리닝 nreq)를 돌리고
+    상위 후보만 고충실도(nreq=60, 콜드 실행)로 확정 — regime→config 테이블 산출.
+    저충실도도 in-engine(같은 bench, 짧은 nreq) — 격리 마이크로벤치 금지(오도 전례)."""
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    storage = f"sqlite:///{os.path.join(HERE, 'autotune.db')}"
+    space = search_space_from_profiles(mp, dp)
+    fixed_env = {"MTP_Q4": "1", "DRAFT_GEMV": "0", "DRAFT_SEQ": "0"}  # P2 measured 확정치 고정
+    server = WarmServer(mp)
+    table = []
+    try:
+        for rg in P2B_REGIMES:
+            lam, sp = rg["lam"], rg["shortp"]
+            tag = f"lam{lam:g}-sp{sp:g}"
+            study = optuna.create_study(
+                study_name=f"autotune-p2b-{tag}", storage=storage, load_if_exists=True,
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=args.sampler_seed, multivariate=True))
+            cache = {}
+            for t in study.trials:
+                if t.state == optuna.trial.TrialState.COMPLETE and "tok_s" in t.user_attrs:
+                    cache[(t.params["bmax"], t.params["K"], t.params["W"], t.params["DRAFT_MW"])] = dict(t.user_attrs)
+
+            def objective(trial, _lam=lam, _sp=sp, _cache=cache):
+                bmax = trial.suggest_int("bmax", *space["bmax"], step=2)
+                K = trial.suggest_int("K", *space["K"])
+                W = trial.suggest_int("W", *space["W"])
+                mw = trial.suggest_categorical("DRAFT_MW", P2B_ENV_AXES["DRAFT_MW"])
+                if K + W <= 8:
+                    trial.set_user_attr("pruned", "canonical Nn<=8")
+                    raise optuna.TrialPruned()
+                ok, need_gb, _ = mem_filter(mp, dp, bmax, K, W)
+                if not ok:
+                    trial.set_user_attr("pruned", f"memory {need_gb:.1f}GB")
+                    raise optuna.TrialPruned()
+                key = (bmax, K, W, mw)
+                if key in _cache:
+                    res = _cache[key]
+                else:
+                    env_key = tuple(sorted({**fixed_env, "DRAFT_MW": mw, "SHORTP": str(_sp)}.items()))
+                    res = server.run(env_key, bmax, K, W, _lam, args.screen_nreq, args.seed)
+                    _cache[key] = res
+                for k in ("tok_s", "tpot95", "accept", "avgB"):
+                    trial.set_user_attr(k, res[k])
+                s = score(res, args.tpot_cap)
+                print(f"  [{tag}] #{trial.number}: B{bmax} K{K} W{W} mw={mw} -> {res['tok_s']:.1f} "
+                      f"tpot {res['tpot95']:.3f} score {s:.1f}", flush=True)
+                return s
+
+            done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+            todo = max(0, args.regime_trials - done)
+            print(f"[p2b {tag}] 기존 {done}, 추가 {todo} trials (screen nreq={args.screen_nreq})", flush=True)
+            if todo:
+                study.optimize(objective, n_trials=todo)
+            # 고충실도 확정: 고유 config 상위 2 → nreq=60 콜드 실행(SHORTP 포함, warm 서버와 독립 검증 겸용)
+            comp = sorted([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE],
+                          key=lambda t: t.value or -1e9, reverse=True)
+            seen, top = set(), []
+            for t in comp:
+                ckey = tuple(sorted(t.params.items()))
+                if ckey not in seen:
+                    seen.add(ckey)
+                    top.append(t)
+                if len(top) >= 2:
+                    break
+            finals = []
+            for t in top:
+                p = t.params
+                eenv = {**fixed_env, "DRAFT_MW": p["DRAFT_MW"], "SHORTP": str(sp)}
+                fin, _ = run_bench(mp, p["bmax"], p["K"], p["W"], lam, 60, args.seed, extra_env=eenv)
+                finals.append({"params": p, "screen": {k: t.user_attrs.get(k) for k in ("tok_s", "tpot95")},
+                               "nreq60": {k: fin.get(k) for k in ("tok_s", "tpot95", "accept", "avgB")}})
+                print(f"[p2b {tag}] 확정 {p}: nreq60 {fin.get('tok_s')} tpot {fin.get('tpot95')}", flush=True)
+            finals.sort(key=lambda f: (f["nreq60"]["tok_s"] or 0) - max(0.0, (f["nreq60"]["tpot95"] or 9) - args.tpot_cap) * 100, reverse=True)
+            # 간이 파레토: throughput 최선 + tpot 최선(다르면) 병기
+            by_tpot = min(finals, key=lambda f: f["nreq60"]["tpot95"] or 9)
+            table.append({"regime": rg, "best": finals[0],
+                          "latency_alt": by_tpot if by_tpot is not finals[0] else None,
+                          "candidates": finals})
+    finally:
+        server.stop()
+    return table
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.path.join(HERE, "profiles", "qwen35-27b.json"))
@@ -239,12 +331,32 @@ def main():
     ap.add_argument("--sampler-seed", type=int, default=7)
     ap.add_argument("--phase2", action="store_true", help="env 축 확장 + warm 서버 + 상위3 검증")
     ap.add_argument("--topk", type=int, default=3, help="phase2: 검증할 상위 후보 수")
+    ap.add_argument("--phase2b", action="store_true", help="regime 격자(λ×mix)별 튜닝 + variant 축 + multi-fidelity")
+    ap.add_argument("--regime-trials", type=int, default=20, help="phase2b: regime당 스크리닝 trial 수")
+    ap.add_argument("--screen-nreq", type=int, default=12, help="phase2b: 저충실도 nreq(in-engine)")
     args = ap.parse_args()
 
     mp = json.load(open(args.model))
     dp = json.load(open(args.device))
     if not os.path.exists(BENCH):
         sys.exit(f"bench 바이너리 없음: {BENCH} (make 먼저)")
+
+    if args.phase2b:
+        table = run_phase2b(mp, dp, args)
+        art = {"schema": "dgx-serving/autotune-regime-table@1",
+               "created": datetime.datetime.now().isoformat(timespec="seconds"),
+               "device_profile": dp, "model_profile": mp,
+               "objective": {"screen_nreq": args.screen_nreq, "final_nreq": 60, "seed": args.seed,
+                             "tpot_cap": args.tpot_cap, "fixed_env": {"MTP_Q4": "1", "DRAFT_GEMV": "0", "DRAFT_SEQ": "0"}},
+               "regime_table": table}
+        out = os.path.join(HERE, "artifacts", f"regime-table-{mp['name'].replace('/', '_').replace(' ', '')}-{datetime.date.today()}.json")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        json.dump(art, open(out, "w"), indent=1, ensure_ascii=False)
+        print(f"[p2b] regime 테이블: {out}", flush=True)
+        for row in table:
+            b = row["best"]
+            print(f"  {row['regime']} -> {b['params']} : {b['nreq60']['tok_s']} tok/s tpot {b['nreq60']['tpot95']}", flush=True)
+        return
 
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)

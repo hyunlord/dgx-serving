@@ -146,20 +146,32 @@ static inline void launch_gemm_mw_q4_B_t(const float *X, const uint8_t *Wq, cons
     dim3 block(32, NW); int grid = (OUT + ROWS - 1) / ROWS;
     gemm_mw_q4_kernel<B, NW, ROWS, ST><<<grid, block, 0, st>>>(X, Wq, sc, Y, IN, OUT);
 }
-static inline bool launch_gemm_mw_q4(const float *X, const uint8_t *Wq, const void *sc, float *Y, int IN, int OUT, int B, int scale_dtype = 0, cudaStream_t st = 0) {
-    if (scale_dtype == 1) {
+// tile 계열(P2b variant): 1=warp多·행2(NW↑ — IN 분할 병렬↑), 2=warp少·행4(ROWS↑ — weight 재사용↑).
+//   B16은 tmp[B][ROWS] 레지스터 압력으로 ROWS2만(두 계열 동일). B는 gemm_batch와 같은 round-up 격자.
+template<typename ST>
+static inline bool launch_gemm_mw_q4_t(const float *X, const uint8_t *Wq, const ST *sc, float *Y, int IN, int OUT, int B, int tile, cudaStream_t st) {
+    if (tile == 2) {
         switch (B) {
-            case 4: launch_gemm_mw_q4_B_t<4,4,2>(X,Wq,(const __half*)sc,Y,IN,OUT,st); return true;
-            case 8: launch_gemm_mw_q4_B_t<8,2,2>(X,Wq,(const __half*)sc,Y,IN,OUT,st); return true;
-            default: return false;
-        }
-    } else {
-        switch (B) {
-            case 4: launch_gemm_mw_q4_B_t<4,4,2>(X,Wq,(const float*)sc,Y,IN,OUT,st); return true;
-            case 8: launch_gemm_mw_q4_B_t<8,2,2>(X,Wq,(const float*)sc,Y,IN,OUT,st); return true;
+            case 1:  launch_gemm_mw_q4_B_t<1,2,4>(X,Wq,sc,Y,IN,OUT,st); return true;
+            case 2:  launch_gemm_mw_q4_B_t<2,2,4>(X,Wq,sc,Y,IN,OUT,st); return true;
+            case 4:  launch_gemm_mw_q4_B_t<4,2,4>(X,Wq,sc,Y,IN,OUT,st); return true;
+            case 8:  launch_gemm_mw_q4_B_t<8,2,4>(X,Wq,sc,Y,IN,OUT,st); return true;
+            case 16: launch_gemm_mw_q4_B_t<16,2,2>(X,Wq,sc,Y,IN,OUT,st); return true;
             default: return false;
         }
     }
+    switch (B) {
+        case 1:  launch_gemm_mw_q4_B_t<1,4,2>(X,Wq,sc,Y,IN,OUT,st); return true;
+        case 2:  launch_gemm_mw_q4_B_t<2,4,2>(X,Wq,sc,Y,IN,OUT,st); return true;
+        case 4:  launch_gemm_mw_q4_B_t<4,4,2>(X,Wq,sc,Y,IN,OUT,st); return true;
+        case 8:  launch_gemm_mw_q4_B_t<8,2,2>(X,Wq,sc,Y,IN,OUT,st); return true;
+        case 16: launch_gemm_mw_q4_B_t<16,2,2>(X,Wq,sc,Y,IN,OUT,st); return true;
+        default: return false;
+    }
+}
+static inline bool launch_gemm_mw_q4(const float *X, const uint8_t *Wq, const void *sc, float *Y, int IN, int OUT, int B, int scale_dtype = 0, cudaStream_t st = 0, int tile = 1) {
+    if (scale_dtype == 1) return launch_gemm_mw_q4_t(X, Wq, (const __half*)sc, Y, IN, OUT, B, tile, st);
+    return launch_gemm_mw_q4_t(X, Wq, (const float*)sc, Y, IN, OUT, B, tile, st);
 }
 
 // ---- W4A8 batch gemm: int8 X(B행) × int4 weight. weight uint32 1로드+unpack → B행 재사용, DP4A ----

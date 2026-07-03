@@ -80,8 +80,53 @@ chunk 512=pre-GDN) — 현 운영점(spec 서빙)에서 전체 공간을 튜너�
 - **축 중요도(fANOVA)**: DRAFT_SEQ 0.33 > Bmax 0.31 > DRAFT_GEMV 0.19 > MTP_Q4 0.13 ≫ K 0.03 > W 0.01
   — draft 경로 커널 스킴이 지배, 트리 형상은 미세 튜닝(4모델 확장 시 공간 축소 prior).
 
+## Phase 2b — 컴파일 축 dispatch화 + regime 정책 (진행 기록)
+
+**설계 전환**: 컴파일 축은 재빌드 루프 대신 **variant 복수 인스턴스화(fat binary) + env dispatch** — 기존
+gemm_batch B{1..16} 특수화·canonical 게이팅이 원형. 산출물은 "최적점 하나"가 아니라 **regime(λ×mix)→config 테이블**.
+
+### STEP A — 미스윕 축 실사 + draft 타일 variant (결과)
+- **축 실사(정직)**: chunk=spec 경로 비실효(prefill 통짜, pmax 32), canonical 경계 M=현 운영점(Nn>8) 비실효,
+  SMAX=sb 미사용 경로(Nn>8은 concat-mmq) — **실효 컴파일 축은 draft gemm_batch 타일뿐**(P5 이식, 이력 0 예측 적중).
+- **DRAFT_MW variant**: 기존 미사용 `gemm_mw_q4`(NW warp 협력×ROWS행 타일, 챕터4 자산)를 B{1,2,4,8,16}×타일
+  2계열(1=NW4·행2, 2=NW2·행4)로 인스턴스 확장 + `DRAFT_MW{0,1,2}` env dispatch(draft q4 matmul만).
+- **게이트**: MW=1/2 둘 다 **full ISO 12/12 PASS**(draft 스킴 변경은 제안만 바꾸고 출력은 verify가 보증), accept 불변.
+  quick A/B(B14 K6W3 nreq20): **MW=1 42.3 > MW=2 41.4 > 기존 40.9(+3.4%)** — 본 판정은 regime 튜닝의 nreq60 확정치로.
+- **SHORTP env**(trace mix 축): long-heavy(0.3)가 운영점을 실제로 움직임(45.4 vs short-heavy 42대) — regime 격자 근거.
+
+### STEP A' — 런타임 핫스위치 최소판 + 스킴 경계 발견 (정직 기록)
+- `HOTSWITCH="K1,W1,K2,W2,thr"`: B_act EMA가 임계를 넘으면 사이클 경계에서 K/W 전환(버퍼는 최악 Nn 할당,
+  maxlen 최악 고정). 동작 확인(크래시 없음).
+- **★발견: 전환 하 per-request bit-ISO는 성질상 미보장** — ISO 9/12 FAIL. 원인은 버그가 아니라 **스킴 경계**:
+  verify 로짓은 concat-mmq의 M(=B·Nn)에 bit-의존 → K/W 전환=스킴 변경 → borderline argmax flip(둘 다 유효
+  argmax — W4A8 스킴 교훈의 재확인). "spec==greedy는 K/W 무관"이라는 사전 추론이 틀렸음을 실측이 교정.
+- 함의: 핫스위치는 **요청 경계 전환**(신규 admit만 새 형상 — ragged Nn_b[] 인프라로 구현 가능)이어야 per-request
+  ISO 유지. 사이클 단위 전환은 throughput 용도로만(이번 부하에선 무득 41.6 vs 고정 42.3). 다음 단계 lever로 기록.
+
+### STEP B/C — regime→config 테이블 (6구간 × 20 trial 스크리닝 nreq12 → top2 확정 nreq60, 총 120+ trial)
+
+| regime (λ, mix) | best config | nreq60 | tpot95 | 지연 대안(파레토) |
+|---|---|---|---|---|
+| λ1, short-heavy(0.9) | B6 K7W3 **mw1** | 36.4 | 0.186 | B4 K7W3 mw1: 35.3, **0.152** |
+| λ1, long-heavy(0.3) | B16 K7W2 | 51.6 | 0.319 | — |
+| λ4, short-heavy | B4 K7W2 | 33.2 | **0.146** | (후보 2 국소 가능성 — 정직 주석) |
+| λ4, long-heavy | B16 K7W2 | **51.7** | 0.335 | B10 K8W2 mw1: 47.8, 0.223 |
+| λ8, short-heavy | B6 K7W3 **mw1** | 38.0 | 0.209 | B4 K7W3 mw1: 31.6, 0.148 |
+| λ8, long-heavy | B16 K7W2 | **51.7** | 0.336 | B10 K8W2 mw1: 47.8, 0.223 |
+
+**판정(정직, regime별 분리)**:
+- **mix가 지배 축, λ는 부차**: long-heavy는 전 λ에서 B16 K7W2(51.6~51.7)로 수렴 — long 생성이 큐를 채워
+  대형 B의 곱이 실현. short-heavy는 **작은 B(4~6) + 깊은 K7 + mw1 variant**(tpot 0.15~0.21) — 슬롯 회전이
+  빨라 큰 B의 큐잉이 손해. 단일점(B14 K6W3) 운영 대비 regime 정책의 가치가 measured로 실증됨.
+- 51.7은 long-heavy mix 조건의 수치 — 기준 mix(0.7)의 P2 확정치(B14 K6W3 50.4)와 조건이 달라 직접 비교 금지
+  (regime별 주장 분리). 흥미: long-heavy에선 **K7W2(Nn=9)**가 K6W3을 대체 — mix가 트리 형상 최적도 움직임.
+- **draft mw variant가 실전 승자 구성에 진입**(short-heavy 2 regime) — STEP A variant dispatch의 실효 확인.
+- 산출물: `tools/autotune/artifacts/regime-table-Qwen3.5-27B-*.json`(전 trial provenance 포함).
+- **regime 승자 full ISO 게이트: long-heavy B16 K7W2 mw0 = 12/12 PASS, short-heavy B6 K7W3 mw1 = 12/12 PASS**
+  (각 스킴 내 배칭==단독 bit-identical — 고정 config 운영 시 정확성 보증).
+
 ## 한계 / 다음
 
-- 목적함수가 λ4 단일점(Phase 7에서 λ 포화 확인된 조건) — 부하 프로파일이 다르면 목적 재정의 필요.
-- 컴파일 타임 축(SMAX/GDN state/타일)은 재빌드 루프 필요 — Phase 2b 후보.
-- Phase 3 = 4모델 확장(0.8b/기타 프로파일 추가), 장비 프로파일 자동 측정(STREAM/SM probe), 다목적(λ1 지연 병기).
+- 컴파일 타임 잔여 축(mmq 타일/regs — 정착 존중, GDN state 타입)은 build-in-the-loop 필요 시 별도.
+- 핫스위치 요청-경계 전환(슬롯별 형상, ragged Nn 활용) = per-request ISO 유지하는 정책 전환의 다음 단계.
+- Phase 3 = 4모델 확장(프로파일 교체), 장비 프로파일 자동 측정(STREAM/SM probe).
