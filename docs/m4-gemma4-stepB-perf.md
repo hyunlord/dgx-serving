@@ -67,3 +67,37 @@ roofline)라 31B-엔진 vs 12B-llama 비교는 apples-to-oranges → **강행 �
 3. **Gemma4 고유 갭**: batch 커널 B4 포화(MMQ 미적용) + M=1 비최적 + W4A8 미검증 — STEP C 튜닝/최적화 후보.
 4. 정직: q4=검증 40%, W4A8=perf-preview 53%(correctness gate 별도). Poisson 서빙 실측·per-layer ncu 분해는
    결론(matmul-지배)에 불필요하나 확보 시 정밀화 가능.
+
+---
+
+## 이식 완결 (STEP C 전 선행 — 27b 자산 3종, 커밋 3a6d649/72a6cef)
+
+STEP B가 드러낸 Gemma4 고유 lever 3종을 전부 **27b 자산 이식**(새 발명 아님)으로 해소. 완료 후 STEP C 튜닝이 진짜 엔진 위에서.
+
+### ① W4A8 골든 (perf-preview 딱지 제거)
+test_gemma4.cu uq 인자(2=W4A8). 같은 fp32 골든(q4 weights)에 use_q4=2 대조 → 활성화 int8 양자화만 검증.
+**PASS: op-level rel worst 6.5e-3 @L2**(활성화 노이즈, 깊이질수록 3.5e-3→2.4e-3 감소=smooth) **+ full-depth argmax 전위치 일치**.
+게이트 rel<1.5e-2. → **W4A8 single 9.26 t/s(53.3%)는 golden 검증 헤드라인**(perf-preview 아님).
+
+### ② batch W4A8 dispatch (B4 포화 돌파) — 최대 WIN
+gemma4_batch.cu mmB에 27b 축1 결정표 이식(동일 커널): 활성화 양자화 + B≤8 gemv_w4a8_sb / B≥14 opt-in split-K / else gemm_batch_w4a8.
+**controlled B-scaling(같은 bench warm, W4A8 sb vs 기존 q4 gemm_batch):**
+
+| B | q4 gemm_batch aggr | W4A8 sb aggr | 개선 |
+|---|---|---|---|
+| 1 | 6.27 | 9.33 | +49%(=single gemv 9.26 회수, M=1 페널티 해소) |
+| 4 | 24.07 | 35.32 | 1.47× |
+| 8 | 25.38(포화) | **62.36** | **2.46×** |
+| 16 | 37.48 | **75.97** | **2.03×** |
+
+gemm_batch **B4 포화(aggr 24→25 정체) 완전 돌파** — sb가 weight 적재를 B행에 amortize(memory-bound batch WIN).
+게이트: W4A8 B=4(SMAX8) slot bit-id 0 + B-무관(B4 slot0==B1) 0 + argmax vs HF 12/12 + 무누수. q4 회귀 동일 PASS.
+★bit-id는 SMAX 버킷 내(B≤8) — 버킷 경계(B≥9 SMAX16)/split-K는 W4A8 스킴 변경(flip 가능, 27b와 동일 문화).
+
+### ③ 서빙 회귀
+serve_gemma4 W4A8(uq=2): 결정성 rel 0.036%·완료 24/24·무누수 PASS(서빙 스택이 새 dispatch서 정상). ragged(uq=1) bit-id 15/15 무변경.
+
+### CYC 재분해 → STEP C 공간
+- single decode: 여전히 matmul-바운드(W4A8 9.26=53.3%) — 다음 lever=FP4(toolkit-blocked)/gemv 효율(27b 동일).
+- **batch: 서빙 처리량 천장이 25(B4 포화)→76(B16 sb)로 이동 → Bmax가 STEP C 실질 튜닝 lever**(전엔 B4 벽).
+- 프리필: W4A8/gemv는 통짜 프리필서 느림(12.7 vs q4/gemm_tiled 75) — 프리필=q4(gemm_tiled), decode=W4A8(sb) 혼용이 최적(STEP C).
