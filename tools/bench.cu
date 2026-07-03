@@ -136,7 +136,29 @@ int main(int argc,char**argv){
                    B,C,N,"-", dec/N, B*N*1000.0/dec, "-", B*N*1000.0/dec);
             free_batch_decode_state(bst); cudaFree(dbt);
         }
-    } else printf("# (MoE B>1 batch decode 미구현 — B=1만. batch MoE는 다음 STEP)\n");
+    }
+    // ---- MoE B>1 raw batch t/s (naive expert 루프 B-scaling — amortization 0 확인) ----
+    if(moe){
+        std::vector<int> Bs={1,4,8,16}; int C=8;   // C=8 작은 warmup prefill(KV 소량), decode N 타이밍
+        for(int B: Bs) for(int N: ngens){
+            size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB);
+            size_t need=(size_t)B*est_kv_bytes(e.c,C+N+1) + (size_t)B*est_workspace_bytes(e.c,1);
+            if(need > (size_t)(0.75*(double)freeB)){
+                printf("  %-4d %-6d %-7d | SKIP — 예산 %.1fGB > 가용 %.1fGB×0.75 (메모리 가드)\n",B,C,N,need/1e9,freeB/1e9); continue; }
+            BatchDecodeState bst=alloc_batch_decode_state(e.c,B,C+N+1);
+            std::vector<int> bt(B); for(int j=0;j<B;j++) bt[j]=htok[j];
+            int *dbt; CK(cudaMalloc(&dbt,B*4));
+            for(int p=0;p<C;p++){ for(int j=0;j<B;j++)bt[j]=htok[(p+j)%V]; CK(cudaMemcpy(dbt,bt.data(),B*4,cudaMemcpyHostToDevice));
+                qwen35_decode_batch(e.c,e.w,bst,dbt,d_cos,d_sin,d_logits,use_q4); }
+            CK(cudaDeviceSynchronize()); cudaEventRecord(t0);
+            for(int i=0;i<N;i++){ CK(cudaMemcpy(dbt,bt.data(),B*4,cudaMemcpyHostToDevice));
+                qwen35_decode_batch(e.c,e.w,bst,dbt,d_cos,d_sin,d_logits,use_q4); }
+            cudaEventRecord(t1); CK(cudaEventSynchronize(t1)); float dec=ev(t0,t1);
+            printf("  %-4d %-6d %-7d | %-10s %-10.3f %-12.1f %-12s (MoE batch, aggr %.1f tok/s, /stream %.1f)\n",
+                   B,C,N,"-", dec/N, (double)B*N*1000.0/dec, "-", (double)B*N*1000.0/dec, (double)N*1000.0/dec);
+            free_batch_decode_state(bst); cudaFree(dbt);
+        }
+    }
 
     engine_free(e);
     return 0;
