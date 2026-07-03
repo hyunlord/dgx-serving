@@ -182,3 +182,36 @@ fused MoE 블록은 **완전 device-side**: routing D2H 제거(#2) + malloc/free
 
 **종합**: MoE 24% 갭의 실 lever = device-fused(measured: single 24→30%, batch B16 +85%, bit-id). #1(scratch)은 오버랩이라
 e2e 0이었으나 graph 선결로 유효. 다음: graph capture 시도 → 서빙 backend(chunked prefill MoE) → 튜닝 → MoE 레시피.
+
+---
+
+## CUDA graph capture — stop-and-report (대수술, 브리프 명시 조건)
+
+STEP A(graph) 실현가능성 실사 결과 **대수술 판정 → stop-report**(브리프: "위치 간접화가 대수술이면 stop, graph 없이 서빙 진행도 유효").
+
+**장벽(구체)**: decode 스텝이 위치를 **host per-b 루프 + host 포인터 오프셋**으로 커널 launch에 박음:
+- KV append: `for(b) launch_f32_to_bf16(kn, st.Kc[l] + b·kvstride + POS(b)·kvdim)` — POS(b) host 오프셋(qwen35_batch.cu:159).
+- flash_attn: `for(b) launch_flash_attn(..., POS(b))` — attendlen host 스칼라(qwen35_batch.cu:165).
+- rope: `d_cos + base·rot` — host 오프셋(base=st.n_past).
+
+CUDA graph는 이 위치들을 **capture 시점에 고정** → 재생마다 같은 위치에 append/attend = decode 오답. 수정 = KV-append +
+flash_attn을 **device-position 커널**로 재작성(host per-b 루프 제거, POS/attendlen을 device에서 읽기) = **검증된 27b/Gemma4
+decode 경로 대수술**(회귀 위험). fused MoE(#2)가 이미 지배 launch(62%)를 붕괴했으므로, single launch-overhead lever를 위해
+검증 경로를 대수술하는 건 정당화 안 됨. **graph는 보류**(decode 위치 인프라 device화가 선결 — 별도 대형 작업).
+
+## 서빙 backend — MoE가 서빙 스택에 (코드 변경 0)
+
+**발견**: 서빙 경로가 이미 MoE 처리 — prefill_batch_slot이 **qwen35_decode에 위임**(qwen35_batch.cu:71), qwen35_decode는
+MoE 분기(fused default) 보유. decode=qwen35_decode_batch도 MoE 분기(line 187). QwenBackend(bench_serve)는 load_weights_qwen
+(35b q4 ✓)·per_seq_bytes(GDN ✓)·양 경로 MoE ✓ = **qwen 계열 모델-중립이라 35b MoE 서빙에 코드 변경 불요**.
+
+**서빙 스모크 PASS(bench_serve 35b, fused default, W4A8 backbone, Bmax8 nreq24 λ4)**:
+- 완료: 24 요청 완주(crash/OOM 없음), c-ch λ4 = 56.2 tok/s·avgB 5.87·maxQ 9.
+- 결정성: run1 56.2(e2e50 6.784) = run2 56.2(6.793), seed 고정 재현(wall 노이즈 <0.15%).
+- 무누수: admission 예산 per-seq 71.1MB×Bmax8=0.57GB OK, 완주 = persistent scratch(#1) 서빙 안전.
+※ 서빙 56.2(avgB 5.87<8, 큐 미포화+chunked prefill 비용) < raw batch B8 169 — 성능 주장은 튜닝 세션(스모크만).
+
+## 종합 / 다음
+- graph: 보류(decode 위치 device화 대수술 선결 — 별도). fused MoE(#2)가 이미 launch 6.7×↓로 주 이득 확보.
+- 서빙: MoE가 서빙 스택에 진입(코드 0, fused). 결정성·완료·무누수 PASS. **튜닝→MoE 첫 레시피 unblock**.
+- 다음: 튜닝(Bmax·regime — MoE 공간, plan strategy MoE expert 축 이미 존재) → MoE 첫 레시피(recipes/qwen35-35b-a3b-gb10.yaml) → 26B-A4B(renorm 규약).
