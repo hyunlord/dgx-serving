@@ -91,10 +91,26 @@ matmul M=B(gemm_batch_q4, fp32 act×q4 w), attn 슬롯별(attn_decode_batch scal
 - **3분류**: ② attn_decode_batch scale+window(기본값 보존, qwen35 회귀 PASS) / ① gemma4_batch+G4BatchState
   신규 모델별 / **③ 서빙 코어 모델분기 0**. spec 없음(MTP 부재) — plain만, 27b 곱 스토리 이식 불가(정직).
 
-### A-3-1 / A-3-3: bench 결합 (별도)
-Qwen 하드코딩 해소(bench_serve.cu:45 qwen35_decode_batch / :170 load_config_qwen / :185 load_weights_qwen)
-= 서빙 코어 모델-중립화(admission/slot/큐/chunked는 공용, graph 호출·state 타입만 훅) + ragged pos(연속 배칭은
-슬롯별 위치 — 현 batch는 same-length) + RSS 가드 + 스모크. decode_batch 정확성(A-3-2)이 토대.
+### A-3-2 부가: 메모리 누수 체크 (서빙 전 필수, PASS)
+batch decode는 per-call malloc/free churn(gemm_batch·버퍼) → 반복 서빙 시 GPU 누수가 112GB 사고의 GPU판.
+30스텝 반복 free-mem 델타 = **음수(드라이버 캐시 정리, 누수 없음)** — 임계 16MB 하 PASS. batch decode
+반복 안전 확인.
+
+### A-3-1 / A-3-3: full bench 결합 — ragged 전제로 별도 (정직 기록)
+
+**핵심 발견**: 연속 배칭(admission→slot→step)은 **슬롯마다 위치가 다름(ragged pos)** — 하지만 현
+gemma4_decode_batch는 **same-length**(모든 슬롯 위치 공통). 즉 full 서빙 결합의 전제 =
+**ragged gemma4_decode_batch**(슬롯별 base, rope_partial_batch→per-row 위치, attn window 슬롯별)로,
+A-3-2 same-length를 넘는 추가 구현. 그 위에:
+- bench 서빙 코어 중립화: bench_serve가 GDN/Qwen 깊이 결합(prefill_batch_slot[GDN state]·admission 예산
+  [nh/D/convd]·BatchDecodeState[GDN 필드]·qwen35_decode_batch, bench_serve.cu:45/170/185/188~). 공용 코어
+  (gen_trace/run_continuous/admission)를 모델 훅(config·weights·decode·prefill·state alloc) 인터페이스로 추상화
+  = 서빙 스택 대규모 리팩터. **③ 서빙 코어 모델분기 회피가 이 추상화의 목표**.
+- chunked prefill batch slot(Gemma4판) + RSS 상시 가드.
+
+**세션 판정**: A-3-2(batch decode 정확성 + 누수 안전 = 서빙의 정확성/안전 토대)가 이번 핵심 성과.
+full bench 결합은 ragged decode_batch + 서빙코어 추상화(각 대규모, golden 필요)로 별도 세션. STEP B(성능)는
+서빙 없이도 single/same-length-batch decode로 부분 측정 가능(연속배칭 throughput은 A-3 완성 후).
 
 ---
 ### (원 산정 기록 — A-1로 상당 부분 해소)

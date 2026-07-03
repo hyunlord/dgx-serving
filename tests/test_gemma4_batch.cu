@@ -56,12 +56,25 @@ int main(int argc,char**argv){
         // (c) argmax 연속성 (프롬프트 이후 위치만 — teacher forcing)
         if(t>=S-1){ am_checks++; if(am(l4.data())==full[t+1]) am_match++; }
     }
+    // (d) 메모리 누수 체크(서빙 전 필수 — per-call malloc/free churn): 반복 decode 전후 free-mem 델타 0.
+    size_t free0=0,tot0=0; TCK(cudaMemGetInfo(&free0,&tot0));
+    { G4BatchState sr=alloc_g4_batch_state(c,B,64); int tk=full[0]; std::vector<int> t4(B,tk);
+      int *dt; TCK(cudaMalloc(&dt,B*4)); TCK(cudaMemcpy(dt,t4.data(),B*4,cudaMemcpyHostToDevice));
+      float *dl; TCK(cudaMalloc(&dl,(size_t)B*V*4));
+      for(int r=0;r<30;r++) gemma4_decode_batch(c,w,sr,dt,d_cf,d_sf,d_cs,d_ss,dl,0,1);  // commit=0(n_past 고정, 반복)
+      cudaFree(dt); cudaFree(dl); free_g4_batch_state(sr); }
+    size_t free1=0,tot1=0; TCK(cudaMemGetInfo(&free1,&tot1));
+    long leak=(long)free0-(long)free1;   // >0 = free 감소 = 누수. <0/소량 = 드라이버 캐싱(정상).
+    bool leak_ok = leak < (16L<<20);     // 누수 임계 16MB(양의 델타만 문제; 음수=정리, 안전)
+    printf("(d) 30스텝 반복 free-mem 델타 = %ld bytes (>0=누수; 현재 %s — 서빙 안전)\n",
+           leak, leak_ok?"누수 없음":"누수 의심");
+
     printf("[cfg] B=%d S=%d total=%d\n",B,S,total);
     printf("(a) batch 슬롯 서로 max|Δ| = %.3e (같은 입력 → 0 기대: 슬롯 독립+attn 격리)\n", slot_diff);
     printf("(b) batch(B=4) 슬롯0 vs batch(B=1) max|Δ| = %.3e (gemm_batch B-무관 → 0 기대)\n", b_diff);
     printf("(c) argmax vs HF greedy: %d/%d\n", am_match, am_checks);
-    bool pass = (slot_diff==0.0) && (b_diff==0.0) && (am_match==am_checks) && am_checks>0;
-    printf("[test_gemma4_batch] %s (게이트=slot bit-id + B-무관 bit-id + argmax 연속성)\n", pass?"PASS":"FAIL");
+    bool pass = (slot_diff==0.0) && (b_diff==0.0) && (am_match==am_checks) && am_checks>0 && leak_ok;
+    printf("[test_gemma4_batch] %s (게이트=slot bit-id + B-무관 bit-id + argmax 연속성 + 누수 0)\n", pass?"PASS":"FAIL");
     free_g4_batch_state(s4); free_g4_batch_state(s1); free_weights_gemma4(w); free_config_gemma4(c);
     return pass?0:1;
 }
