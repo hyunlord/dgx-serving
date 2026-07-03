@@ -134,43 +134,47 @@ static inline void launch_attn_decode(const float *Q, const float *Kc, const flo
 // ---- batch decode attention (챕터3): B개 독립 시퀀스, 각 1토큰(위치 base), 각자 KV 캐시 ----
 //   Q,O: [B, NQ, HD]. Kc/Vc: [B, max_len, NKV, HD] (시퀀스별), kv_stride = max_len*NKV*HD.
 //   각 row b는 자기 KV[b][0..base] attend (attendlen = base+1 공통, same-length).
+//   scale: 0 → 1/sqrt(HD). window: 0 → 무제한; w>0 → sliding [qpos-w+1, qpos] (qpos=base, same-length 배치).
 static __global__ void attn_decode_batch_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
-                                   int NQ, int NKV, int HD, int base, long kv_stride) {
+                                   int NQ, int NKV, int HD, int base, long kv_stride, float scale, int window) {
     int b = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     int GRP = NQ / NKV, kv = h / GRP;
     int attendlen = base + 1;
+    int lo = (window > 0 && base - window + 1 > 0) ? base - window + 1 : 0;
     const float *Kcb = Kc + (size_t)b * kv_stride;     // 시퀀스 b의 KV
     const float *Vcb = Vc + (size_t)b * kv_stride;
     extern __shared__ float sm[];
     float *qs = sm, *scores = sm + HD;
     if (d < HD) qs[d] = Q[((size_t)b * NQ + h) * HD + d];
     __syncthreads();
-    for (int j = d; j < attendlen; j += blockDim.x) {
+    for (int j = d + lo; j < attendlen; j += blockDim.x) {
         const float *kp = Kcb + ((size_t)j * NKV + kv) * HD;
         float dot = 0.f;
         for (int t = 0; t < HD; t++) dot += qs[t] * kp[t];
-        scores[j] = dot / sqrtf((float)HD);
+        scores[j] = dot * scale;
     }
     __syncthreads();
     __shared__ float ssum;
     if (d == 0) {
-        float m = -FLT_MAX; for (int j = 0; j < attendlen; j++) m = fmaxf(m, scores[j]);
-        float s = 0.f; for (int j = 0; j < attendlen; j++) { scores[j] = expf(scores[j] - m); s += scores[j]; }
+        float m = -FLT_MAX; for (int j = lo; j < attendlen; j++) m = fmaxf(m, scores[j]);
+        float s = 0.f; for (int j = lo; j < attendlen; j++) { scores[j] = expf(scores[j] - m); s += scores[j]; }
         ssum = s;
     }
     __syncthreads();
     if (d < HD) {
         float acc = 0.f;
-        for (int j = 0; j < attendlen; j++) acc += scores[j] * Vcb[((size_t)j * NKV + kv) * HD + d];
+        for (int j = lo; j < attendlen; j++) acc += scores[j] * Vcb[((size_t)j * NKV + kv) * HD + d];
         O[((size_t)b * NQ + h) * HD + d] = acc / ssum;
     }
 }
 static inline void launch_attn_decode_batch(const float *Q, const float *Kc, const float *Vc, float *O,
-                                            int B, int NQ, int NKV, int HD, int base, long kv_stride, cudaStream_t st = 0) {
+                                            int B, int NQ, int NKV, int HD, int base, long kv_stride, cudaStream_t st = 0,
+                                            float scale = 0.f, int window = 0) {
     dim3 grid(B, NQ);
     size_t shmem = (size_t)(HD + base + 1) * sizeof(float);
     attn_smem_guard((const void *)attn_decode_batch_kernel, shmem, "attn_decode_batch", base + 1);
-    attn_decode_batch_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, NQ, NKV, HD, base, kv_stride);
+    float sc = (scale > 0.f) ? scale : rsqrtf((float)HD);
+    attn_decode_batch_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, NQ, NKV, HD, base, kv_stride, sc, window);
 }
 
 #endif // DGX_ATTENTION_CUH

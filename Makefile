@@ -14,7 +14,7 @@ ENGINE_SRCS := models/smollm3.cu runtime/weights.cu
 # *_27b/*_35b/moe 테스트는 대형모델 artifacts 필요, test_gemv_q4_scale 는 측정 도구 → 기본 스위트 제외(수동).
 TEST_SRCS := $(filter-out tests/test_27b.cu tests/test_gdn_27b.cu tests/test_attn_27b.cu tests/test_gemv_q4_scale.cu \
              tests/test_35b.cu tests/test_gdn_35b.cu tests/test_moe_expert.cu tests/test_rope_gen.cu tests/test_chunk_prefill.cu \
-             tests/test_gemma4.cu tests/test_gemma4_decode.cu tests/test_gemma4_gen.cu \
+             tests/test_gemma4.cu tests/test_gemma4_decode.cu tests/test_gemma4_gen.cu tests/test_gemma4_batch.cu \
              tests/test_long_ctx.cu tests/test_treeamort.cu tests/test_treespec.cu tests/test_treespec_depth.cu, $(wildcard tests/*.cu))
 TEST_BINS := $(TEST_SRCS:.cu=)
 
@@ -39,6 +39,9 @@ tests/test_gemma4_decode: tests/test_gemma4_decode.cu models/gemma4.cu models/ge
 
 tests/test_gemma4_gen: tests/test_gemma4_gen.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_gen.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+
+tests/test_gemma4_batch: tests/test_gemma4_batch.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_batch.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
 
 tests/test_decode: tests/test_decode.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_decode.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu -o $@

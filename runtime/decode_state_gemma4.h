@@ -32,4 +32,21 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const float *d_cos_s, const float *d_sin_s,
                    float *d_logits, int commit, int use_q4, int last_only = 0);
 
+// ---- Batch decode (A-3-2): B슬롯 동시. same-length(모든 슬롯 위치 base 공통) — ragged/chunked는 A-3 후속. ----
+//   KV: 층별 [B, max_len, NKV_l, hd_l] fp32 (kv_stride = max_len*NKV_l*hd_l). GDN 없어 KV만.
+struct G4BatchState {
+    int    n_past, max_len, L, B;
+    int   *kv_cap;
+    float **Kc, **Vc;   // [L], 각 [B, max_len, NKV_l, hd_l]
+};
+G4BatchState alloc_g4_batch_state(const ModelConfig &c, int B, int max_len);
+void free_g4_batch_state(G4BatchState &s);
+
+// B슬롯 1토큰 동시 decode (same-length, 위치 = st.n_past). matmul M=B(gemm_batch), attn 슬롯별.
+//   d_tokens: [B]. d_logits: [B,V] (softcap 후). commit=1이면 n_past += 1.
+void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                         const int *d_tokens, const float *d_cos_f, const float *d_sin_f,
+                         const float *d_cos_s, const float *d_sin_s,
+                         float *d_logits, int commit, int use_q4);
+
 #endif // DGX_DECODE_STATE_GEMMA4_H

@@ -77,9 +77,24 @@ sliding, 인자이지 모델분기 아님. ① gemma4_decode(graph)+G4DecodeStat
 현 alloc은 안전판(전부 max_len 선형)으로 OOB 원천 제거. window **마스크** 정확성은 A-1 test_gemma4_gen
 (sliding 층 window=1024로 12/12)에서 이미 검증 — 남은 건 물리 슬롯 인덱싱뿐.
 
-### A-3: bench 모델-중립화 (별도)
+### A-3-2: gemma4_decode_batch (완결, PASS)
+
+**gemma4_batch.cu**(~110줄): B슬롯 same-length 동시 decode(위치 base 공통 — ragged/chunked는 후속).
+matmul M=B(gemm_batch_q4, fp32 act×q4 w), attn 슬롯별(attn_decode_batch scale+window), KV 슬롯별
+[B,max_len,NKV_l,hd_l]. rope는 rope_partial_batch(rot=hd=full rope, 위치 공통).
+
+**3중 bit-identical 게이트 PASS**(test_gemma4_batch, B=4, 17토큰 시퀀스):
+- (a) batch 슬롯 서로 **max|Δ|=0** — 같은 입력 완전 일치(슬롯 독립성 + attention 격리 확인).
+- (b) batch(B=4) 슬롯0 == batch(B=1) **max|Δ|=0** — **gemm_batch B-무관 canonical 실증**(27b Phase5와
+  일치: 행별 acc·warp_reduce 순서 B-무관 → bit-exact). plain판 ISO.
+- (c) argmax **12/12 HF greedy 일치** — A-1 연속성 B 확장.
+- **3분류**: ② attn_decode_batch scale+window(기본값 보존, qwen35 회귀 PASS) / ① gemma4_batch+G4BatchState
+  신규 모델별 / **③ 서빙 코어 모델분기 0**. spec 없음(MTP 부재) — plain만, 27b 곱 스토리 이식 불가(정직).
+
+### A-3-1 / A-3-3: bench 결합 (별도)
 Qwen 하드코딩 해소(bench_serve.cu:45 qwen35_decode_batch / :170 load_config_qwen / :185 load_weights_qwen)
-+ gemma4_decode_batch(B 슬롯) + RSS 가드 + 스모크. plain 경로(spec 無).
+= 서빙 코어 모델-중립화(admission/slot/큐/chunked는 공용, graph 호출·state 타입만 훅) + ragged pos(연속 배칭은
+슬롯별 위치 — 현 batch는 same-length) + RSS 가드 + 스모크. decode_batch 정확성(A-3-2)이 토대.
 
 ---
 ### (원 산정 기록 — A-1로 상당 부분 해소)
