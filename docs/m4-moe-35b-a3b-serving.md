@@ -144,3 +144,41 @@ cudaFree는 **GPU 실행(62% busy)과 오버랩된 비동기 API 시간, critica
 1. **#2 device-fused MoE**(최대 lever — GPU 62% + D2H 둘 다, graph 가능화). 상당 작업이나 24% 달성률의 유일 돌파구.
 2. #2 후 재측정 → 서빙 backend(chunked prefill MoE — 현 bench_serve 미지원) → 튜닝(plan strategy MoE expert 축) → MoE 첫 레시피.
 3. 그룹핑은 계속 NO-GO(M_e<1). 26B-A4B는 별도(router renorm 규약 확인).
+
+---
+
+## #2 device-fused MoE 커널 (831b4e6) — 실 WIN measured
+
+### 설계
+kernels/moe_fused.cuh: **grouped gemv 4커널**. warp per (slot, output), slot=b·K+k, expert e=didx[slot] **device 간접**
+(★routing D2H 제거), weight=base+e·stride. per-output dot은 gemv_q4와 동일((q-8)·scale·lane-stride32·warp_reduce)
++ **k-order 고정 reduce**(naive s,k 루프 순서와 동일) → **naive와 bit-identical**·결정적(atomicAdd 회피).
+launch 토큰당 ~640→층당 4(gu/swiglu/down/reduce), host loop 제거. moe_block MOE_FUSED 스위치(default 1, 0=naive 폴백).
+모델독립(③=0): n_experts/K/H/MI 인자, Qwen 특수 없음(26B-A4B renorm은 router_topk config 분기 예정).
+
+### 게이트 (bit-identical 확증)
+- test_35b fused MEAN-rel **6.64e-2 = naive와 IDENTICAL**·argmax ALL·last 11751 → fused==naive bit-identical.
+- test_batch_decode fused: batch==solo argmax ALL(재사용 오염 없음). default(env 없음)=fused 골든 PASS.
+
+### 측정 (back-to-back warm, fused vs naive)
+| | naive | fused | 개선 |
+|---|---|---|---|
+| single B=1 | 42.8 | **51.8** | +21% (달성률 24.2%→**29.8%** of 165.3) |
+| batch B4 aggr | 82.9 | 126.8 | +53% |
+| batch B8 aggr | 97.1 | 168.9 | +74% |
+| batch B16 aggr | 105.3 | **195.3** | **+85%** |
+| prefill(S8) | 94.7 | **183.1** | +93% |
+
+★single은 예측 상한 75 미달(51.8) — "환산 금지" 실현(8-expert 병렬 한계, single은 fusion 이득 제한). **batch/prefill서
+이득 훨씬 큼**(launch/D2H 제거가 B 비례 — B16 +85%). 전 축 실 WIN + bit-identical.
+
+### nsys 재귀속 (fused)
+- **cudaLaunchKernel 1.08M→161k(6.7×↓)** — grouped가 launch 붕괴. **cudaMemcpy 60.2%→6.6%**(routing D2H 제거).
+- GPU: moe_fused_gu 33.9%+down 16.5%=50.4%(naive gemv_q4 62.3%↓, 같은 MAC 적은 큰 커널=occupancy↑).
+
+### ★CUDA graph 장벽 해소 (기록 — capture는 다음 세션)
+fused MoE 블록은 **완전 device-side**: routing D2H 제거(#2) + malloc/free 제거(#1) → host-의존 제어흐름 0.
+→ **MoE decode 스텝 graph-capturable**(이전 BLOCK 원인 둘 다 해소). capture 시도·검증은 다음 세션(GDN 등 나머지 경로 포함 e2e).
+
+**종합**: MoE 24% 갭의 실 lever = device-fused(measured: single 24→30%, batch B16 +85%, bit-id). #1(scratch)은 오버랩이라
+e2e 0이었으나 graph 선결로 유효. 다음: graph capture 시도 → 서빙 backend(chunked prefill MoE) → 튜닝 → MoE 레시피.
