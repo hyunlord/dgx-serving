@@ -127,6 +127,26 @@ full bench 결합은 ragged decode_batch + 서빙코어 추상화(각 대규모,
 - **3분류**: ② attn base_b(기본값 보존) / rope_partial_pos 재사용(신규 0) / ① gemma4_batch ragged 분기.
   **③ 커널 모델분기 0**.
 
+## STEP 2 — 서빙코어 추상화 설계 (확정) + full 리팩터는 별도
+
+**bench_serve 결합 지점 6개(코드 조사, 파일:라인)** — 이 6개만 훅으로 뽑으면 서빙 코어는 모델 무지:
+| # | 지점 | 라인 | ModelBackend 훅 |
+|---|---|---|---|
+| 1 | step_forward decode | 45 | `decode_batch_step(state, toks, pos)` |
+| 2 | prefill_batch_slot | 68 | `prefill_slot(state, b, tokens, P)` |
+| 3 | alloc_batch_decode_state | 55/109 | `alloc_state(Bmax, maxlen)` / `free/reset` |
+| 4 | load_config/weights | 170/185 | `load(dir) → {config, weights}` |
+| 5 | admission per-seq bytes | 191-192 | `per_seq_bytes(maxlen)` (GDN 항 vs KV-only) |
+
+**서빙 코어(모델 무지)**: gen_trace(Poisson)/run_continuous(큐·slot·admission·chunked)/run_static/Stats — 이미
+모델 로직 없음(위 5훅 통해서만 모델 접촉). **③ 회피 = 이 5훅 뒤로 모델 격리**. Qwen backend(GDN state·spec
+사이클), Gemma4 backend(plain·G4BatchState·ragged decode_batch[STEP1]) 각각 구현.
+
+**full 리팩터는 별도(정직)**: bench_serve(219줄)+qwen35_batch prefill/admission을 ModelBackend 위로 이관 +
+**무회귀 measured**(추상화 후 qwen35 ISO 12/12 + 처리량 스팟 52~53대 유지 — 27b 서빙 실행 수분·메모리)까지가
+STEP 2 완결 기준. 설계·훅 목록 확정됐으므로 다음 세션 즉시 착수 가능. STEP 3(Gemma4 full 서빙 스모크)은
+그 위에서. **이 세션 핵심 = STEP 1(ragged, 연속 배칭 최대 기술 리스크 해소)**.
+
 ---
 ### (원 산정 기록 — A-1로 상당 부분 해소)
 
