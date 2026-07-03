@@ -104,3 +104,43 @@
 
 **종합**: MoE 24% 갭의 실 원인 = (a) moe_mlp_block malloc/free 직렬화(cudaFree 41.8%, cheap fix) (b) expert tiny-matmul
 62% GPU(device fused 필요) (c) host round-trip(graph 차단). **그룹핑은 아니다**(M_e<1). 다음 세션: #1 구현→재측정→#2 판단.
+
+---
+
+## #1 persistent scratch 구현 + 재측정 (462f798) — measured가 판정
+
+### 게이트 (수학 불변 measured, assumed 아님)
+moe_mlp_block 11버퍼 호출당 malloc/free → static grow-on-demand(g_bxq 패턴). 게이트 전부 PASS·이전과 동일:
+router idx 불일치=0·weight 1.49e-8, expert rel 6.99e-7, test_35b argmax ALL·last 11751, batch bit-id 1.148e-3
++argmax ALL. **버퍼 재사용 오염 없음**(다른 시퀀스 연속 실행 확인 — 각 버퍼는 매 호출 커널 출력으로 완전 덮어씀, 누산기 out은 memset).
+
+### ★재측정 판정: e2e 이득 0 (환산 금지 실증)
+
+| | single | B4 | B8 | B16 |
+|---|---|---|---|---|
+| 이전(malloc/free) | 42.8 | 83.2 | 97.8 | 106.6 |
+| #1(persistent) | 42.8 | 83.2 | 97.0 | 105.7 |
+
+**malloc 제거가 처리량 불변.** nsys: **cudaFree 41.8%→3.0%**(53k→1.6k calls, 제거 작동)인데 e2e 안 변함 →
+cudaFree는 **GPU 실행(62% busy)과 오버랩된 비동기 API 시간, critical path 아니었음**. 브리프 경고("API%는 GPU와
+겹칠 수 있음 — 환산 금지")가 정확히 실현. **교훈: nsys API-time % ≠ critical-path time — 재측정만이 판정.**
+
+### 재귀속 (persistent scratch 후)
+- GPU: **gemv_q4 62.4% 불변**(481k tiny 2048×512, avg 8µs=BW 23% 저활용) — 실 병목, malloc 무관.
+- API: cudaMemcpy 60.2%(routing D2H **여전** — #1은 malloc만 제거, host 왕복 안 건드림), cudaLaunchKernel 22.9%(1.08M launch).
+
+### #2 device-fused MoE go/no-go (새 지도 근거)
+
+- **#1 가치(정직)**: perf lever 아님(e2e 0). 무회귀 + malloc/free 제거(CUDA graph capture 선결 — graph는
+  cudaMalloc/Free 금지) + host API 부하↓. 유지(graph/#2 인프라 선결).
+- **★#2 GO — 유일한 실 lever**: expert gemv 62.4% GPU(tiny matmul BW 23%) + routing D2H(cudaMemcpy 60% API) 둘 다
+  device-side fused MoE로만 해결. 온-디바이스 expert 루프(routing device-resident → **D2H 제거**, 481k tiny launch
+  → 층당 소수, occupancy↑로 BW util↑) + **CUDA graph 가능화**(host 왕복 제거).
+  payoff 상한(정직): expert gemv가 BW-bound 도달(8µs→~1.8µs, 4.4×)이면 62%→~17% → single TPOT 23ms→~13ms →
+  **~43→75 t/s(24%→~43%)**. 단 M_e~1이라 fusion은 per-expert 병렬 아닌 **다수 expert 동시 스케줄(occupancy)+launch 제거**로
+  util 개선 — 실 이득은 커널 구현이 판정(상한이지 예측 아님). 상당한 커널 작업(다음 세션).
+
+### 서빙 트랙 순서 권고 (measured 근거)
+1. **#2 device-fused MoE**(최대 lever — GPU 62% + D2H 둘 다, graph 가능화). 상당 작업이나 24% 달성률의 유일 돌파구.
+2. #2 후 재측정 → 서빙 backend(chunked prefill MoE — 현 bench_serve 미지원) → 튜닝(plan strategy MoE expert 축) → MoE 첫 레시피.
+3. 그룹핑은 계속 NO-GO(M_e<1). 26B-A4B는 별도(router renorm 규약 확인).
