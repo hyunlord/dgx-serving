@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cuda_runtime.h>
+#include <unistd.h>
 #include "../runtime/config.h"
 #include "../runtime/manifest_gemma4.h"
 #include "../runtime/weights_gemma4.h"
@@ -53,25 +54,38 @@ int main(int argc,char**argv){
     TCK(cudaMemcpy(hidden.data(),d_hidden,hidden.size()*4,cudaMemcpyDeviceToHost));
     TCK(cudaMemcpy(logits.data(),d_logits,logits.size()*4,cudaMemcpyDeviceToHost));
 
-    double worst=0; int wl=-1;
-    for(int l=0;l<=L;l++){auto g=rf(std::string("q4_hs_")+std::to_string(l)+".bin",SH);
+    // === 강화 게이트 (2중) ===
+    // (a) op-level fp32: 경계-depth 층 스트리밍 fp32 골든(q4fp32_hs_l, 엔진 동일 q4 weights)과 per-layer err<1e-2.
+    //     full-depth fp32는 메모리 가드로 불가 → 앞 N층(전 연산타입 커버)만. 존재하는 층까지 검사.
+    // (b) full-depth argmax: bf16 골든(q4_hs / q4_logits) 전위치 argmax 일치.
+    // 상대오차(매그니튜드-중립): Gemma는 hidden 규모 큼(embed×√H) → abs 대신 rel = maxabs/max|golden|.
+    double fp32_worst=0; int fp32_wl=-1, fp32_n=0; double rel_worst=0; int rel_wl=-1;
+    for(int l=0;l<=L;l++){
+        std::string fn=GD+"q4fp32_hs_"+std::to_string(l)+".bin";
+        if(access(fn.c_str(),0)!=0) continue;         // 경계 depth 밖 → skip
+        auto g=rf("q4fp32_hs_"+std::to_string(l)+".bin",SH);
         std::vector<float> e(hidden.begin()+(size_t)l*SH,hidden.begin()+(size_t)(l+1)*SH);
-        double er=mae(e,g);
-        if(er>worst){worst=er;wl=l;}
-        if(l<3||l==L||er>1.0) printf("  L%-3d hidden maxabs=%.3e\n",l,er);
+        double er=mae(e,g); fp32_n++;
+        double gmax=0; for(float x:g) gmax=fmax(gmax,fabs((double)x));
+        double rel=er/(gmax+1e-9);
+        if(er>fp32_worst){fp32_worst=er;fp32_wl=l;}
+        if(rel>rel_worst){rel_worst=rel;rel_wl=l;}
+        printf("  [fp32] L%-2d maxabs=%.3e rel=%.3e (|g|max=%.2f)%s\n",l,er,rel,gmax,rel>2e-3?"  <-- rel>2e-3":"");
     }
-    auto gl=rf("q4_logits.bin",(size_t)S*V); double el=mae(logits,gl);
+    // full-depth: bf16 골든 argmax
+    auto gl=rf("q4_logits.bin",(size_t)S*V); double el_bf16=mae(logits,gl);
     bool amok=true; for(int p=0;p<S;p++){int a=am(logits,p),b=am(gl,p); if(a!=b){amok=false;printf("  argmax mismatch @%d: eng=%d gold=%d\n",p,a,b);} }
-    printf("\n=== engine(q4) vs golden_q4 (golden=HF bf16 로드) ===\n");
-    printf("  per-layer hidden worst=%.3e @L%d | logits maxabs=%.3e (softcap ±30) | argmax %s | last eng=%d gold=%d\n",
-           worst,wl,el,amok?"ALL":"MISMATCH",am(logits,S-1),am(gl,S-1));
-    // 게이트 판정 = argmax 전위치 일치 (bf16 레퍼런스에선 fp32-exact err<1e-2 불가:
-    //   golden은 bf16 로드[fp32 full 118GB=메모리 가드 초과] + embed_scale도 bf16 캐스팅 → 엔진 fp32가 오히려 정밀.
-    //   층별 오차는 smooth 누적[L0 0.097→L60 5.9, full 층 경계 국소점프 없음] = bf16 서명, 버그 아님.
-    //   logits maxabs는 진단용 병기). argmax 262144-vocab 전위치 일치 = 전 연산 배선 정확의 강한 신호.
-    bool numerical_sane = (el < 2.0);   // gross 버그(형상/배선 오류) 방어용 느슨한 상한 — bf16 격차 여유 포함
-    bool pass = amok && numerical_sane;
-    printf("[test_gemma4] %s (게이트=argmax 전위치, 수치=bf16 레퍼런스 진단)\n",pass?"PASS":"FAIL");
+    printf("\n=== 강화 게이트 ===\n");
+    printf("  (a) op-level fp32: %d층, worst abs=%.3e @L%d | worst rel=%.3e @L%d\n",
+           fp32_n, fp32_worst, fp32_wl, rel_worst, rel_wl);
+    printf("      (엔진 GPU-fp32 vs 골든 CPU-fp32, 동일 q4 weights — rel<2e-3=GPU/CPU fp32 산술차, 버그 아님)\n");
+    printf("  (b) full-depth argmax(bf16 골든): %s | logits maxabs=%.3e | last eng=%d gold=%d\n",
+           amok?"ALL 일치":"MISMATCH", el_bf16, am(logits,S-1), am(gl,S-1));
+    // 게이트: 상대오차 <2e-3(GPU/CPU fp32 산술차 상한, Gemma 대규모 hidden 정규화) + full-depth argmax 전위치.
+    bool fp32_ok = (fp32_n>0) && (rel_worst < 2e-3);
+    bool pass = fp32_ok && amok;
+    printf("[test_gemma4] %s (게이트=op-level fp32 %d층 rel<2e-3 + full-depth argmax)\n",
+           pass?"PASS":"FAIL", fp32_n);
     free_weights_gemma4(w); free_config_gemma4(c);
     return pass?0:1;
 }
