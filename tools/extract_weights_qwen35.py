@@ -103,6 +103,34 @@ def main():
         "attn_output_gate": bool(g("attn_output_gate", False)),
         "full_attention_interval": g("full_attention_interval"),
     }
+    # Gemma4류 dims (있을 때만 — config 주도. M4 유연성 수정 #2: 타입별 RoPE·sliding·k_eq_v·softcap)
+    rp_all = getattr(tcfg, "rope_parameters", None)
+    if isinstance(rp_all, dict) and "full_attention" in rp_all:
+        # 레이어 타입별 RoPE(Gemma4): 단일 rope_theta/rotary_dim 대신 타입별 저장.
+        # proportional형은 각도수=prf*hd/2, 지수 분모=head_dim(기존 partial과 분모가 다름 — graph가 소비).
+        rpf, rps = rp_all.get("full_attention") or {}, rp_all.get("sliding_attention") or {}
+        ghd = g("global_head_dim") or hd
+        manifest.update({
+            "rope_theta_full": float(rpf.get("rope_theta", 10000.0)),
+            "rope_type_full": rpf.get("rope_type", "default"),
+            "rotary_dim_full": int(round(ghd * float(rpf.get("partial_rotary_factor", 1.0)))),
+            "rope_denom_full": ghd,  # proportional: inv_freq 지수 분모 = head_dim
+            "rope_theta_sliding": float(rps.get("rope_theta", 10000.0)),
+            "rotary_dim_sliding": int(round(hd * float(rps.get("partial_rotary_factor", 1.0)))),
+            "rope_denom_sliding": hd,
+        })
+    for k_cfg, k_mf in (("sliding_window", "sliding_window"),
+                        ("global_head_dim", "global_head_dim"),
+                        ("num_global_key_value_heads", "num_global_kv_heads"),
+                        ("attention_k_eq_v", "attention_k_eq_v"),
+                        ("final_logit_softcapping", "final_logit_softcapping"),
+                        ("hidden_activation", "hidden_act")):  # Gemma4 필드명 hidden_activation
+        v = g(k_cfg)
+        if v is not None and manifest.get(k_mf) is None:
+            manifest[k_mf] = int(v) if isinstance(v, bool) else v
+    if isinstance(rp_all, dict) and "full_attention" in rp_all:
+        manifest["embed_scale"] = float(g("hidden_size")) ** 0.5  # Gemma 전통 embed×√H (modeling L1602)
+        manifest["attn_scaling"] = 1.0  # Gemma4TextAttention.scaling=1.0 (QK-norm 존재)
     # MoE dims (num_experts 있을 때만 — dense 모델엔 미추가, config 주도)
     if g("num_experts"):
         manifest.update({

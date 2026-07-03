@@ -22,22 +22,40 @@ def anatomize(manifest_path: str) -> dict:
     m = json.load(open(manifest_path))
     is_hf = "model_type" in m or "architectures" in m  # HF config.json
     if is_hf:
-        # HF config.json 최소 매핑(v0: Qwen3.5 계열 필드 기준 — 다른 계열은 필드 추가로 확장)
+        # 멀티모달 래퍼(Gemma4 등): 텍스트 서빙 대상은 text_config — 언랩(유연성 수정 #1, M4)
+        outer = m
+        if "text_config" in m and isinstance(m["text_config"], dict):
+            m = m["text_config"]
+        # HF config.json 매핑(Qwen3.5/Gemma4 계열 — 새 계열은 필드 추가로 확장)
         layers = m.get("num_hidden_layers")
         lt = m.get("layer_types") or []
         gdn = any(t in ("linear_attention", "gdn") for t in lt) or m.get("linear_num_value_heads") is not None
-        moe = (m.get("num_experts") or 0) > 0
+        moe = (m.get("num_experts") or 0) > 0 or bool(m.get("enable_moe_block"))
         hd = m.get("head_dim") or (m["hidden_size"] // m["num_attention_heads"]
                                    if m.get("num_attention_heads") else None)
         prof = {
-            "name": m.get("_name_or_path") or m.get("model_type", "unknown"),
+            "name": outer.get("_name_or_path") or outer.get("model_type", "unknown"),
             "num_layers": layers,
             "hidden_size": m.get("hidden_size"),
             "gdn": gdn, "moe": moe,
-            "tied_lm_head": bool(m.get("tie_word_embeddings")),
+            "tied_lm_head": bool(m.get("tie_word_embeddings", outer.get("tie_word_embeddings"))),
             "num_kv_heads": m.get("num_key_value_heads"),
             "head_dim": hd,
+            "vocab_size": m.get("vocab_size"),
+            "params_b": round(estimate_params_hf(m) / 1e9, 1) if m.get("hidden_size") else None,
         }
+        # attention 패턴(GDN 없는 계열: sliding/full 혼합 — 서빙 마스크·KV 설계 입력)
+        if lt and not gdn:
+            nfull = sum(1 for t in lt if t == "full_attention")
+            prof["attn_pattern"] = {"full_layers": nfull, "sliding_layers": len(lt) - nfull,
+                                    "sliding_window": m.get("sliding_window")}
+        # 신규 연산 후보(있을 때만 — 커널 자산 매핑의 입력)
+        for k in ("final_logit_softcapping", "attn_logit_softcapping", "hidden_activation",
+                  "attention_k_eq_v", "global_head_dim", "num_global_key_value_heads",
+                  "rope_parameters", "rope_theta", "partial_rotary_factor"):
+            if m.get(k) is not None:
+                prof[k] = m[k]
+        prof["multimodal_wrapper"] = "text_config" in outer and outer is not m
     else:
         # dgx-serving manifest.json(추출 파이프 산출물)
         lt = m.get("layer_types") or []
@@ -62,6 +80,27 @@ def anatomize(manifest_path: str) -> dict:
             "pmax_default": 32,
         }
     return prof
+
+
+def estimate_params_hf(m: dict) -> float:
+    """HF text config 형상으로 파라미터 근사(±10% 추정 — 레이어 타입별 head 구성 반영).
+    가정 명시: MLP=gated 3장(gate/up/down), attention_k_eq_v=true면 K/V projection 1장."""
+    H, L, V = m["hidden_size"], m["num_hidden_layers"], m["vocab_size"]
+    FFN = m.get("intermediate_size", 4 * H)
+    NQ = m.get("num_attention_heads")
+    lt = m.get("layer_types") or ["full_attention"] * L
+    kv_mult = 1 if m.get("attention_k_eq_v") else 2
+    attn = 0
+    for t in lt:
+        if t == "full_attention" and m.get("global_head_dim"):
+            hd, nkv = m["global_head_dim"], m.get("num_global_key_value_heads",
+                                                   m.get("num_key_value_heads"))
+        else:
+            hd, nkv = m.get("head_dim", H // NQ), m.get("num_key_value_heads")
+        attn += H * NQ * hd + kv_mult * H * nkv * hd + NQ * hd * H  # q + k/v + o
+    mlp = L * 3 * H * FFN
+    embed = V * H * (1 if m.get("tie_word_embeddings") else 2)
+    return attn + mlp + embed
 
 
 def estimate_params(m: dict) -> float:

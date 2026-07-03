@@ -45,4 +45,24 @@ static inline void launch_rmsnorm_zc(const float *X, const float *W, float *Y,
     rmsnorm_zc_kernel<<<rows, 256, 0, s>>>(X, W, Y, hh, eps);
 }
 
+// Scale 없는 RMSNorm: y = x * rsqrt(mean(x^2)+eps). (with_scale=False norm — 예: Gemma4 v_norm)
+static __global__ void rmsnorm_ns_kernel(const float *X, float *Y, int hh, float eps) {
+    int row = blockIdx.x, tid = threadIdx.x;
+    const float *xr = X + (size_t)row * hh;
+    float *yr = Y + (size_t)row * hh;
+    __shared__ float sh[32];
+    __shared__ float inv;
+    float ss = 0.f;
+    for (int i = tid; i < hh; i += blockDim.x) { float v = xr[i]; ss += v * v; }
+    ss = block_reduce_sum(ss, sh);
+    if (tid == 0) inv = rsqrtf(ss / hh + eps);
+    __syncthreads();
+    for (int i = tid; i < hh; i += blockDim.x) yr[i] = xr[i] * inv;
+}
+
+static inline void launch_rmsnorm_noscale(const float *X, float *Y,
+                                          int rows, int hh, float eps, cudaStream_t s = 0) {
+    rmsnorm_ns_kernel<<<rows, 256, 0, s>>>(X, Y, hh, eps);
+}
+
 #endif // DGX_RMSNORM_CUH

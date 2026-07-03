@@ -27,11 +27,14 @@ static inline void attn_smem_guard(const void *kernel, size_t shmem, const char 
 //   블록 = (head h, query qi). blockDim.x = HD. threadIdx.x 가 dim(d) 와 key-pos(j) 두 역할.
 //   ⇒ 제약: S <= HD (1단계 prefill 용도). 동적 shared: qs[HD] + scores[S] + probs[S].
 //   kv head = h / (NQ/NKV) (GQA group).
+//   scale: softmax 전 스코어 스케일(0 → 1/sqrt(HD) 기본). window: sliding window 폭
+//   (0 → 무제한 causal; w>0 → key pos j ∈ [qi-w+1, qi]). 마스크 파라미터화 — 모델 분기 아님.
 static __global__ void attn_kernel(const float *Q, const float *K, const float *V, float *O,
-                            int S, int NQ, int NKV, int HD) {
+                            int S, int NQ, int NKV, int HD, float scale, int window) {
     int h = blockIdx.x, qi = blockIdx.y, d = threadIdx.x;
     if (qi >= S) return;
     int GRP = NQ / NKV, kv = h / GRP;
+    int lo = (window > 0 && qi - window + 1 > 0) ? qi - window + 1 : 0;
     extern __shared__ float sm[];
     float *qs = sm;            // [HD]
     float *scores = sm + HD;   // [S]
@@ -40,36 +43,38 @@ static __global__ void attn_kernel(const float *Q, const float *K, const float *
     if (d < HD) qs[d] = Q[((size_t)qi * NQ + h) * HD + d];
     __syncthreads();
 
-    // causal: key pos j = d, j <= qi
-    if (d <= qi) {
+    // causal (+sliding window): key pos j = d, lo <= j <= qi
+    if (d >= lo && d <= qi) {
         const float *kp = K + ((size_t)d * NKV + kv) * HD;
         float dot = 0.f;
         for (int t = 0; t < HD; t++) dot += qs[t] * kp[t];
-        scores[d] = dot / sqrtf((float)HD);
+        scores[d] = dot * scale;
     }
     __syncthreads();
 
     if (d == 0) {
         float m = -FLT_MAX;
-        for (int j = 0; j <= qi; j++) m = fmaxf(m, scores[j]);
+        for (int j = lo; j <= qi; j++) m = fmaxf(m, scores[j]);
         float sum = 0.f;
-        for (int j = 0; j <= qi; j++) { probs[j] = expf(scores[j] - m); sum += probs[j]; }
-        for (int j = 0; j <= qi; j++) probs[j] /= sum;
+        for (int j = lo; j <= qi; j++) { probs[j] = expf(scores[j] - m); sum += probs[j]; }
+        for (int j = lo; j <= qi; j++) probs[j] /= sum;
     }
     __syncthreads();
 
     if (d < HD) {
         float acc = 0.f;
-        for (int j = 0; j <= qi; j++) acc += probs[j] * V[((size_t)j * NKV + kv) * HD + d];
+        for (int j = lo; j <= qi; j++) acc += probs[j] * V[((size_t)j * NKV + kv) * HD + d];
         O[((size_t)qi * NQ + h) * HD + d] = acc;
     }
 }
 
 static inline void launch_attn(const float *Q, const float *K, const float *V, float *O,
-                               int S, int NQ, int NKV, int HD, cudaStream_t st = 0) {
+                               int S, int NQ, int NKV, int HD, cudaStream_t st = 0,
+                               float scale = 0.f, int window = 0) {
     dim3 grid(NQ, S);
     size_t shmem = (size_t)(HD + 2 * S) * sizeof(float);
-    attn_kernel<<<grid, HD, shmem, st>>>(Q, K, V, O, S, NQ, NKV, HD);
+    float sc = (scale > 0.f) ? scale : rsqrtf((float)HD);
+    attn_kernel<<<grid, HD, shmem, st>>>(Q, K, V, O, S, NQ, NKV, HD, sc, window);
 }
 
 // Decode/verify attention over a KV cache (위치 독립 cache, 임의 길이). 2a attn_kernel 의 S<=HD 제약 없음.

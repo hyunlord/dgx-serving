@@ -43,6 +43,17 @@ typedef struct ModelConfig {
     int num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, norm_topk_prob;
     // weight-scale dtype: 0=fp32, 1=fp16. xs(activation scale)는 항상 fp32.
     int scale_dtype;
+
+    // ---- Gemma4 확장 (sliding/global 혼합 dense — 미사용 모델은 0) ----
+    int   sliding_window;         // sliding 층 윈도우 폭(0=미사용). layer_is_full[i]==0 층에 적용
+    int   global_head_dim;        // full(global) 층 head_dim (0 → head_dim)
+    int   num_global_kv_heads;    // full 층 NKV (0 → num_kv_heads)
+    int   attention_k_eq_v;       // 1: full 층 v_proj 없음 — V = rmsnorm_noscale(k_proj 출력, RoPE 전)
+    float final_logit_softcapping;// >0 이면 logits = tanh(l/c)*c
+    float embed_scale;            // embed 출력 스칼라(√H 등). 0 → 미적용
+    float attn_scaling;           // softmax scale. 0 → 1/sqrt(층 head_dim)
+    int   rotary_dim_full;        // full 층 rotary 차원 (0 → rotary_dim)
+    int   rotary_dim_sliding;     // sliding 층 rotary 차원 (0 → head_dim 전체)
 } ModelConfig;
 
 // GDN 파생값

@@ -1,0 +1,35 @@
+{
+  "name": "Gemma4-31B-it",
+  "num_layers": 60,
+  "hidden_size": 5376,
+  "gdn": false,
+  "moe": false,
+  "tied_lm_head": true,
+  "num_kv_heads": 16,
+  "head_dim": 256,
+  "vocab_size": 262144,
+  "params_b": 29.6,
+  "attn_pattern": {
+    "full_layers": 10,
+    "sliding_layers": 50,
+    "sliding_window": 1024
+  },
+  "final_logit_softcapping": 30.0,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "attention_k_eq_v": true,
+  "global_head_dim": 512,
+  "num_global_key_value_heads": 4,
+  "rope_parameters": {
+    "full_attention": {
+      "partial_rotary_factor": 0.25,
+      "rope_theta": 1000000.0,
+      "rope_type": "proportional"
+    },
+    "sliding_attention": {
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    }
+  },
+  "multimodal_wrapper": true,
+  "quant": "w4a8"
+}

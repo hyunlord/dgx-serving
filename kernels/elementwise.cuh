@@ -29,6 +29,24 @@ static inline void launch_add(float *out, const float *a, const float *b, int n,
     add_kernel<<<grid, block, 0, s>>>(out, a, b, n);
 }
 
+// y[i] = x[i] * s (스칼라 곱 — embed 스케일·per-layer scalar 등, 모델 독립)
+static __global__ void scale_kernel(float *y, const float *x, float s, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = x[i] * s;
+}
+static inline void launch_scale(float *y, const float *x, float s, size_t n, cudaStream_t st = 0) {
+    scale_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(y, x, s, n);
+}
+
+// y[i] = tanh(x[i]/c) * c (logit softcapping — 모델 독립 elementwise)
+static __global__ void softcap_kernel(float *y, const float *x, float c, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = tanhf(x[i] / c) * c;
+}
+static inline void launch_softcap(float *y, const float *x, float c, size_t n, cudaStream_t st = 0) {
+    softcap_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(y, x, c, n);
+}
+
 // y[i] *= sigmoid(gate[i])  — Qwen3.5 full-attn output gate (gate는 sigmoid, silu 아님)
 static __global__ void gate_sigmoid_kernel(float *y, const float *gate, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
