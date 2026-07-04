@@ -43,6 +43,8 @@ static inline Stats sc_run_continuous(ServingBackend&be, void* st, const std::ve
     int R=reqs.size();
     struct Slot{int req=-1,pos=0,P=0,gen=0,g=0;}; std::vector<Slot> slot(Bmax);
     std::deque<int> queue; int nextArr=0, completed=0; double simt=0; long stepN=0; double sumB=0, maxq=0;
+    double t_pf=0, t_dec=0, t_idle=0;   // ★갭 계측(측정 먼저): prefill 간섭 / decode / idle 누적. 스케줄링 무변경.
+    std::vector<long> ahist(Bmax+1,0);  // active 분포 히스토그램(avgB 정체 기전 규명)
     while(completed<R){
         while(nextArr<R && reqs[nextArr].arrival<=simt) queue.push_back(nextArr++);
         for(int b=0;b<Bmax;b++) if(slot[b].req<0 && !queue.empty()){
@@ -50,22 +52,30 @@ static inline Stats sc_run_continuous(ServingBackend&be, void* st, const std::ve
             queue.pop_front(); slot[b]=Slot(); slot[b].req=r; slot[b].P=reqs[r].P; slot[b].gen=reqs[r].gen;
             be.reset_slot(st,b); reqs[r].admit=simt;
             if(chunked){  // 병렬 prefill(1스텝, 측정). 후 pos=P부터 decode. 첫 토큰=prefill 로짓(TTFT).
-                simt+=be.prefill_slot(st,b,reqs[r].P);
+                { double _pt=be.prefill_slot(st,b,reqs[r].P); simt+=_pt; t_pf+=_pt; }
                 slot[b].pos=reqs[r].P; slot[b].g=1; reqs[r].first=simt;
                 if(slot[b].g>=slot[b].gen){ reqs[r].done=simt; completed++; slot[b]=Slot(); } } }
         int active=0; for(int b=0;b<Bmax;b++) if(slot[b].req>=0) active++;
-        if(active==0){ if(nextArr<R){ simt=reqs[nextArr].arrival; continue; } else break; }
+        if(active==0){ if(nextArr<R){ t_idle+=reqs[nextArr].arrival-simt; simt=reqs[nextArr].arrival; continue; } else break; }
         if((double)queue.size()>maxq) maxq=queue.size();
         std::vector<int> toks(Bmax),pos(Bmax);
         for(int b=0;b<Bmax;b++){ Slot&s=slot[b];
             if(s.req<0){toks[b]=0;pos[b]=0;} else {toks[b]=ids[s.pos%ids.size()];pos[b]=s.pos;} }
-        double dt=be.decode_step(st,toks.data(),pos.data(),Bmax); simt+=dt; sumB+=active; stepN++;
+        double dt=be.decode_step(st,toks.data(),pos.data(),Bmax); simt+=dt; t_dec+=dt; sumB+=active; stepN++; ahist[active]++;
         for(int b=0;b<Bmax;b++){ Slot&s=slot[b]; if(s.req<0)continue;
             if(s.pos<s.P-1){ s.pos++; }
             else { if(s.g==0) reqs[s.req].first=simt;
                    s.g++; s.pos++;
                    if(s.g>=s.gen){ reqs[s.req].done=simt; completed++; slot[b]=Slot(); } } }
     }
+    // ★갭 분해(측정 먼저): 서빙 makespan을 prefill 간섭 / decode / idle 로 나눔 + underfill 손실 추정.
+    { double tot=t_pf+t_dec+t_idle, avgB=stepN?sumB/stepN:0;
+      double underfill=(Bmax>0)?t_dec*(1.0-avgB/Bmax):0;
+      fprintf(stderr,"[gap] makespan=%.4f = prefill %.4f(%.1f%%) + decode %.4f(%.1f%%) + idle %.4f(%.1f%%) | "
+              "avgB=%.2f/%d underfill≈%.4f(decode의 %.1f%%) stepN=%ld\n",
+              tot, t_pf,100*t_pf/(tot+1e-12), t_dec,100*t_dec/(tot+1e-12), t_idle,100*t_idle/(tot+1e-12),
+              avgB,Bmax, underfill,100*(1.0-avgB/(Bmax+1e-12)), stepN);
+      fprintf(stderr,"[ahist] active 분포(step수): "); for(int a=0;a<=Bmax;a++) if(ahist[a]) fprintf(stderr,"%d:%ld ",a,ahist[a]); fprintf(stderr,"\n"); }
     return sc_finalize(reqs,R,stepN,sumB,maxq,simt);
 }
 
