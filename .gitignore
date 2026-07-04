@@ -24,6 +24,7 @@ build/
 /tools/bench_w4a8_sb
 /tools/bench_mmq_tune
 /tools/bench_mmq_shape
+/tools/bench_mmq_ms
 /tools/memdiag
 /tools/ncu_*
 /tools/probe_*
