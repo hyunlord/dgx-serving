@@ -137,23 +137,29 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--recipe", required=True)
+    ap.add_argument("--recipe", default="")                        # 있으면 verify(지문·메모리); 없으면 직접 서빙/벤치(--uq)
     ap.add_argument("--weights", required=True)
     ap.add_argument("--tokenizer", default="google/gemma-4-E4B")   # vocab 262144 == 엔진 V(de-risked)
     ap.add_argument("--device", default=os.path.join(HERE,"autotune","profiles","gb10.json"))
-    ap.add_argument("--model", default=os.path.join(HERE,"autotune","profiles","gemma4-31b.json"))
+    ap.add_argument("--model-profile", default=os.path.join(HERE,"autotune","profiles","gemma4-31b.json"))  # recipe verify용 프로파일 json(--model과 별개)
     ap.add_argument("--maxlen", type=int, default=384)
     ap.add_argument("--bmax", type=int, default=8)                 # 동시 활성 슬롯 상한(온라인 배칭 폭)
     ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen","spec"])  # daemon 종류(arg 레이아웃 상이; spec=27b MTP spec)
     ap.add_argument("--golden", default="")                        # qwen/spec rope+MTP golden dir(필수 — gemma4는 dummy rope)
+    ap.add_argument("--uq", type=int, default=2)                   # recipe 없을 때 양자화(2=W4A8·1=q4·0=fp32)
+    ap.add_argument("--model-id", default="")                      # recipe 없을 때 모델 표시명
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
-    recipe = load_and_verify_recipe(args.recipe, args.device, args.model)
-    quant = recipe["target"]["model"].get("quant","w4a8")
-    uq = 2 if quant == "w4a8" else (1 if quant == "q4" else 0)
-    model_id = recipe["target"]["model"].get("id","gemma4")
-    print(f"[serve_api] recipe PASS(verify) → model={model_id} uq={uq}. daemon 起動 중(weight 로드)...", file=sys.stderr)
+    if args.recipe:
+        recipe = load_and_verify_recipe(args.recipe, args.device, args.model_profile)
+        quant = recipe["target"]["model"].get("quant","w4a8")
+        uq = 2 if quant == "w4a8" else (1 if quant == "q4" else 0)
+        model_id = recipe["target"]["model"].get("id","gemma4")
+        print(f"[serve_api] recipe PASS(verify) → model={model_id} uq={uq}. daemon 起動 중(weight 로드)...", file=sys.stderr)
+    else:
+        uq = args.uq; model_id = args.model_id or f"{args.model}-direct"
+        print(f"[serve_api] recipe 없음(직접 서빙/벤치) → uq={uq} model={model_id}. daemon 起動 중(weight 로드)...", file=sys.stderr)
 
     os.environ.setdefault("HF_HUB_OFFLINE","1"); os.environ.setdefault("TRANSFORMERS_OFFLINE","1")
     from transformers import AutoTokenizer
