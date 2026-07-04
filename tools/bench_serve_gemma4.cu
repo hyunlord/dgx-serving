@@ -26,7 +26,8 @@ static size_t mem_available(){ FILE*f=fopen("/proc/meminfo","r"); long kb=0; if(
 struct Gemma4Backend : ServingBackend {
     ModelConfig c; G4Weights w;
     float *d_cf=nullptr,*d_sf=nullptr,*d_cs=nullptr,*d_ss=nullptr;
-    float *d_logit=nullptr; int *d_tok=nullptr; int *d_pos=nullptr;
+    float *d_logit=nullptr; int *d_tok=nullptr; int *d_pos=nullptr; int *d_tok_pf=nullptr;
+    const std::vector<int>* p_ids=nullptr;   // 토큰 스트림 참조(chunked prefill 토큰 = ids[0..P-1])
     int V=0,uq=2,maxlen=0,Bmax=0;
     bool has_spec() const override { return false; }
     size_t per_seq_bytes(int ml) const override {
@@ -38,7 +39,14 @@ struct Gemma4Backend : ServingBackend {
     void* alloc_state(int B,int ml) override { G4BatchState* st=new G4BatchState(alloc_g4_batch_state(c,B,ml)); return st; }
     void free_state(void* s) override { G4BatchState* st=(G4BatchState*)s; free_g4_batch_state(*st); delete st; }
     void reset_slot(void*,int) override {}   // 위치독립 KV 덮어쓰기(serve_gemma4와 동일)
-    double prefill_slot(void*,int,int) override { fprintf(stderr,"chunked prefill 미지원(sweep=chunked=false)\n"); exit(2); }
+    double prefill_slot(void* s,int b,int P) override {  // chunked prefill: 슬롯 b에 P토큰(어댑터=W4A8 bit-id 게이트 통과)
+        G4BatchState* st=(G4BatchState*)s;
+        std::vector<int> pt(P); for(int i=0;i<P;i++) pt[i]=(*p_ids)[i % p_ids->size()];
+        CK(cudaMemcpy(d_tok_pf,pt.data(),(size_t)P*4,cudaMemcpyHostToDevice));
+        auto t0=clk::now();
+        gemma4_prefill_batch_slot(c,w,*st,b,d_tok_pf,P,d_cf,d_sf,d_cs,d_ss,d_logit,uq);
+        CK(cudaDeviceSynchronize()); auto t1=clk::now(); return std::chrono::duration<double>(t1-t0).count();
+    }
     double decode_step(void* s,const int* toks,const int* pos,int B) override {
         G4BatchState* st=(G4BatchState*)s;
         CK(cudaMemcpy(d_tok,toks,B*4,cudaMemcpyHostToDevice));
@@ -68,29 +76,34 @@ int main(int argc,char**argv){
     launch_gen_rope(be.d_cf,be.d_sf,maxlen,hd_f,1e4f); launch_gen_rope(be.d_cs,be.d_ss,maxlen,hd_s,1e4f); CK(cudaDeviceSynchronize());
     be.w=load_weights_gemma4(WD.c_str(),be.c,uq!=0?1:0,uq==0?1:0);
     CK(cudaMalloc(&be.d_tok,Bmax*4)); CK(cudaMalloc(&be.d_pos,Bmax*4)); CK(cudaMalloc(&be.d_logit,(size_t)Bmax*V*4));
+    CK(cudaMalloc(&be.d_tok_pf,(size_t)maxlen*4));   // chunked prefill 프롬프트 토큰(P≤pmax≤maxlen)
     // 토큰 스트림(더미, 서빙 스케줄만 — 내용 무관)
     std::vector<int> ids(256); for(int i=0;i<256;i++) ids[i]=(i*131+7)%V;
+    be.p_ids=&ids;   // chunked prefill 토큰 소스
 
     size_t avail=mem_available(); size_t perseq=be.per_seq_bytes(maxlen);
     printf("# Gemma4 plain 서빙 스윕: uq=%d maxlen=%d pmax=%d nreq=%d seed=%u | per-seq KV=%.1fMB, MemAvailable=%.1fGB\n",
            uq,maxlen,pmax,nreq,seed,perseq/1e6,avail/1e9);
     printf("# 메모리 필터: Bmax×per-seq ≤ 0.7·MemAvailable=%.1fGB → Bmax_hi≈%ld\n",0.7*avail/1e9,(long)(0.7*avail/perseq));
-    printf("\n  %-4s %-5s | %8s %8s | %7s %7s | %5s %5s\n","Bmax","λ","req/s","tok/s","tpot50","tpot95","avgB","maxQ");
-    printf("  %s\n",std::string(64,'-').c_str());
+    printf("\n  %-4s %-5s %-5s | %8s %8s | %7s %7s | %5s %5s\n","Bmax","mode","λ","req/s","tok/s","tpot50","tpot95","avgB","maxQ");
+    printf("  %s\n",std::string(72,'-').c_str());
 
     for(int B:Bs){
         if((double)B*perseq > 0.7*(double)avail){ printf("  %-4d %-5s   예산 초과(스킵, 메모리 필터)\n",B,"-"); continue; }
         void* st=be.alloc_state(B,maxlen);
-        // warm-up(클럭+캐시): 작은 trace 1회
-        { auto tr=sc_gen_trace(8.0,12,seed,pmax); sc_run_continuous(be,st,ids,tr,B,maxlen,false); }
+        // warm-up(클럭+캐시): 양 모드 1회씩(공정 비교)
+        { auto tr=sc_gen_trace(8.0,12,seed,pmax); sc_run_continuous(be,st,ids,tr,B,maxlen,false); sc_run_continuous(be,st,ids,tr,B,maxlen,true); }
         for(double lam:lams){
-            auto tr=sc_gen_trace(lam,nreq,seed,pmax); Stats s=sc_run_continuous(be,st,ids,tr,B,maxlen,false);
-            printf("  %-4d %-5g | %8.3f %8.1f | %7.4f %7.4f | %5.2f %5.0f\n",
-                   B,lam,s.thru_req,s.thru_tok,s.tpot50,s.tpot95,s.avgB,s.maxq);
+            for(int ch=0;ch<=1;ch++){   // 0=c1tok(1토큰 ingest), 1=c-ch(chunked prefill 어댑터, W4A8 bit-id)
+                auto tr=sc_gen_trace(lam,nreq,seed,pmax); Stats s=sc_run_continuous(be,st,ids,tr,B,maxlen,ch!=0);
+                printf("  %-4d %-5s %-5g | %8.3f %8.1f | %7.4f %7.4f | %5.2f %5.0f\n",
+                       B, ch?"c-ch":"c1tok", lam,s.thru_req,s.thru_tok,s.tpot50,s.tpot95,s.avgB,s.maxq);
+            }
         }
         be.free_state(st);
     }
     printf("\n  (throughput=tok/s. tpot=per-token latency(초). avgB=평균 active 배치. plain 서빙(spec 無). W4A8 sb dispatch.)\n");
-    cudaFree(be.d_tok);cudaFree(be.d_pos);cudaFree(be.d_logit);cudaFree(be.d_cf);cudaFree(be.d_sf);cudaFree(be.d_cs);cudaFree(be.d_ss);
+    printf("  (c1tok=프롬프트 1토큰/step ingest. c-ch=chunked prefill(어댑터, W4A8 bit-id 게이트 통과=순수 스케줄링).)\n");
+    cudaFree(be.d_tok);cudaFree(be.d_pos);cudaFree(be.d_logit);cudaFree(be.d_tok_pf);cudaFree(be.d_cf);cudaFree(be.d_sf);cudaFree(be.d_cs);cudaFree(be.d_ss);
     free_weights_gemma4(be.w); free_config_gemma4(be.c); return 0;
 }

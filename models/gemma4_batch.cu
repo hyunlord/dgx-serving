@@ -1,6 +1,7 @@
 #include "../runtime/decode_state_gemma4.h"
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 #include <cuda_runtime.h>
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
@@ -137,4 +138,27 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
 
     float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn};
     for(float *p:all) cudaFree(p);
+}
+
+// ---- chunked prefill (슬롯-b 뷰): 검증필 gemma4_decode(Sq=P) 재사용 ----
+//   슬롯 b의 KV 서브영역(Kc[l]+b*stride_l)을 단일-시퀀스 뷰로 노출 → gemma4_decode가 위치 0..P-1을 그 영역에 append.
+//   레이아웃 [B,max_len,nkv,hd]에서 슬롯 b의 [max_len,nkv,hd]이 곧 G4DecodeState.Kc[l] → 오프셋 정합(위 append와 동일).
+void gemma4_prefill_batch_slot(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                               int b, const int *d_tokens, int P,
+                               const float *d_cos_f, const float *d_sin_f,
+                               const float *d_cos_s, const float *d_sin_s,
+                               float *d_logits, int use_q4){
+    const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
+    const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
+    G4DecodeState view{}; view.n_past=0; view.max_len=st.max_len; view.L=st.L; view.kv_cap=st.kv_cap;
+    std::vector<float*> Kc(st.L), Vc(st.L);
+    for(int l=0;l<st.L;l++){
+        int full=c.layer_is_full?c.layer_is_full[l]:1;
+        int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
+        size_t stride=(size_t)st.max_len*nkv*hd;
+        Kc[l]=st.Kc[l]+(size_t)b*stride; Vc[l]=st.Vc[l]+(size_t)b*stride;   // 슬롯 b 서브영역
+    }
+    view.Kc=Kc.data(); view.Vc=Vc.data();
+    // commit=0(뷰의 n_past 불필요 — 스케줄러가 위치 관리), last_only=1(마지막 로짓만; 서빙은 discard)
+    gemma4_decode(c,w,view,d_tokens,P,d_cos_f,d_sin_f,d_cos_s,d_sin_s,d_logits,0,use_q4,1);
 }

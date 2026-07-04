@@ -65,6 +65,38 @@ c1tok vs c-ch 직접 대조가 이 은닉 비용을 노출한다(아래).
   +12%/대형-프롬프트 이득 대비 가치 있는가). 부재 중 정확성-리스크 신규 graph 강행 금지(헌법).
 - 26B-A4B는 decode 그래프 미빌드 → 이 lever 대상 밖(chunked prefill 구현 시 공통 수혜, 나중 합류).
 
+## STEP A — gemma4 chunked prefill 구현 + 실측 (measured, 정직)
+
+STEP0 lever(chunked prefill)를 gemma4에 착수. **어댑터 `gemma4_prefill_batch_slot`**: KV 레이아웃 `[B,max_len,nkv,hd]`에서
+슬롯 b 서브영역이 곧 단일-시퀀스 KV → 검증필 `gemma4_decode`(Sq=P)를 슬롯-b 뷰로 재사용(신규 커널 0·③=0).
+
+**① 정확성 게이트 `tests/test_gemma4_prefill_slot`** (chunked vs c1tok 1-tok ingest):
+- ★**W4A8(서빙 모드): 완전 bit-id** — KV Δ=0 **전 60층**·decode 4토큰 Δ=0·argmax 4/4. **chunked=순수 스케줄링**(브리핑 전제 충족).
+- q4(uq=1): scheme-internal(KV Δ≤5.9e-4·decode 4e-3·argmax 보존 — tiled vs batch gemm 누적차, 서빙 미사용).
+- ragged 무회귀 PASS(bit-id·argmax 15/15). → **정확성 완벽.**
+
+**② e2e 실측 (bench_serve_gemma4, pmax=32 Bmax=8 λ4): ★NET-LOSS**
+| mode | tok/s | tpot50 | prefill% | makespan |
+|---|---|---|---|---|
+| c1tok | **38.8** | 0.132 | 0% | 81s |
+| c-ch(chunked) | **22.1** | 0.274 | 54.3% | 142s |
+
+c-ch가 **-43%**(prefill ~1.6s/req, P≤32에 비정상). **chunked prefill이 gemma4에선 net-loss** — 정확성은 완벽하나 성능 역행.
+
+**③ 진단 (커널 근거 확정, 추측 아님):**
+- `gemma4_decode`의 W4A8 mm(`gemma4_decode.cu:52`)은 **plain `launch_gemv_w4a8`** 사용 = weight를 P행에 amortize 안 함
+  (tiled-gemm `:53`은 q4 전용). 반면 amortized 커널 `gemv_w4a8_sb`(`gemv_w4a8.cuh:126` "weight 재적재 없음")은
+  **decode(mmB)만** 사용. → 프리필 P토큰이 비-amortized gemv로 P× 메모리 트래픽 → c1tok의 배치 ingest보다 느림.
+- 대조: qwen `prefill_batch_slot`(`qwen35_batch.cu:13`)은 청크 multi-token + amortized 매트멀 → +12% WIN.
+
+**④ 수정 경로 (substantial — 사용자 판단):** gemma4 프리필이 **`gemv_w4a8_sb`(amortized, SMAX≤16 → P를 청크)**를 쓰도록
+새 chunked prefill forward 작성(qwen 아날로그). decode와 **같은 SB 커널이라 bit-id 유지 가능성 높음**(재게이트 필수).
+substantial + 정확성-민감 → 헌법(막히면 보고·큰 변경 강행 금지)대로 방향 확인 후 착수.
+
+**정직 결론:** chunked prefill lever는 27b/35b엔 유효(amortized prefill 보유)나, **gemma4는 amortized W4A8 프리필 커널
+경로 부재로 naive 구현이 net-loss**. bit-id 어댑터+게이트는 올바른 자산(빠른 버전의 기반). 26B는 대상 밖(decode 미빌드).
+
 ## 자산
 - 계측: `runtime/serving_core.h`([gap]/[ahist], accuracy-invariant 영구 측정 도구).
-- 벤치: `tools/bench_serve.cu`(27b/35b, c1tok+c-ch 스윕), `tools/bench_serve_gemma4.cu`(c1tok 전용).
+- 벤치: `tools/bench_serve.cu`(27b/35b, c1tok+c-ch 스윕), `tools/bench_serve_gemma4.cu`(c1tok+c-ch 양모드 스윕).
+- 어댑터: `models/gemma4_batch.cu` `gemma4_prefill_batch_slot`(bit-id, 현재 net-loss). 게이트: `tests/test_gemma4_prefill_slot.cu`.

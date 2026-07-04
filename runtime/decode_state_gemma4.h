@@ -53,4 +53,14 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
                          float *d_logits, int commit, int use_q4,
                          const int *d_pos_b = nullptr, const int *h_pos_b = nullptr);
 
+// chunked prefill: 슬롯 b에 P토큰(위치 0..P-1) 프리필. KV 레이아웃 [B,max_len,nkv,hd]에서 슬롯 b 서브영역
+//   (Kc[l]+b*kv_stride)이 곧 단일-시퀀스 KV → 검증필 gemma4_decode(Sq=P) 프리필을 슬롯-b 뷰로 재사용(신규 커널 0).
+//   d_tokens[P](device), d_logits=[1,V] scratch(last_only). 서빙은 KV만 필요(prefill 로짓 discard).
+//   ★정확성: KV 내용(roped K/v_norm V)은 위치별·attn 무관이라 1-tok ingest와 동일 KV여야 함(bit-id 게이트로 실측).
+void gemma4_prefill_batch_slot(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                               int b, const int *d_tokens, int P,
+                               const float *d_cos_f, const float *d_sin_f,
+                               const float *d_cos_s, const float *d_sin_s,
+                               float *d_logits, int use_q4);
+
 #endif // DGX_DECODE_STATE_GEMMA4_H

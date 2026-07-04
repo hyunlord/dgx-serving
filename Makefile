@@ -14,7 +14,7 @@ ENGINE_SRCS := models/smollm3.cu runtime/weights.cu
 # *_27b/*_35b/moe 테스트는 대형모델 artifacts 필요, test_gemv_q4_scale 는 측정 도구 → 기본 스위트 제외(수동).
 TEST_SRCS := $(filter-out tests/test_27b.cu tests/test_gdn_27b.cu tests/test_attn_27b.cu tests/test_gemv_q4_scale.cu \
              tests/test_35b.cu tests/test_gdn_35b.cu tests/test_moe_expert.cu tests/test_rope_gen.cu tests/test_chunk_prefill.cu \
-             tests/test_gemma4.cu tests/test_gemma4_decode.cu tests/test_gemma4_gen.cu tests/test_gemma4_batch.cu tests/test_gemma4_ragged.cu tests/test_gemma4_moe.cu tests/test_gemma4_moe_golden.cu tests/test_gemma4_moe_router_iso.cu \
+             tests/test_gemma4.cu tests/test_gemma4_decode.cu tests/test_gemma4_gen.cu tests/test_gemma4_batch.cu tests/test_gemma4_ragged.cu tests/test_gemma4_prefill_slot.cu tests/test_gemma4_moe.cu tests/test_gemma4_moe_golden.cu tests/test_gemma4_moe_router_iso.cu \
              tests/test_long_ctx.cu tests/test_treeamort.cu tests/test_treespec.cu tests/test_treespec_depth.cu, $(wildcard tests/*.cu))
 TEST_BINS := $(TEST_SRCS:.cu=)
 
@@ -52,8 +52,8 @@ tests/test_gemma4_decode: tests/test_gemma4_decode.cu models/gemma4.cu models/ge
 tests/test_gemma4_gen: tests/test_gemma4_gen.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_gen.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
-tests/test_gemma4_batch: tests/test_gemma4_batch.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_batch.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
+tests/test_gemma4_batch: tests/test_gemma4_batch.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_batch.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
 tests/test_decode: tests/test_decode.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_decode.cu models/qwen35.cu models/qwen35_decode.cu runtime/weights_qwen.cu -o $@
@@ -107,16 +107,16 @@ tools/bench_serve: tools/bench_serve.cu models/qwen35.cu models/qwen35_decode.cu
 
 # M4 라운드2: Gemma4 full 서빙 스모크(serving_core.h 모델-무지 코어 + Gemma4Backend). 결정성+완료+누수 게이트.
 #   사용법: ./tools/serve_gemma4 [w] [g] [uq] [Bmax] [nreq] [seed] [λ]
-tools/serve_gemma4: tools/serve_gemma4.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_gemma4.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
+tools/serve_gemma4: tools/serve_gemma4.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_gemma4.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
 # M4 STEP B: Gemma4 성능 벤치(single/batch decode t/s + prefill, roofline 대조). 사용법: ./tools/bench_gemma4 <w> [uq] [ctx] [ngen] [B..]
 tools/bench_gemma4: tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
 
 # M4 STEP C: Gemma4 plain 서빙 튜닝 스윕(λ×Bmax, dummy rope, 메모리 필터). 사용법: ./tools/bench_serve_gemma4 <w> [uq] [nreq] [seed] [pmax] [maxlen] [B..] -- [λ..]
-tools/bench_serve_gemma4: tools/bench_serve_gemma4.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_serve_gemma4.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
+tools/bench_serve_gemma4: tools/bench_serve_gemma4.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_serve_gemma4.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
 # 챕터10 축2: spec-serving 벤치(연속배칭+슬롯별 spec 사이클, ragged verify_batch). ISO=1 iso게이트, TIME=1 곱 B버킷.
 #   사용법: ./tools/bench_serve_spec [w] [g] [uq] [Bmax] [nreq] [seed] [K] [W] [λ...]
@@ -160,5 +160,9 @@ tests/test_long_ctx: tests/test_long_ctx.cu models/qwen35.cu models/qwen35_decod
 tests/test_35b: tests/test_35b.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_35b.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@
 
-tests/test_gemma4_ragged: tests/test_gemma4_ragged.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_ragged.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
+tests/test_gemma4_ragged: tests/test_gemma4_ragged.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_ragged.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+
+# STEP A chunked prefill 게이트: gemma4_prefill_batch_slot(어댑터) == c1tok bit-id/scheme-internal 검증.
+tests/test_gemma4_prefill_slot: tests/test_gemma4_prefill_slot.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_prefill_slot.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
