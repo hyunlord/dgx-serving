@@ -1,8 +1,9 @@
 #include "gemma4_moe.h"
-#include "../runtime/decode_state_gemma4.h"   // G4DecodeState (26B decode = 31B KV 구조 + dense∥MoE MLP)
+#include "../runtime/decode_state_gemma4.h"   // G4DecodeState/G4BatchState (26B decode = 31B KV 구조 + dense∥MoE MLP)
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <vector>
 #include <cuda_runtime.h>
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
@@ -279,4 +280,25 @@ void gemma4_moe_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &
 
     float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn,h1,h2,moe_in,moe_out,comb,rnorm};
     for(float *p:all) cudaFree(p);
+}
+
+// 26B MoE chunked prefill(슬롯-b 뷰) — gemma4_prefill_batch_slot의 MoE판: 슬롯 b KV 서브영역 뷰로 gemma4_moe_decode(Sq=P) 재사용.
+//   [B,max_len,nkv,hd]의 슬롯 b가 곧 G4DecodeState.Kc[l](오프셋 정합) → 위치 0..P-1 append. commit=0·last_only=1.
+void gemma4_moe_prefill_batch_slot(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                                   int b, const int *d_tokens, int P,
+                                   const float *d_cos_f, const float *d_sin_f,
+                                   const float *d_cos_s, const float *d_sin_s,
+                                   float *d_logits, int use_q4){
+    const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
+    const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
+    G4DecodeState view{}; view.n_past=0; view.max_len=st.max_len; view.L=st.L; view.kv_cap=st.kv_cap;
+    std::vector<float*> Kc(st.L), Vc(st.L);
+    for(int l=0;l<st.L;l++){
+        int full=c.layer_is_full?c.layer_is_full[l]:1;
+        int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
+        size_t stride=(size_t)st.max_len*nkv*hd;
+        Kc[l]=st.Kc[l]+(size_t)b*stride; Vc[l]=st.Vc[l]+(size_t)b*stride;   // 슬롯 b 서브영역
+    }
+    view.Kc=Kc.data(); view.Vc=Vc.data();
+    gemma4_moe_decode(c,w,view,d_tokens,P,d_cos_f,d_sin_f,d_cos_s,d_sin_s,d_logits,0,use_q4,1);   // commit=0, last_only=1
 }

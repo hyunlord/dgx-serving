@@ -38,5 +38,11 @@ void gemma4_moe_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchSt
                              const float *d_cos_s, const float *d_sin_s,
                              float *d_logits, int commit, int use_q4,
                              const int *d_pos_b, const int *h_pos_b);
+// 26B MoE chunked prefill(슬롯-b 뷰) — gemma4_prefill_batch_slot의 MoE판.
+void gemma4_moe_prefill_batch_slot(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                                   int b, const int *d_tokens, int P,
+                                   const float *d_cos_f, const float *d_sin_f,
+                                   const float *d_cos_s, const float *d_sin_s,
+                                   float *d_logits, int use_q4);
 
 #endif // DGX_MODELS_GEMMA4_MOE_H

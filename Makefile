@@ -120,8 +120,8 @@ tools/serve_daemon_gemma4: tools/serve_daemon_gemma4.cu models/gemma4_decode.cu 
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_gemma4.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
 # M5 온라인 연속 배칭 daemon(모델-중립 루프 serving_online.h + Gemma4OnlineBackend). batch primitive 재사용.
-tools/serve_daemon_gemma4_online: tools/serve_daemon_gemma4_online.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_gemma4_online.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@ -lpthread
+tools/serve_daemon_gemma4_online: tools/serve_daemon_gemma4_online.cu models/gemma4_batch.cu models/gemma4_decode.cu models/gemma4_moe.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_gemma4_online.cu models/gemma4_batch.cu models/gemma4_decode.cu models/gemma4_moe.cu runtime/weights_gemma4.cu -o $@ -lpthread
 
 # M5 온라인 daemon — Qwen3.5 계열(27b·35b-a3b MoE plain, greedy). 같은 모델-중립 루프(serving_online.h) + QwenOnlineBackend.
 tools/serve_daemon_qwen_online: tools/serve_daemon_qwen_online.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)

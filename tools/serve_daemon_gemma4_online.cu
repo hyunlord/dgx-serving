@@ -8,6 +8,7 @@
 #include "../runtime/weights_gemma4.h"
 #include "../runtime/decode_state_gemma4.h"
 #include "../runtime/serving_online.h"
+#include "../models/gemma4_moe.h"      // 26B-A4B MoE 분기(gemma4_moe_decode_batch·prefill_batch_slot)
 #include "../kernels/rope.cuh"
 
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"[online] CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
@@ -16,7 +17,7 @@ struct Gemma4OnlineBackend : OnlineBackend {
     ModelConfig c; G4Weights w;
     float *d_cf=nullptr,*d_sf=nullptr,*d_cs=nullptr,*d_ss=nullptr,*d_logit=nullptr;
     int *d_tok=nullptr,*d_pos=nullptr,*d_pf=nullptr;
-    int V=0, maxlen_=0, uq=2;
+    int V=0, maxlen_=0, uq=2, moe=0;   // moe=1: 26B-A4B(dense∥MoE) → gemma4_moe_* 분기(c.num_experts>0 자동)
     int vocab() const override { return V; }
     int max_len() const override { return maxlen_; }
     void* alloc_state(int Bmax) override { return new G4BatchState(alloc_g4_batch_state(c,Bmax,maxlen_)); }
@@ -24,14 +25,16 @@ struct Gemma4OnlineBackend : OnlineBackend {
     void  prefill_ids(void* st, int b, const int* h_ids, int P) override {
         G4BatchState* s=(G4BatchState*)st;
         CK(cudaMemcpy(d_pf, h_ids, (size_t)P*4, cudaMemcpyHostToDevice));
-        gemma4_prefill_batch_slot(c,w,*s,b,d_pf,P,d_cf,d_sf,d_cs,d_ss,d_logit,uq);  // 슬롯 b KV[0..P-1], d_logit[0:V]=마지막
+        if(moe) gemma4_moe_prefill_batch_slot(c,w,*s,b,d_pf,P,d_cf,d_sf,d_cs,d_ss,d_logit,uq);   // 26B dense∥MoE
+        else    gemma4_prefill_batch_slot(c,w,*s,b,d_pf,P,d_cf,d_sf,d_cs,d_ss,d_logit,uq);        // 31B dense
     }
     void  decode_step(void* st, const int* h_toks, const int* h_pos, int Bmax) override {
         G4BatchState* s=(G4BatchState*)st;
         CK(cudaMemcpy(d_tok, h_toks, Bmax*4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_pos, h_pos, Bmax*4, cudaMemcpyHostToDevice));
         std::vector<int> hp(h_pos, h_pos+Bmax);
-        gemma4_decode_batch(c,w,*s,d_tok,d_cf,d_sf,d_cs,d_ss,d_logit,0,uq,d_pos,hp.data());  // ragged(슬롯 독립)
+        if(moe) gemma4_moe_decode_batch(c,w,*s,d_tok,d_cf,d_sf,d_cs,d_ss,d_logit,0,uq,d_pos,hp.data());  // 26B(dense mmB + MoE fused)
+        else    gemma4_decode_batch(c,w,*s,d_tok,d_cf,d_sf,d_cs,d_ss,d_logit,0,uq,d_pos,hp.data());       // 31B(ragged 슬롯 독립)
     }
     void  logits_to_host(float* h_dst, int rows) override { CK(cudaMemcpy(h_dst, d_logit, (size_t)rows*V*4, cudaMemcpyDeviceToHost)); }
 };
@@ -42,6 +45,7 @@ int main(int argc,char**argv){
     Gemma4OnlineBackend be; be.uq=uq; be.maxlen_=maxlen;
     be.c = load_config_gemma4((WD+"/manifest.json").c_str());
     be.V = be.c.vocab_size;
+    be.moe = be.c.num_experts>0 ? 1 : 0;   // 26B-A4B(E=128) → dense∥MoE 경로 자동 분기
     const int hd_s=be.c.head_dim, hd_f=be.c.global_head_dim?be.c.global_head_dim:be.c.head_dim;
     CK(cudaMalloc(&be.d_cf,(size_t)maxlen*hd_f*4)); CK(cudaMalloc(&be.d_sf,(size_t)maxlen*hd_f*4));
     CK(cudaMalloc(&be.d_cs,(size_t)maxlen*hd_s*4)); CK(cudaMalloc(&be.d_ss,(size_t)maxlen*hd_s*4));
@@ -49,7 +53,7 @@ int main(int argc,char**argv){
     be.w = load_weights_gemma4(WD.c_str(), be.c, uq!=0?1:0, uq==0?1:0);
     CK(cudaMalloc(&be.d_tok,Bmax*4)); CK(cudaMalloc(&be.d_pos,Bmax*4)); CK(cudaMalloc(&be.d_pf,(size_t)maxlen*4));
     CK(cudaMalloc(&be.d_logit,(size_t)Bmax*be.V*4));
-    fprintf(stderr,"[online] ready: gemma4 uq=%d maxlen=%d Bmax=%d V=%d (연속 배칭 greedy, 태그드 ID-in/out)\n", uq,maxlen,Bmax,be.V); fflush(stderr);
+    fprintf(stderr,"[online] ready: gemma4%s uq=%d maxlen=%d Bmax=%d V=%d (연속 배칭 greedy, 태그드 ID-in/out)\n", be.moe?"-MoE(26B)":"", uq,maxlen,Bmax,be.V); fflush(stderr);
 
     run_online_daemon(be, Bmax);      // 모델-중립 루프(serving_online.h)
 
