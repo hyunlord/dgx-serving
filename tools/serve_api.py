@@ -175,7 +175,11 @@ def main():
     Handler.daemon = OnlineDaemon(cmd)
     Handler.model_id = model_id
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    class _Server(ThreadingHTTPServer):
+        request_queue_size = 128       # SYN backlog 상향(기본 5) — 동시 연결 폭주(초과구독)서 커널 리셋 방지
+        daemon_threads = True          # 종료 시 핸들러 스레드 대기 안 함(빠른 셧다운)
+        allow_reuse_address = True     # 재起動 시 TIME_WAIT 포트 재사용
+    httpd = _Server(("0.0.0.0", args.port), Handler)
     print(f"[serve_api] listening :{args.port} (/v1/completions greedy 온라인 배칭 Bmax={args.bmax}, /v1/models). recipe={os.path.basename(args.recipe)}", file=sys.stderr)
     try: httpd.serve_forever()
     except KeyboardInterrupt: pass
