@@ -110,6 +110,10 @@ tools/bench_serve: tools/bench_serve.cu models/qwen35.cu models/qwen35_decode.cu
 tools/serve_gemma4: tools/serve_gemma4.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_gemma4.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
+# M5 Phase 0: Gemma4 plain 서빙 daemon(영속 token-ID in/out, greedy). Python front(serve_api.py)이 HTTP/토큰화 담당.
+tools/serve_daemon_gemma4: tools/serve_daemon_gemma4.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_gemma4.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+
 # M4 STEP B: Gemma4 성능 벤치(single/batch decode t/s + prefill, roofline 대조). 사용법: ./tools/bench_gemma4 <w> [uq] [ctx] [ngen] [B..]
 tools/bench_gemma4: tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
