@@ -7,6 +7,8 @@ build/
 /tests/test_*
 !/tests/*.cu
 !/tests/*.cuh
+!/tests/*.py
+!/tests/*.sh
 # compiled tool binaries (no extension, produced by nvcc) — *.cu 소스만 추적
 /tools/bench
 /tools/bench_batch
@@ -15,6 +17,7 @@ build/
 /tools/serve_gemma4
 /tools/bench_gemma4
 /tools/bench_serve_gemma4
+/tools/serve_daemon_gemma4
 /tools/bench_w4a8_sb
 /tools/memdiag
 /tools/ncu_*
