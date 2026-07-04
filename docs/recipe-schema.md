@@ -60,3 +60,46 @@ provenance:      # source_artifact+sha256, trial DB 참조, 검증 프로토콜 
   시험으로 자동 생성, GB10 수동본 대조 PASS. `verify --device <auto.json>`로 그대로 사용 가능.
 - 정책이 정적 룩업(요청-경계 핫스위치·온라인 컨트롤러는 스킴 경계 해결 후).
 - 서명(무결성)은 provenance sha256 수준(암호학적 서명은 배포 채널 정할 때).
+
+## v1 후보 — 3모델 일괄 스냅샷에서 실사용으로 드러난 한계 (기록만, 이번 구현 X)
+
+> 27b(spec)·35b-a3b(plain MoE)·gemma4 31b(plain dense) 3모델을 한 배치로 담으며 v0의 **spec-편향**이 노출됨.
+> 위 §구조/§로드검증 서술은 사실상 27b(export 산출) 형태 — plain/MoE 변형은 hand-author로 메꿔진 상태.
+> M5(공개 API)는 아래를 v1 스키마로 정리해야 한다(구현은 별도 트랙).
+
+- **★export가 spec-하드코딩**(`recipe.py cmd_export`): `config={bmax,K,W}`·`claims.accept`·`scheme="…mtp_q4+concat-mmq+draft_…"`·
+  `backend.engine_bin=bench_serve_spec`·`variant_axes={DRAFT_MW}`·`provenance{}` 만 생성. → **plain/MoE 레시피(35b·gemma4)는
+  cmd_export로 못 만들어 hand-authored**(그 증거: 둘은 `verification{}` 블록 있고 `provenance` 없음, backend 하위구조가 서로 다름).
+  v1: scheme-class(spec/plain/plain-moe)별 export 분기 필요.
+- **backend 하위구조가 레시피마다 ad-hoc**: 27b=`variant_axes`+`fixed_env(MTP_Q4…)` / 35b=`scheme_detail{moe,quant,attn}`+`MOE_FUSED` /
+  gemma4=`quant_path{prefill,decode}`. 표준 없음(각자 발명). v1: backend를 scheme-class로 타입화하거나 공통 `scheme_detail` 스키마 규정.
+- **config union에 판별자 없음**: spec `{bmax,K,W}` vs plain `{bmax}`. 레시피 자신은 타입 미선언 —
+  `verify`는 **외부 model profile의 `mtp`**로 plain/spec 분기(`plain = not mp.get("mtp")`, recipe.py:233). 레시피가 자기서술 못 함.
+  v1: 레시피-레벨 `serving_class` 판별자(verify가 --model 없이도 분기 가능하게).
+- **claims.measured 형태 차이**: spec은 `accept`(spec 전용) 포함, plain은 없음. v0 doc는 `screen/final`만 서술 —
+  실제로는 plain에서 screen==final(같은 nreq)인 경우도. v1: scheme-class별 optional claim 필드 명시.
+- **`verification` vs `provenance` 이원화**: export는 `provenance{source_artifact,sha256,verification문자열}`, hand-authored plain은
+  `verification{scope,golden,engine_bin,caveats}`. 목적 겹침. v1: 통합(정합·bit-id 근거+출처 한 블록).
+- **model 필드 v0 doc 불완전**: MoE는 `num_experts/top_k/active_params_b` 필요(35b 보유)·`mtp` 필드 필요(분기 축) —
+  doc §구조의 model 목록(id/params_b/gdn/tied/moe/quant)은 이들 누락. v1: MoE/mtp 필드 문서화·요구.
+- **★파이프-벤치 stdout 컬럼 결합(취약)**: `run_bench_plain`이 bench stdout를 컬럼 위치로 파싱 →
+  이번 서빙 변경(bench_serve_gemma4에 c1tok/c-ch **mode 컬럼** 추가)이 gemma4 파서를 깨뜨림(이번 세션 수정: 신포맷+구포맷 fallback).
+  v1: bench가 machine-readable(JSON) 출력 or 레시피가 `serving_mode` 기록(claim이 어느 모드 측정인지). 지금 gemma4 claim은 c1tok-era(모드 미기록).
+- **★warm-start 훅도 spec-하드코딩**(`autotune.py recipe_warmstart_configs:349`가 `c["K"],c["W"]` 가정 / `enqueue_warmstart:361`이
+  `space["K"/"W"]` 가정): **plain 레시피(35b/gemma4)를 prior로 로드 시 `KeyError: 'K'` CRASH**(실측 확인 — 27b spec만 OK).
+  → cross-model warm-start "3점"(27b↔gemma4·gemma4↔35b)이 현 코드로 실행 불가. **"축 SET transfer" 가설은 config-space 구조로
+  확정**(spec {bmax,K,W} ⊃ plain {bmax}: 이질=bmax만 겹침·spec축 미전이 / 같은 plain paradigm=bmax SET 전이·값 fresh)이나
+  코드가 plain을 표현 못 해 실증 실행 불가. v1: paradigm-aware warm-start(config 축 SET을 recipe scheme-class에서 읽어 유연 매칭).
+
+## 파이프 자동화 갭 — 3모델 일괄 스냅샷 리포트 (개입 곡선 연장)
+
+| 단계 | 27b(spec) | 35b·gemma4(plain/MoE) |
+|---|---|---|
+| plan(strategy·roofline) | ✅ 자동(profile 분기 모델-무지 — 실측 확인) | ✅ 자동(spec축 정직 축소·expert축 추가) |
+| tune(autotune regime) | ✅ 자동(spec 축 스윕) | ◐ 자동이나 축=bmax 위주(spec축 제거) |
+| **export**(→recipe.yaml) | ✅ 자동(`cmd_export`) | ✗ **수동**(spec-하드코딩 → hand-authored) |
+| **warm-start**(prior 로드) | ✅ 자동 | ✗ **CRASH**(spec-하드코딩) |
+| verify(지문·메모리·재현율·bit-id) | ✅ 자동(spec ISO) | ✅ 자동(plain-tolerant·offline golden) |
+
+★결론: 파이프는 **spec(27b) end-to-end 자동**이나 **plain/MoE는 export·warm-start가 spec-하드코딩이라 수동 개입 필요**
+(plan/verify는 모델-무지 성공). 개입 곡선의 다음 갭 = **export·warm-start의 scheme-class 추상화**(M5 공개 API의 선결).

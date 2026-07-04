@@ -46,12 +46,22 @@ def run_bench_plain(mp, bmax, lam, nreq, seed):
                 except (ValueError, IndexError):
                     continue
         return {"tok_s": 0, "tpot95": None, "raw": out[-400:]}
-    # gemma4 전용
+    # gemma4 전용. ★STEP A 이후 행 포맷=<B> <mode> <λ> | req tok | tp50 tp95 | avgB maxQ (mode 컬럼 추가).
+    #   mode=c1tok(claim 측정 모드=historical, spec/c-ch 이전) 매칭 → 정직 재현율. c-ch은 현 서빙 개선분(별도 스냅샷).
     cmd = [bin_, mp["weights_dir"], str(mp.get("uq", 2)), str(nreq), str(seed), "32", "384", str(bmax), "--", str(lam)]
-    r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=1200)
+    r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=1800)
     out = r.stdout + r.stderr
+    want_mode = mp.get("serving_mode", "c1tok")   # claim 모드(기본 c1tok). c-ch로 갱신 시 profile에서 지정.
     for line in out.splitlines():
         p = line.split()
+        # 신 포맷: p[0]=B, p[1]=mode, p[2]=λ, p[3]="|", p[5]=tok, p[8]=tp95
+        if len(p) >= 9 and p[0].isdigit() and int(p[0]) == bmax and p[1] == want_mode and p[3] == "|":
+            try:
+                if abs(float(p[2]) - lam) < 1e-6:
+                    return {"tok_s": float(p[5]), "tpot95": float(p[8]) if len(p) > 8 else None}
+            except (ValueError, IndexError):
+                continue
+        # 구 포맷 호환: p[0]=B, p[1]=λ, p[2]="|", p[4]=tok, p[7]=tp95
         if len(p) >= 5 and p[0].isdigit() and int(p[0]) == bmax and p[2] == "|":
             try:
                 if abs(float(p[1]) - lam) < 1e-6:
