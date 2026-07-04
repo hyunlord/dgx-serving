@@ -21,4 +21,13 @@ void gemma4_moe_forward(const ModelConfig &c, const G4Weights &w,
                         float *d_logits, float *hidden_dump, int use_q4,
                         int *router_didx_dump=nullptr, float *router_dw_dump=nullptr);
 
+// 26B-A4B MoE decode graph (KV-cached — gemma4_decode 대칭 + dense∥MoE MLP). G4DecodeState 필요(decode_state_gemma4.h).
+//   commit: n_past += Sq. last_only: 마지막 행 logit만. 프리필-모드(Sq=S,base=0)=gemma4_moe_forward와 동일(엔진 bit-id 게이트).
+struct G4DecodeState;
+void gemma4_moe_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
+                       const int *d_tokens, int Sq,
+                       const float *d_cos_f, const float *d_sin_f,
+                       const float *d_cos_s, const float *d_sin_s,
+                       float *d_logits, int commit, int use_q4, int last_only);
+
 #endif // DGX_MODELS_GEMMA4_MOE_H
