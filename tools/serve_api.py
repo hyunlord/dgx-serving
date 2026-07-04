@@ -38,10 +38,9 @@ def load_and_verify_recipe(recipe_path, device_json, model_json):
 # ★직렬화 안 함: 동시 HTTP 스레드가 각자 태그드 요청을 daemon에 주입 → daemon 배치 루프가 연속 배칭.
 #   stdin 쓰기만 락(라인 원자성). stdout은 단일 reader 스레드가 읽어 req_id로 연결별 큐에 분배(경합 방지).
 class OnlineDaemon:
-    def __init__(self, weights_dir, uq, maxlen, bmax):
-        bin_ = os.path.join(REPO, "tools", "serve_daemon_gemma4_online")
-        if not os.path.exists(bin_): sys.exit(f"[serve_api] daemon 바이너리 없음: {bin_} (make tools/serve_daemon_gemma4_online)")
-        self.p = subprocess.Popen([bin_, weights_dir, str(uq), str(maxlen), str(bmax)],
+    def __init__(self, cmd):                               # cmd = [daemon_bin, args...] (모델별 레이아웃은 main이 구성)
+        if not os.path.exists(cmd[0]): sys.exit(f"[serve_api] daemon 바이너리 없음: {cmd[0]} (make {os.path.relpath(cmd[0],REPO)})")
+        self.p = subprocess.Popen(cmd,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
         self.wlock = threading.Lock()                      # stdin 쓰기 직렬화(요청 라인 원자성)
         self.idlock = threading.Lock(); self._next = 0     # req_id 할당 카운터
@@ -145,6 +144,8 @@ def main():
     ap.add_argument("--model", default=os.path.join(HERE,"autotune","profiles","gemma4-31b.json"))
     ap.add_argument("--maxlen", type=int, default=384)
     ap.add_argument("--bmax", type=int, default=8)                 # 동시 활성 슬롯 상한(온라인 배칭 폭)
+    ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen"])  # daemon 종류(arg 레이아웃 상이)
+    ap.add_argument("--golden", default="")                        # qwen rope golden dir(qwen 필수 — gemma4는 dummy rope)
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
@@ -157,7 +158,12 @@ def main():
     os.environ.setdefault("HF_HUB_OFFLINE","1"); os.environ.setdefault("TRANSFORMERS_OFFLINE","1")
     from transformers import AutoTokenizer
     Handler.tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    Handler.daemon = OnlineDaemon(args.weights, uq, args.maxlen, args.bmax)
+    if args.model == "gemma4":
+        cmd = [os.path.join(REPO,"tools","serve_daemon_gemma4_online"), args.weights, str(uq), str(args.maxlen), str(args.bmax)]
+    else:                                                          # qwen(27b·35b) — golden(rope) 필수
+        if not args.golden: sys.exit("[serve_api] --model qwen 은 --golden(rope dir) 필수")
+        cmd = [os.path.join(REPO,"tools","serve_daemon_qwen_online"), args.weights, args.golden, str(uq), str(args.maxlen), str(args.bmax)]
+    Handler.daemon = OnlineDaemon(cmd)
     Handler.model_id = model_id
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
