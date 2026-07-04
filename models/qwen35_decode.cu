@@ -12,6 +12,7 @@
 #include "../kernels/gemm_tiled.cuh"   // 챕터7 Phase A: software tiled q4 GEMM (prefill)
 #include "../kernels/gemm_mma.cuh"     // 챕터7 Phase B: tensor-core MMA W4A8 (prefill)
 #include "../kernels/gemm_mmq.cuh"     // 챕터7 STEP 0i: full-MMQ W4A8 (128×128+ldmatrix, L1/TEX 84→40%, 1.89×)
+#include "../kernels/gemm_mmq_tmpl.cuh"  // in-engine A/B: launch_gemm_mmq_w4a8_auto(env MMQ256 → 256×64 tall 형상, bitwise 동일)
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/attention_flash.cuh"  // 챕터7 FA.1a: full-attn 16층 (attn_decode 교체 — 12K 벽 제거)
@@ -55,7 +56,7 @@ static void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, 
         launch_quantize_x_q8(X, g_xq, g_xs, g_xsum, IN, S);
         if      (S == 1) launch_gemv_w4a8_mlp<2>(g_xq, g_xs, g_xsum, m.wq, m.sc, Y, IN, OUT, S, g_sdtype);  // 챕터9: MLP↑(outstanding load 2개로 long_scoreboard latency 숨김, bit-exact)
         else if (S <= 8) launch_gemv_w4a8_sb(g_xq, g_xs, m.wq, m.sc, Y, IN, OUT, S, g_sdtype);  // STEP D: verify 소-batch(2~8). (챕터9 SB-MLP 실험은 역효과 — S-accum이 이미 ILP, U-unroll이 occupancy만↓)
-        else             launch_gemm_mmq_w4a8(g_xq, g_xs, m.wq, m.sc, Y, S, OUT, IN, g_sdtype); // prefill: full-MMQ(STEP 0i, e2e 1.51× vs gemm_mma)
+        else             launch_gemm_mmq_w4a8_auto(g_xq, g_xs, m.wq, m.sc, Y, S, OUT, IN, g_sdtype); // prefill: full-MMQ(env MMQ256=1 → 256×64 tall, 기본 128×128)
     } else if (use_q4) launch_gemm_tiled_q4(X, m.wq, m.sc, Y, S, OUT, IN, g_sdtype);   // prefill tiled GEMM(Phase A); S=1은 gemv
     else               launch_gemv_f32(X, m.wf, Y, IN, OUT, S);
 }
@@ -136,7 +137,7 @@ void qwen35_decode(const ModelConfig &c, const QwenWeights &w, DecodeState &st,
     auto MMs=[&](const QMat&m,const float*X,const int8_t*xqs,const float*xss,float*Y,int IN,int OUT){
         if (use_q4==2) { if      (Sq==1) launch_gemv_w4a8_mlp<2>(xqs,xss,nullptr,m.wq,m.sc,Y,IN,OUT,Sq,g_sdtype);  // 챕터9 MLP↑
                          else if (Sq<=8) launch_gemv_w4a8_sb(xqs,xss,m.wq,m.sc,Y,IN,OUT,Sq,g_sdtype);   // STEP D (SB-MLP 역효과로 미적용)
-                         else            launch_gemm_mmq_w4a8(xqs,xss,m.wq,m.sc,Y,Sq,OUT,IN,g_sdtype); } // prefill full-MMQ(STEP 0i)
+                         else            launch_gemm_mmq_w4a8_auto(xqs,xss,m.wq,m.sc,Y,Sq,OUT,IN,g_sdtype); } // prefill full-MMQ(env MMQ256 토글)
         else           mm(m,X,Y,IN,OUT,Sq,use_q4);
     };
 

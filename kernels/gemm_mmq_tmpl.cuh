@@ -101,3 +101,12 @@ static inline void launch_gemm_mmq_tmpl(const int8_t*X,const float*xs,const uint
     if(scale_dtype==1) gemm_mmq_tmpl_kernel<BM,BN,KT,WM,WN,__half><<<grid,nt,0,st>>>(X,xs,Wq,(const __half*)sw,Y,M,N,K);
     else               gemm_mmq_tmpl_kernel<BM,BN,KT,WM,WN,float ><<<grid,nt,0,st>>>(X,xs,Wq,(const float*)sw,Y,M,N,K);
 }
+
+// (in-engine A/B) prefill mmq 형상 토글: env MMQ256=1 → 256×64(격리 +14.5%), 기본 0 → 128×128(원본·무회귀).
+//   출력 bitwise 동일(같은 K-reduction 순서) → 정확성 불변. 격리≠엔진 검증용 controlled A/B 스위치.
+static inline void launch_gemm_mmq_w4a8_auto(const int8_t*X,const float*xs,const uint8_t*Wq,
+                                             const void*sw,float*Y,int M,int N,int K,int scale_dtype=0,cudaStream_t st=0){
+    static int sh = getenv("MMQ256") ? atoi(getenv("MMQ256")) : 0;
+    if(sh) launch_gemm_mmq_tmpl<256,64,64,4,2>(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);   // tall 타일(W 트래픽 절반)
+    else   launch_gemm_mmq_w4a8(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);                  // 128×128 원본
+}
