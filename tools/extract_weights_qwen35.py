@@ -24,7 +24,9 @@ def is_q4(name, ndim):
         return False
     if "in_proj_a" in name or "in_proj_b" in name:  # 작은 gating proj [16,1024] → fp32
         return False
-    if name.endswith("mlp.gate.weight"):            # MoE router (H→E) → fp32 (라우팅 정밀, gate_proj와 다름)
+    if name.endswith("mlp.gate.weight"):            # Qwen-MoE router (H→E) → fp32 (라우팅 정밀, gate_proj와 다름)
+        return False
+    if name.endswith("router.proj.weight"):         # Gemma-MoE router (H→E) → fp32 (라우팅 정밀). router.scale/per_expert_scale는 1D→위 ndim!=2로 이미 fp32
         return False
     if "shared_expert_gate" in name:                # shared expert sigmoid gate (H→1) → fp32
         return False
