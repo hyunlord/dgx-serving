@@ -13,6 +13,9 @@
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
+#include "../kernels/gemv_f32.cuh"      // 26B MoE: router scores(fp32 gemv)
+#include "../kernels/router_topk.cuh"   // 26B MoE: softmax→top8→renorm + per_expert_scale
+#include "../kernels/moe_fused.cuh"     // 26B MoE: grouped gemv(batch experts — M_e<1도 fused, 35b 교훈)
 
 #define BK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
     fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
@@ -59,6 +62,12 @@ static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT,
         launch_gemm_batch_q4(X, m.wq, m.sc, Y, IN, OUT, B, gb_sdtype);
     }
 }
+
+// 26B MoE batch scratch (persistent static, grow-on-demand — gemma4_moe.cu g4m_* 패턴, 매 호출 덮어써짐=수학 불변).
+static float *gbm_scores=nullptr,*gbm_dw=nullptr,*gbm_fgu=nullptr,*gbm_fhid=nullptr,*gbm_fsout=nullptr; static int *gbm_didx=nullptr;
+static size_t cb_scores=0,cb_dw=0,cb_fgu=0,cb_fhid=0,cb_fsout=0,cb_didx=0;
+static inline float* gbm_grow(float*&p,size_t&cap,size_t n){ if(cap<n){ if(p)cudaFree(p); BK(cudaMalloc(&p,n*4)); cap=n; } return p; }
+static inline int*   gbm_growi(int*&p,size_t&cap,size_t n){ if(cap<n){ if(p)cudaFree(p); BK(cudaMalloc(&p,n*4)); cap=n; } return p; }
 
 void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
                          const int *d_tokens, const float *d_cos_f, const float *d_sin_f,
@@ -137,6 +146,120 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
     BK(cudaDeviceSynchronize());
 
     float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn};
+    for(float *p:all) cudaFree(p);
+}
+
+// 26B-A4B MoE batch decode — gemma4_decode_batch(31B batch KV attn + dense mmB) + dense∥MoE MLP(B tokens).
+//   ★batch 커널 measured(35b 교훈): dense=mmB(gemm_batch 분할상환), MoE experts=moe_fused(grouped gemv — M_e<1도 fused).
+//   신규 커널 0(attn_decode_batch·router_topk·per_expert_scale·moe_fused·geglu 재사용). ragged/same-length. batch==solo bit-id(스킴 내).
+void gemma4_moe_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                             const int *d_tokens, const float *d_cos_f, const float *d_sin_f,
+                             const float *d_cos_s, const float *d_sin_s,
+                             float *d_logits, int commit, int use_q4,
+                             const int *d_pos_b, const int *h_pos_b) {
+    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
+    const int B=st.B, H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
+    const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
+    const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
+    const int E=c.num_experts, K=c.num_experts_per_tok, MI=c.moe_intermediate_size;
+    const float eps=c.rms_norm_eps, ascale=c.attn_scaling, root=powf((float)H,-0.5f);
+    const long gu_w=(long)2*MI*H, dn_w=(long)H*MI;
+    const bool ragged = (d_pos_b != nullptr);
+    const int base = st.n_past;
+    int base_max = base;
+    if(ragged && h_pos_b) for(int b=0;b<B;b++) base_max = h_pos_b[b]>base_max ? h_pos_b[b] : base_max;
+    const size_t BH=(size_t)B*H;
+    const int hd_max=hd_f>hd_s?hd_f:hd_s;
+    const size_t qmax=(size_t)B*NQ*hd_max;
+    const size_t kvmax=(size_t)B*(nkv_s*hd_s>nkv_f*hd_f?nkv_s*hd_s:nkv_f*hd_f);
+
+    float *x=bdm(BH),*norm=bdm(BH),*tmp=bdm(BH),*after=bdm(BH);
+    float *qb=bdm(qmax),*qn=bdm(qmax);
+    float *kb=bdm(kvmax),*kn=bdm(kvmax),*vb=bdm(kvmax),*vn=bdm(kvmax);
+    float *attn=bdm(qmax),*ob=bdm(BH);
+    float *g=bdm((size_t)B*FFN),*u=bdm((size_t)B*FFN),*act=bdm((size_t)B*FFN),*dn=bdm(BH);
+    float *h1=bdm(BH),*h2=bdm(BH),*moe_in=bdm(BH),*moe_out=bdm(BH),*comb=bdm(BH),*rnorm=bdm(BH);
+
+    launch_embedding(d_tokens, w.embed, x, B, H);
+    if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,BH);
+
+    for(int l=0;l<c.num_layers;l++){
+        const G4Layer &L=w.layers[l];
+        const int full=L.is_full;
+        const int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
+        const int qdim=NQ*hd, kvdim=nkv*hd;
+        const float *cosT=full?d_cos_f:d_cos_s, *sinT=full?d_sin_f:d_sin_s;
+        const int window=full?0:c.sliding_window;
+        const long kv_stride=(long)st.max_len*kvdim;
+
+        // --- attention block (batch KV-cached — gemma4_decode_batch와 동일) ---
+        launch_rmsnorm(x, L.input_ln, norm, B, H, eps);
+        mmB(L.q, norm, qb, H, qdim, B);
+        launch_rmsnorm(qb, L.q_norm, qn, B*NQ, hd, eps);
+        if(ragged) launch_rope_partial_pos(qn, cosT, sinT, d_pos_b, B, NQ, hd, hd);
+        else       launch_rope_partial_batch(qn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, B, NQ, hd, hd);
+        mmB(L.k, norm, kb, H, kvdim, B);
+        if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn, B*nkv, hd, eps);
+        else { mmB(L.v, norm, vb, H, kvdim, B); launch_rmsnorm_noscale(vb, vn, B*nkv, hd, eps); }
+        launch_rmsnorm(kb, L.k_norm, kn, B*nkv, hd, eps);
+        if(ragged) launch_rope_partial_pos(kn, cosT, sinT, d_pos_b, B, nkv, hd, hd);
+        else       launch_rope_partial_batch(kn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, B, nkv, hd, hd);
+        for(int b=0;b<B;b++){
+            size_t pos = ragged ? (size_t)h_pos_b[b] : (size_t)base;
+            BK(cudaMemcpy(st.Kc[l]+(size_t)b*kv_stride+pos*kvdim, kn+(size_t)b*kvdim, (size_t)kvdim*4, cudaMemcpyDeviceToDevice));
+            BK(cudaMemcpy(st.Vc[l]+(size_t)b*kv_stride+pos*kvdim, vn+(size_t)b*kvdim, (size_t)kvdim*4, cudaMemcpyDeviceToDevice));
+        }
+        launch_attn_decode_batch(qn, st.Kc[l], st.Vc[l], attn, B, NQ, nkv, hd, base_max, kv_stride, 0, ascale, window, ragged?d_pos_b:nullptr);
+        mmB(L.o, attn, ob, qdim, H, B);
+        launch_rmsnorm(ob, L.post_attn_ln, tmp, B, H, eps);
+        launch_add(after, x, tmp, (int)BH);                          // after = residual (attn 후)
+
+        // --- dense GeGLU MLP (mmB — 분할상환) ---
+        launch_rmsnorm(after, L.pre_ffn_ln, norm, B, H, eps);
+        mmB(L.gate, norm, g, H, FFN, B);
+        mmB(L.up,   norm, u, H, FFN, B);
+        launch_geglu(g, u, act, (size_t)B*FFN);
+        mmB(L.down, act, dn, FFN, H, B);
+
+        if(L.is_moe){
+            launch_rmsnorm(dn, L.post_ff_ln_1, h1, B, H, eps);        // h1 = post_ff_ln_1(dense)
+            // router(rin=after=residual)
+            launch_rmsnorm(after, L.router_scale, rnorm, B, H, eps);
+            launch_scale(rnorm, rnorm, root, BH);
+            float *scores=gbm_grow(gbm_scores,cb_scores,(size_t)B*E);
+            float *dw    =gbm_grow(gbm_dw,cb_dw,(size_t)B*K);
+            int   *didx  =gbm_growi(gbm_didx,cb_didx,(size_t)B*K);
+            launch_gemv_f32(rnorm, L.router_proj, scores, H, E, B);
+            launch_router_topk(scores, didx, dw, B, E, K);
+            launch_apply_per_expert_scale(dw, L.per_expert_scale, didx, B, K);
+            // experts(pre_ff_ln_2(rin)) — moe_fused grouped(nslot=B*K, M_e<1도 fused)
+            launch_rmsnorm(after, L.pre_ff_ln_2, moe_in, B, H, eps);
+            long nslot=(long)B*K;
+            float *fgu  =gbm_grow(gbm_fgu,cb_fgu,nslot*(size_t)2*MI);
+            float *fhid =gbm_grow(gbm_fhid,cb_fhid,nslot*(size_t)MI);
+            float *fsout=gbm_grow(gbm_fsout,cb_fsout,nslot*(size_t)H);
+            launch_moe_fused_gu(moe_in, L.experts_gate_up.wq, L.experts_gate_up.sc, didx, fgu, H, 2*MI, K, nslot, gu_w, gb_sdtype);
+            for(long slot=0;slot<nslot;slot++)
+                launch_geglu(fgu+slot*(2L*MI), fgu+slot*(2L*MI)+MI, fhid+slot*MI, MI);
+            launch_moe_fused_down(fhid, L.experts_down.wq, L.experts_down.sc, didx, dw, fsout, MI, H, K, nslot, dn_w, gb_sdtype);
+            launch_moe_fused_reduce(fsout, moe_out, H, K, B);
+            launch_rmsnorm(moe_out, L.post_ff_ln_2, h2, B, H, eps);   // h2 = post_ff_ln_2(moe)
+            launch_add(comb, h1, h2, (int)BH);
+            launch_rmsnorm(comb, L.post_ffn_ln, tmp, B, H, eps);
+        } else {
+            launch_rmsnorm(dn, L.post_ffn_ln, tmp, B, H, eps);
+        }
+        launch_add(x, after, tmp, (int)BH);
+        if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, BH);
+    }
+
+    launch_rmsnorm(x, w.final_norm, norm, B, H, eps);
+    mmB(w.lm_head, norm, d_logits, H, V, B);
+    if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)B*V);
+    if(commit && !ragged) st.n_past += 1;    // ragged면 per-slot 위치는 호출자 관리
+    BK(cudaDeviceSynchronize());
+
+    float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn,h1,h2,moe_in,moe_out,comb,rnorm};
     for(float *p:all) cudaFree(p);
 }
 

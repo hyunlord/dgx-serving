@@ -30,4 +30,13 @@ void gemma4_moe_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &
                        const float *d_cos_s, const float *d_sin_s,
                        float *d_logits, int commit, int use_q4, int last_only);
 
+// 26B-A4B MoE batch decode (KV-cached — gemma4_decode_batch 대칭 + dense∥MoE MLP). G4BatchState 필요(decode_state_gemma4.h).
+//   dense=mmB(gemm_batch)·experts=moe_fused(grouped). ragged: d_pos_b!=null(슬롯별 위치). batch==solo bit-id(스킴 내).
+struct G4BatchState;
+void gemma4_moe_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                             const int *d_tokens, const float *d_cos_f, const float *d_sin_f,
+                             const float *d_cos_s, const float *d_sin_s,
+                             float *d_logits, int commit, int use_q4,
+                             const int *d_pos_b, const int *h_pos_b);
+
 #endif // DGX_MODELS_GEMMA4_MOE_H

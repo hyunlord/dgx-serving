@@ -42,9 +42,10 @@ tests/test_gemma4_moe: tests/test_gemma4_moe.cu models/gemma4_moe.cu runtime/wei
 tests/test_gemma4_moe_golden: tests/test_gemma4_moe_golden.cu models/gemma4_moe.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_moe_golden.cu models/gemma4_moe.cu runtime/weights_gemma4.cu -o $@
 
-# 26B decode 게이트: gemma4_moe_decode == gemma4_moe_forward(엔진 정합·연속성). gemma4_decode.cu=alloc_g4_decode_state.
-tests/test_gemma4_moe_decode: tests/test_gemma4_moe_decode.cu models/gemma4_moe.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_moe_decode.cu models/gemma4_moe.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+# 26B decode 게이트: gemma4_moe_decode(single)+gemma4_moe_decode_batch(batch) == forward(엔진 정합·연속성·batch 격리).
+#   gemma4_decode.cu=alloc_g4_decode_state / gemma4_batch.cu=gemma4_moe_decode_batch·alloc_g4_batch_state.
+tests/test_gemma4_moe_decode: tests/test_gemma4_moe_decode.cu models/gemma4_moe.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_moe_decode.cu models/gemma4_moe.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
 
 # Gemma4 26B-A4B router ISOLATED 검증 (동일 rin → 엔진 router == HF. 소형 텐서만, standalone)
 tests/test_gemma4_moe_router_iso: tests/test_gemma4_moe_router_iso.cu $(HEADERS)

@@ -69,9 +69,29 @@ int main(int argc,char**argv){
     }
     printf("[Gate B] decode step-by-step(KV 이어받기) 각 위치==forward: argmax 불일치 %d/%d\n",badB,S);
 
-    bool ok = (badA==0 && badB==0);
-    printf("\n[게이트] Gate A(decode==forward)=%s | Gate B(연속성)=%s | 스킴 내(q4)\n", badA==0?"PASS":"FAIL", badB==0?"PASS":"FAIL");
-    printf("[test_gemma4_moe_decode] %s (26B decode graph == forward[HF-골든 PASS] 엔진 정합 + KV 연속성 — decode==HF 전이적)\n", ok?"PASS":"FAIL");
+    // ── Gate C: batch==solo (2 슬롯 다른 토큰 base=0) — slot 격리 + batch graph 정합 ──
+    auto solo1=[&](int tok)->std::vector<float>{
+        G4DecodeState s=alloc_g4_decode_state(c,maxlen); int*dt; TCK(cudaMalloc(&dt,4)); TCK(cudaMemcpy(dt,&tok,4,cudaMemcpyHostToDevice));
+        float*dl; TCK(cudaMalloc(&dl,(size_t)V*4)); gemma4_moe_decode(c,w,s,dt,1,d_cf,d_sf,d_cs,d_ss,dl,0,uq,1);
+        std::vector<float> o(V); TCK(cudaMemcpy(o.data(),dl,V*4,cudaMemcpyDeviceToHost)); cudaFree(dt);cudaFree(dl); free_g4_decode_state(s); return o; };
+    std::vector<float> s0=solo1(ids[0]), s1=solo1(ids[1]);
+    auto am1=[&](const std::vector<float>&L){ int b=0; float bv=L[0]; for(int j=1;j<V;j++) if(L[j]>bv){bv=L[j];b=j;} return b; };
+    G4BatchState bst = alloc_g4_batch_state(c,2,maxlen);
+    int bt[2]={ids[0],ids[1]}; int*d_bt; TCK(cudaMalloc(&d_bt,8)); TCK(cudaMemcpy(d_bt,bt,8,cudaMemcpyHostToDevice));
+    float*d_bl; TCK(cudaMalloc(&d_bl,(size_t)2*V*4));
+    gemma4_moe_decode_batch(c,w,bst,d_bt,d_cf,d_sf,d_cs,d_ss,d_bl,0,uq,nullptr,nullptr);   // same-length base=0
+    std::vector<float> bl((size_t)2*V); TCK(cudaMemcpy(bl.data(),d_bl,bl.size()*4,cudaMemcpyDeviceToHost));
+    std::vector<float> b0(bl.begin(),bl.begin()+V), b1(bl.begin()+V,bl.begin()+2*V);
+    double absC0=0,absC1=0; for(int j=0;j<V;j++){ absC0=fmax(absC0,fabs((double)b0[j]-s0[j])); absC1=fmax(absC1,fabs((double)b1[j]-s1[j])); }
+    int badC = (am1(b0)!=am1(s0)) + (am1(b1)!=am1(s1));
+    printf("[Gate C] batch(B=2)==solo: slot0 argmax %s(abs %.2e)·slot1 %s(abs %.2e) — slot 격리\n",
+           am1(b0)==am1(s0)?"OK":"DIFF",absC0, am1(b1)==am1(s1)?"OK":"DIFF",absC1);
+    cudaFree(d_bt);cudaFree(d_bl); free_g4_batch_state(bst);
+
+    bool ok = (badA==0 && badB==0 && badC==0);
+    printf("\n[게이트] Gate A(decode==forward)=%s | Gate B(연속성)=%s | Gate C(batch==solo·격리)=%s | 스킴 내(q4)\n",
+           badA==0?"PASS":"FAIL", badB==0?"PASS":"FAIL", badC==0?"PASS":"FAIL");
+    printf("[test_gemma4_moe_decode] %s (26B decode(single+batch) graph == forward[HF-골든 PASS] 정합 + KV 연속성 + batch 격리)\n", ok?"PASS":"FAIL");
     free_g4_decode_state(st); free_weights_gemma4(w); free_config_gemma4(c);
     return ok?0:1;
 }
