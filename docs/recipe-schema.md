@@ -85,6 +85,10 @@ provenance:      # source_artifact+sha256, trial DB 참조, 검증 프로토콜 
 - **★파이프-벤치 stdout 컬럼 결합(취약)**: `run_bench_plain`이 bench stdout를 컬럼 위치로 파싱 →
   이번 서빙 변경(bench_serve_gemma4에 c1tok/c-ch **mode 컬럼** 추가)이 gemma4 파서를 깨뜨림(이번 세션 수정: 신포맷+구포맷 fallback).
   v1: bench가 machine-readable(JSON) 출력 or 레시피가 `serving_mode` 기록(claim이 어느 모드 측정인지). 지금 gemma4 claim은 c1tok-era(모드 미기록).
+  ★**실측 증거(35b)**: verify가 SKIP1TOK로 c-ch 측정 → local 106 vs claim 62.9 = **168.8%**("PASS"로 리포트되나 **충실 재현 아님**).
+  claim의 serving_mode 미기록이라 c-ch(현) vs claim(모드 불명)이 같은 조건인지 판별 불가. repro% 게이트(≥90% PASS)가
+  >100%(1.6×)를 못 걸러냄 = **verify가 claim과 같은 모드/조건을 강제하지 않음**(recipe.py는 "같은 조건끼리만" 표방하나 mode 미포함).
+  v1: claim에 `serving_mode`+verify가 그 모드 강제 / repro 상한도 체크(예: 90~110%만 PASS, 초과=조건 불일치 경고).
 - **★warm-start 훅도 spec-하드코딩**(`autotune.py recipe_warmstart_configs:349`가 `c["K"],c["W"]` 가정 / `enqueue_warmstart:361`이
   `space["K"/"W"]` 가정): **plain 레시피(35b/gemma4)를 prior로 로드 시 `KeyError: 'K'` CRASH**(실측 확인 — 27b spec만 OK).
   → cross-model warm-start "3점"(27b↔gemma4·gemma4↔35b)이 현 코드로 실행 불가. **"축 SET transfer" 가설은 config-space 구조로
