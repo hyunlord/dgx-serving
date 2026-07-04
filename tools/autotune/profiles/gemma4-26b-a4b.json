@@ -1,6 +1,6 @@
 {
   "name": "Gemma4-26B-A4B-it",
-  "weights_dir": "artifacts/gemma4-26b-a4b/weights(미변환)",
+  "weights_dir": "artifacts/gemma4-26b-a4b/weights",
   "golden_dir": "artifacts/gemma4-26b-a4b/golden(미생성)",
   "uq": 2,
   "params_b": 26.0,
@@ -38,5 +38,5 @@
     "softmax": true
   },
   "shared_expert": false,
-  "note": "weights 미다운로드(config만 해부). dense MLP∥MoE 병렬 구조(31B dense·35b MoE-replace와 다른 제3). roofline은 config 기반 수동 산출(plan.py active_params는 Qwen-MoE 형상이라 병렬-dense/sliding-attn 항 미포함)."
+  "note": "가중치 변환 완료(2da99f3, q4 rel-err 0.1035, 18GB). dense MLP∥MoE 병렬 구조. graph/golden 미구현(build-spec 참조). roofline config 기반 수동."
 }
