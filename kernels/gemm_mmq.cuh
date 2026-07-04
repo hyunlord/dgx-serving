@@ -11,8 +11,14 @@
 #define MMQ_BM 128
 #define MMQ_BN 128
 #define MMQ_KT 64           // 엔진 기본 K-tile(2 QBLK). KTILE↑ = sync↓ (단 shared↑)
+// AP/BPAD: shared 패딩(bank-conflict 회피). C-1 튜닝 스윕용 #ifndef 가드(-D 오버라이드 가능·기본값 불변).
+//   기본 AP=0(KT 16배수라 sA 자연 정렬)·BPAD=4. 튜너가 -DMMQ_AP/-DMMQ_BPAD로 대체 탐색.
+#ifndef MMQ_AP
 #define MMQ_AP 0            // sA K-stride = KT = 16배수 → ldmatrix 16B 정렬
+#endif
+#ifndef MMQ_BPAD
 #define MMQ_BPAD 4
+#endif
 
 // 정렬 4-byte read의 하위 16bit(4 nibble) → (q-8) int8 4개 (bank conflict 회피).
 __device__ __forceinline__ int mmq_unpack4v(unsigned h){
