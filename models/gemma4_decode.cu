@@ -44,12 +44,17 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 // ---- mm dispatch (gemma4.cu와 동일 규약) ----
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
+static int gd_amort=0;   // 1=프리필 amortized 매트멀(SB 커널, weight 1회/≤16행). 기본0=plain gemv(golden 경로 무변경).
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4){
     if(use_q4==2){ size_t n=(size_t)S*IN;
         if(gd_cap<n){ if(gd_xq)cudaFree(gd_xq); if(gd_xs)cudaFree(gd_xs); if(gd_xsum)cudaFree(gd_xsum);
             DK(cudaMalloc(&gd_xq,n)); DK(cudaMalloc(&gd_xs,(n/QBLK)*4)); DK(cudaMalloc(&gd_xsum,(n/QBLK)*4)); gd_cap=n; }
         launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S);
-        launch_gemv_w4a8(gd_xq,gd_xs,gd_xsum,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype);
+        if(gd_amort && S>1){  // 프리필: SB 커널로 weight 1회/≤16행 amortize(비-amortized plain gemv의 S× 재적재 제거).
+            //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
+            for(int s0=0;s0<S;s0+=16){ int sq=(S-s0<16)?(S-s0):16;
+                launch_gemv_w4a8_sb(gd_xq+(size_t)s0*IN, gd_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gd_sdtype); }
+        } else launch_gemv_w4a8(gd_xq,gd_xs,gd_xsum,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype);
     } else if(use_q4) launch_gemm_tiled_q4(X,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype);
     else              launch_gemv_f32(X,m.wf,Y,IN,OUT,S);
 }
@@ -58,8 +63,8 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const int *d_tokens, int Sq,
                    const float *d_cos_f, const float *d_sin_f,
                    const float *d_cos_s, const float *d_sin_s,
-                   float *d_logits, int commit, int use_q4, int last_only) {
-    gd_sdtype=c.scale_dtype;
+                   float *d_logits, int commit, int use_q4, int last_only, int amort_mm) {
+    gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;

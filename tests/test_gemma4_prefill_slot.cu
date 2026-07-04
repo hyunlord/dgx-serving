@@ -15,6 +15,7 @@
 #include "../runtime/manifest_gemma4.h"
 #include "../runtime/weights_gemma4.h"
 #include "../runtime/decode_state_gemma4.h"
+#include "../kernels/rope.cuh"
 
 #define TCK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 static std::string WD,GD;
@@ -28,13 +29,21 @@ int main(int argc,char**argv){
     const int V=c.vocab_size, L=c.num_layers;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
-    std::vector<int> full=ri("gen_tokens.bin"); int total=full.size();
-    int P=argc>4?atoi(argv[4]):8; int N=argc>5?atoi(argv[5]):4;
-    if(P+N>total){ N=total-P; if(N<1){P=total-2;N=1;} }   // rope 테이블 범위(0..total-1) 안
-    auto cf=rf("gen_rope_full_cos.bin",(size_t)total*hd_f), sf=rf("gen_rope_full_sin.bin",(size_t)total*hd_f);
-    auto cs=rf("gen_rope_sliding_cos.bin",(size_t)total*hd_s), ss=rf("gen_rope_sliding_sin.bin",(size_t)total*hd_s);
+    int P=argc>4?atoi(argv[4]):8; int N=argc>5?atoi(argv[5]):4; int synth=argc>6?atoi(argv[6]):0;
     auto up=[&](std::vector<float>&h){float*d;TCK(cudaMalloc(&d,h.size()*4));TCK(cudaMemcpy(d,h.data(),h.size()*4,cudaMemcpyHostToDevice));return d;};
-    float *d_cf=up(cf),*d_sf=up(sf),*d_cs=up(cs),*d_ss=up(ss);
+    std::vector<int> full; int total; float *d_cf,*d_sf,*d_cs,*d_ss;
+    if(synth){   // 합성 모드: dummy rope(엔진 생성) + 합성 토큰 → P 임의화(멀티-청크 P>16 검증). 두 엔진 경로 비교라 골든 불요.
+        total=P+N+2; full.resize(total); for(int i=0;i<total;i++) full[i]=(i*131+7)%V;
+        TCK(cudaMalloc(&d_cf,(size_t)total*hd_f*4)); TCK(cudaMalloc(&d_sf,(size_t)total*hd_f*4));
+        TCK(cudaMalloc(&d_cs,(size_t)total*hd_s*4)); TCK(cudaMalloc(&d_ss,(size_t)total*hd_s*4));
+        launch_gen_rope(d_cf,d_sf,total,hd_f,1e4f); launch_gen_rope(d_cs,d_ss,total,hd_s,1e4f); TCK(cudaDeviceSynchronize());
+    } else {     // 골든 모드: 실제 위치 rope + gen_tokens (rope 테이블 범위 0..total-1 안).
+        full=ri("gen_tokens.bin"); total=full.size();
+        if(P+N>total){ N=total-P; if(N<1){P=total-2;N=1;} }
+        auto cf=rf("gen_rope_full_cos.bin",(size_t)total*hd_f), sf=rf("gen_rope_full_sin.bin",(size_t)total*hd_f);
+        auto cs=rf("gen_rope_sliding_cos.bin",(size_t)total*hd_s), ss=rf("gen_rope_sliding_sin.bin",(size_t)total*hd_s);
+        d_cf=up(cf);d_sf=up(sf);d_cs=up(cs);d_ss=up(ss);
+    }
     G4Weights w=load_weights_gemma4(WD.c_str(),c,use_q4!=0?1:0,use_q4==0?1:0);
     auto am=[&](const float*lg){int b=0;float bv=lg[0];for(int j=1;j<V;j++)if(lg[j]>bv){bv=lg[j];b=j;}return b;};
     printf("[cfg] total=%d P=%d N=%d use_q4=%d(%s) L=%d V=%d\n",total,P,N,use_q4,use_q4==2?"W4A8":(use_q4?"q4":"fp32"),L,V);
