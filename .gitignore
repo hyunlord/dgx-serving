@@ -23,6 +23,7 @@ build/
 /tools/serve_daemon_qwen_spec_online
 /tools/bench_w4a8_sb
 /tools/bench_mmq_tune
+/tools/bench_mmq_shape
 /tools/memdiag
 /tools/ncu_*
 /tools/probe_*
