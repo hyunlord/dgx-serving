@@ -11,7 +11,15 @@ struct G4Layer {
     float  layer_scalar;                                        // 레이어 출력 스칼라 (host)
     QMat   q, k, v, o;                                          // v.wq==NULL if k_eq_v(full)
     float *q_norm, *k_norm;                                     // [hd_l] per-head norm (v_norm은 scale 없음 → 텐서 없음)
-    QMat   gate, up, down;                                      // GeGLU MLP
+    QMat   gate, up, down;                                      // GeGLU dense MLP
+
+    // ---- Gemma4 MoE (26B-A4B, num_experts>0) — dense MLP ∥ MoE 병렬, shared expert 없음 ----
+    int    is_moe;                                              // 1이면 MoE 블록 활성 (num_experts>0)
+    float *post_ff_ln_1, *pre_ff_ln_2, *post_ff_ln_2;           // [H] MoE 경로 3-norm (dense post / MoE 입력·출력)
+    QMat   experts_gate_up, experts_down;                       // [E,2*MI,H] / [E,H,MI] batched q4 (moe_fused)
+    float *router_proj;                                         // fp32 [E,H] (launch_gemv_f32)
+    float *router_scale;                                        // fp32 [H]  (rmsnorm weight로 흡수: norm_noscale*scale)
+    float *per_expert_scale;                                    // fp32 [E]  (top_w 후처리 gather-multiply)
 };
 
 struct G4Weights {

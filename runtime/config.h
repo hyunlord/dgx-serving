@@ -54,6 +54,9 @@ typedef struct ModelConfig {
     float attn_scaling;           // softmax scale. 0 → 1/sqrt(층 head_dim)
     int   rotary_dim_full;        // full 층 rotary 차원 (0 → rotary_dim)
     int   rotary_dim_sliding;     // sliding 층 rotary 차원 (0 → head_dim 전체)
+    // ---- Gemma4 MoE 확장 (26B-A4B — dense MLP ∥ MoE 병렬 위상) ----
+    int   moe_parallel_dense;     // 1: dense MLP와 MoE를 병렬 실행 후 합산(Gemma MoE). 0: MoE가 MLP 대체(Qwen)
+    int   router_gemma;           // 1: router 자체 RMSNorm(no-scale)+scale[H]+H^-0.5 + per_expert_scale[E](Gemma). 0: Qwen(gemv+topk)
 } ModelConfig;
 
 // GDN 파생값

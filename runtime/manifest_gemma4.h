@@ -37,6 +37,15 @@ static inline ModelConfig load_config_gemma4(const char *manifest_path) {
     c.rotary_dim_full       = mf_int_opt(s, "rotary_dim_full", 0);
     c.rotary_dim_sliding    = mf_int_opt(s, "rotary_dim_sliding", 0);
 
+    // Gemma4 MoE (26B-A4B) — num_experts>0 이면 dense MLP ∥ MoE 병렬 위상. dense 모델은 전부 0.
+    c.num_experts           = mf_int_opt(s, "num_experts", 0);
+    c.num_experts_per_tok   = mf_int_opt(s, "num_experts_per_tok", 0);
+    c.moe_intermediate_size = mf_int_opt(s, "moe_intermediate_size", 0);
+    c.shared_expert_intermediate_size = mf_int_opt(s, "shared_expert_intermediate_size", 0);
+    c.norm_topk_prob        = mf_int_opt(s, "norm_topk_prob", 0);
+    c.moe_parallel_dense    = mf_int_opt(s, "moe_parallel_dense", 0);
+    c.router_gemma          = mf_int_opt(s, "router_gemma", 0);
+
     // layer_types → layer_is_full[i] (full_attention=1, sliding_attention=0) — qwen 파서와 동일 규약
     int *lf = (int *)malloc(sizeof(int) * c.num_layers);
     const char *p = strchr(mf_find(s, "layer_types"), '[');

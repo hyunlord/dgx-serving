@@ -73,6 +73,22 @@ G4Weights load_weights_gemma4(const char *dir, const ModelConfig &c, int load_q4
         L.gate = mat(p + "mlp.gate_proj", FFN, H);
         L.up   = mat(p + "mlp.up_proj",   FFN, H);
         L.down = mat(p + "mlp.down_proj", H, FFN);
+
+        // MoE (26B-A4B): num_experts>0 이면 dense MLP와 병렬인 MoE 블록 텐서 로드.
+        //   experts = batched q4 (mat: OUT=E*2*MI/E*H flat 인덱싱). router는 fp32(항상 f32 로드).
+        //   norms 3종(post_ff_ln_1 / pre_ff_ln_2 / post_ff_ln_2)은 fp32.
+        if (c.num_experts > 0) {
+            const size_t E = c.num_experts, MI = c.moe_intermediate_size;
+            L.is_moe = 1;
+            L.post_ff_ln_1 = f32(p + "post_feedforward_layernorm_1", H);
+            L.pre_ff_ln_2  = f32(p + "pre_feedforward_layernorm_2", H);
+            L.post_ff_ln_2 = f32(p + "post_feedforward_layernorm_2", H);
+            L.experts_gate_up = mat(p + "experts.gate_up_proj", E * 2 * MI, H);   // [E,2*MI,H] flat
+            L.experts_down    = mat(p + "experts.down_proj",    E * H,      MI);  // [E,H,MI]  flat
+            L.router_proj      = f32(p + "router.proj", E * H);                   // [E,H] fp32
+            L.router_scale     = f32(p + "router.scale", H);                      // [H]   fp32
+            L.per_expert_scale = f32(p + "router.per_expert_scale", E);           // [E]   fp32
+        }
     }
     return w;
 }
@@ -86,6 +102,9 @@ void free_weights_gemma4(G4Weights &w) {
         F(L.input_ln); F(L.post_attn_ln); F(L.pre_ffn_ln); F(L.post_ffn_ln);
         FM(L.q); FM(L.k); FM(L.v); FM(L.o); F(L.q_norm); F(L.k_norm);
         FM(L.gate); FM(L.up); FM(L.down);
+        F(L.post_ff_ln_1); F(L.pre_ff_ln_2); F(L.post_ff_ln_2);
+        FM(L.experts_gate_up); FM(L.experts_down);
+        F(L.router_proj); F(L.router_scale); F(L.per_expert_scale);
     }
     free(w.layers); w.layers = nullptr; w.L = 0;
 }

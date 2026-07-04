@@ -96,4 +96,21 @@ static inline void launch_moe_fused_reduce(const float *Sout, float *out, int H,
     int block=256; long grid=(B*H+block-1)/block;
     moe_fused_reduce_kernel<<<(unsigned)grid,block,0,st>>>(Sout,out,H,K,B);
 }
+
+// (5) per-expert routing-weight scale (모델 독립): dw[slot] *= per_expert_scale[didx[slot]].
+//   Gemma4 router 후처리(top_w * per_expert_scale[top_i]) 표현. router_topk가 낸 dw(=top_w)에
+//   expert별 스케일을 gather-multiply. 결과 dw를 moe_fused_down의 dw로 그대로 사용(=naive의 wk).
+//   ★신규 커널 사유: gather(didx로 pes 인덱싱)+multiply라 launch_scale(스칼라)/axpy로 표현 불가.
+//   어떤 MoE든 per-expert weight scaling에 재사용 가능(모델 상수 없음) → 헌법 원칙1(커널 모델독립) 준수.
+static __global__ void moe_apply_pes_kernel(float *dw, const float *pes, const int *didx, long nslot) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nslot) return;
+    dw[i] *= pes[didx[i]];
+}
+static inline void launch_apply_per_expert_scale(float *dw, const float *pes, const int *didx,
+                                                 int S, int K, cudaStream_t st=0) {
+    long nslot = (long)S * K;
+    int block = 256; long grid = (nslot + block - 1) / block;
+    moe_apply_pes_kernel<<<(unsigned)grid, block, 0, st>>>(dw, pes, didx, nslot);
+}
 #endif // DGX_MOE_FUSED_CUH
