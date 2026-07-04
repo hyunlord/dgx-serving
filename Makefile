@@ -114,6 +114,10 @@ tools/serve_gemma4: tools/serve_gemma4.cu models/gemma4_batch.cu models/gemma4_d
 tools/serve_daemon_gemma4: tools/serve_daemon_gemma4.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_gemma4.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
+# M5 온라인 연속 배칭 daemon(비동기 stdin reader 스레드 + G4BatchState 배치 루프 + 태그드 스트림). batch primitive 재사용.
+tools/serve_daemon_gemma4_online: tools/serve_daemon_gemma4_online.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_gemma4_online.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@ -lpthread
+
 # M4 STEP B: Gemma4 성능 벤치(single/batch decode t/s + prefill, roofline 대조). 사용법: ./tools/bench_gemma4 <w> [uq] [ctx] [ngen] [B..]
 tools/bench_gemma4: tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@

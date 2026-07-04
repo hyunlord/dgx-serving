@@ -18,6 +18,7 @@ build/
 /tools/bench_gemma4
 /tools/bench_serve_gemma4
 /tools/serve_daemon_gemma4
+/tools/serve_daemon_gemma4_online
 /tools/bench_w4a8_sb
 /tools/memdiag
 /tools/ncu_*
