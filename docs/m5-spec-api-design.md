@@ -61,3 +61,14 @@ accept를 out-배열로 반환 → 코어 slot-advance가 그 배열을 읽음."
 - 공개 API 표면: plain(gemma4·qwen 27b/35b) = `run_online_daemon`(검증됨). spec(27b) = `run_online_daemon_spec`(별도 경로, STEP C).
 - front(serve_api.py)는 태그드 프로토콜 공통 — plain/spec daemon 바이너리만 다름(--model 확장). 계산 불변(front 무지).
 - 미해결→해소: "spec 코어 API 노출"(정립 노트 2C) = 옵션 B 확정. 곱(accept) 보존이 게이트 핵심.
+
+## STEP C 구현 (옵션 B 실물화 — tools/serve_daemon_qwen_spec_online.cu)
+
+bench_serve_spec.cu **복사** 후 `run_spec_continuous` → `run_spec_online` in-place 전환. ★cycle(draft_tree_batch→
+qwen35_verify_batch→accept_path/promote_and_catchup)은 **바이트 그대로 유지**(전사 위험 0), wrapper만 실시간化:
+- trace 도착 → `spec_reader` 스레드(stdin 태그드 "<req_id> <max_tokens> <ids>" → 큐, SHUTDOWN/EOF). dummy IDS → 실 ids.
+- 고정 gen → 요청 max_tokens(spec overshoot 길이 가드 clamp). s.out 누적 → **태그드 스트림**(첫/accept/bonus 토큰 각
+  "<req_id> <tok>" fflush) + "<req_id> END". 유휴 cv.wait. SpecSlot.reqid(스트림용). setup 진단 stderr(stdout=태그드 전용).
+- SOLO 모드(SOLO=1): canonical `solo_spec`("<max_tokens> <ids>"→토큰+"###END") = 게이트 기준.
+- 게이트 tests/test_spec_online.py(direct-pipe·front-style 연속 reader=35b subprocess quirk 회피): online(태그드) ==
+  SOLO(canonical 단독 spec) bit-id · concurrent(2슬롯 격리) · reuse(slot 재사용·MtpKV clear). 같은 토큰=accept 곱 보존.

@@ -122,6 +122,10 @@ tools/serve_daemon_gemma4_online: tools/serve_daemon_gemma4_online.cu models/gem
 tools/serve_daemon_qwen_online: tools/serve_daemon_qwen_online.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_qwen_online.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@ -lpthread
 
+# M5 STEP C: 온라인 spec daemon — Qwen3.5 27b spec(MTP draft→verify→accept, 태그드 연속 배칭). run_spec_continuous 실시간 짝.
+tools/serve_daemon_qwen_spec_online: tools/serve_daemon_qwen_spec_online.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_qwen_spec_online.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@ -lpthread
+
 # M4 STEP B: Gemma4 성능 벤치(single/batch decode t/s + prefill, roofline 대조). 사용법: ./tools/bench_gemma4 <w> [uq] [ctx] [ngen] [B..]
 tools/bench_gemma4: tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@

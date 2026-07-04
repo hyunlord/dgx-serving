@@ -144,8 +144,8 @@ def main():
     ap.add_argument("--model", default=os.path.join(HERE,"autotune","profiles","gemma4-31b.json"))
     ap.add_argument("--maxlen", type=int, default=384)
     ap.add_argument("--bmax", type=int, default=8)                 # 동시 활성 슬롯 상한(온라인 배칭 폭)
-    ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen"])  # daemon 종류(arg 레이아웃 상이)
-    ap.add_argument("--golden", default="")                        # qwen rope golden dir(qwen 필수 — gemma4는 dummy rope)
+    ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen","spec"])  # daemon 종류(arg 레이아웃 상이; spec=27b MTP spec)
+    ap.add_argument("--golden", default="")                        # qwen/spec rope+MTP golden dir(필수 — gemma4는 dummy rope)
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
@@ -160,7 +160,10 @@ def main():
     Handler.tok = AutoTokenizer.from_pretrained(args.tokenizer)
     if args.model == "gemma4":
         cmd = [os.path.join(REPO,"tools","serve_daemon_gemma4_online"), args.weights, str(uq), str(args.maxlen), str(args.bmax)]
-    else:                                                          # qwen(27b·35b) — golden(rope) 필수
+    elif args.model == "spec":                                     # 27b MTP spec(draft→verify→accept) — golden(rope+MTP) 필수
+        if not args.golden: sys.exit("[serve_api] --model spec 은 --golden(rope+MTP dir) 필수")
+        cmd = [os.path.join(REPO,"tools","serve_daemon_qwen_spec_online"), args.weights, args.golden, str(uq), str(args.bmax)]  # spec: <w> <golden> <uq> <Bmax>(maxlen=PMAX·K/W 기본)
+    else:                                                          # qwen(27b·35b plain) — golden(rope) 필수
         if not args.golden: sys.exit("[serve_api] --model qwen 은 --golden(rope dir) 필수")
         cmd = [os.path.join(REPO,"tools","serve_daemon_qwen_online"), args.weights, args.golden, str(uq), str(args.maxlen), str(args.bmax)]
     Handler.daemon = OnlineDaemon(cmd)
