@@ -53,6 +53,18 @@
 - **author 이메일**: 커밋 이력 = `hyunlord@naver.com`(개인 이메일 노출). 후보: 그대로 / `git`의 noreply 전환(이력 재작성 필요·이력 공유 시 무거움) / 향후 커밋만 noreply. 권장: **향후 커밋 noreply 정도**(이력 재작성은 과함) — 결정은 사용자.
 - **문서 로컬 경로 scrub**: README env(venv 경로)·CLAUDE.md(로컬 자산)·docs/llama-mmvq-latency-analysis.md(`/home/hyunlord/repos/llama.cpp-mtp` 인용)·blueprint 문서들. 공개 범위 확정 후 일괄 scrub(Phase 1). python 툴 2개(HF 캐시 경로)는 **이번 세션 이미 이식성 수정 완료**.
 
+## ★결정됨 (사용자, 2026-07-05 — Phase 1 입력)
+
+| 항목 | 결정 | Phase 1 반영 작업 |
+|---|---|---|
+| 1. 이름 | **dgx-serving 유지** | README에 "DGX/Spark는 NVIDIA 상표" 고지 1줄 |
+| 2. 라이선스 | **Apache-2.0** | `LICENSE` 파일 추가 + 소스 헤더 정책(선택)·README 배지·모델 라이선스 별개 고지 |
+| 3. 공개 범위 | **엔진 + 판정 문서**(worklog 선택 공개) | 코드+recipes+정제 docs(지형도·방법론·M6 가이드) 공개·worklog는 선별·CLAUDE.md 경로 scrub 후 포함 |
+| 4. 톤 | **연구 프로젝트 톤** | README 초안(m7-readme-draft) 톤 그대로 확정·측정 지형도/방법론 전면 |
+| (부수) 시점 | 미명시 | README/LICENSE 확정 즉시 공개 가능(갭=로드맵). push는 사용자 손 |
+
+**Phase 1 계획(다음 — 공개 push 없이 준비 마무리)**: ①`LICENSE`(Apache-2.0) 추가 ②`m7-readme-draft.md` → `README.md` 확정(상표 고지·라이선스 배지·연구 톤) ③문서 로컬 경로 scrub(CLAUDE.md·README env·llama 분석·blueprint) ④worklog 선별(공개/보류 분류) ⑤clean 환경 빌드 스모크 ⑥author 이메일 정책(향후 noreply). **공개(push)는 사용자 실행.**
+
 ## STEP 0 위생 요약 (이번 세션 확인·수정)
 
 - ✅ gitignore 견고(weights·.bin·.venv·.omc·골든 차단) · 추적 301파일에 바이너리 0 · **이력에 비밀/가중치 커밋 0**(스캔 확인).
