@@ -38,6 +38,14 @@
 - **인터랙티브 서빙**: serving_core가 trace-기반(사전 생성) → 실 API의 온라인 도착(요청-구동)과 갭.
 - 정립 방향: 이 갭들의 **scheme-class 추상화**(export/warm-start가 spec/plain/MoE를 유형으로) = M5/M6 공개 API의 선결.
 
+## M7 Phase 0 — 정립·공개 준비 (착수)
+- 트리거 ①②(공개 표면 M5·backend 경계 M6) 충족 → M7 착수. **Phase 0 = 공개 준비**(공개 push는 사용자 손).
+- 산출물: `docs/m7-readme-draft.md`(정직 포지셔닝 README 초안 — ★2-way 26b dgx 0.28~0.48× "진다" 포함·overclaim 0),
+  `docs/m7-public-doc-structure.md`(공개 문서 4절 아웃라인 — 2D 설계철학·2E 정확성 계약·확장 가이드·2F 알려진 갭),
+  `docs/m7-decisions.md`(★사용자 결정 표면화: 이름·라이선스·범위·톤·시점 — 후보+장단·자율 확정 금지).
+- 위생: gitignore 견고·이력 비밀/가중치 0(스캔)·Makefile 이식성·python 툴 HF 경로 이식성 수정. 남은 scrub(문서 로컬 경로·author 이메일)은 공개 범위 결정 후 Phase 1.
+- **2D 설계철학·2E 정확성 계약 트리거는 Phase 1에서 확정**(결정 반영 후 공개 본문 작성).
+
 ## 요약 — 정립 시작점으로서의 M5
 M5는 단순 기능 추가가 아니라 **공개 표면의 등장**이라 위 세 트랙(공개 API 안정성·backend/spec 경계·자동화 갭)을
 명시적으로 정해야 하는 시점. Phase 0는 그 표면을 정의(설계 + 최소 골격)하고, 갭들을 정직하게 목록화(구현은 트랙별
