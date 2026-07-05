@@ -54,7 +54,7 @@ static void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, 
         if (g_xqcap < n) { if(g_xq)cudaFree(g_xq); if(g_xs)cudaFree(g_xs); if(g_xsum)cudaFree(g_xsum);
             DK(cudaMalloc(&g_xq,n)); DK(cudaMalloc(&g_xs,(n/QBLK)*4)); DK(cudaMalloc(&g_xsum,(n/QBLK)*4)); g_xqcap=n; }
         launch_quantize_x_q8(X, g_xq, g_xs, g_xsum, IN, S);
-        if      (S == 1) launch_gemv_w4a8_mlp<2>(g_xq, g_xs, g_xsum, m.wq, m.sc, Y, IN, OUT, S, g_sdtype);  // 챕터9: MLP↑(outstanding load 2개로 long_scoreboard latency 숨김, bit-exact)
+        if      (S == 1) launch_gemv_w4a8_mlp_auto(g_xq, g_xs, g_xsum, m.wq, m.sc, Y, IN, OUT, S, g_sdtype);  // 챕터9 MLP↑(env MLP_U=outstanding load, 기본 2, bit-exact)
         else if (S <= 8) launch_gemv_w4a8_sb(g_xq, g_xs, m.wq, m.sc, Y, IN, OUT, S, g_sdtype);  // STEP D: verify 소-batch(2~8). (챕터9 SB-MLP 실험은 역효과 — S-accum이 이미 ILP, U-unroll이 occupancy만↓)
         else             launch_gemm_mmq_w4a8_auto(g_xq, g_xs, m.wq, m.sc, Y, S, OUT, IN, g_sdtype); // prefill: full-MMQ(env MMQ256=1 → 256×64 tall, 기본 128×128)
     } else if (use_q4) launch_gemm_tiled_q4(X, m.wq, m.sc, Y, S, OUT, IN, g_sdtype);   // prefill tiled GEMM(Phase A); S=1은 gemv

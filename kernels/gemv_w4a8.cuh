@@ -96,6 +96,17 @@ static inline void launch_gemv_w4a8_mlp(const int8_t *xq, const float *xs, const
     if (scale_dtype == 1) gemv_w4a8_mlp_kernel<__half,U><<<grid,block,0,st>>>(xq,xs,xsum,Wq,(const __half*)sw,Y,IN,OUT,S);
     else                  gemv_w4a8_mlp_kernel<float,U><<<grid,block,0,st>>>(xq,xs,xsum,Wq,(const float*)sw,Y,IN,OUT,S);
 }
+// (decode 튜닝 A/B) outstanding-load U 토글: env MLP_U(기본 2=엔진값). long_scoreboard latency 은폐 실험.
+//   ★compute 순서 baseline 동일 = 전 U bit-exact(값 불변·발사 스케줄만). U↑=레지스터/발사↑(occupancy 영향 measure).
+static inline void launch_gemv_w4a8_mlp_auto(const int8_t *xq, const float *xs, const int32_t *xsum,
+                                    const uint8_t *Wq, const void *sw, float *Y,
+                                    int IN, int OUT, int S, int scale_dtype = 0, cudaStream_t st = 0) {
+    static int u = getenv("MLP_U") ? atoi(getenv("MLP_U")) : 2;
+    switch(u){ case 3: launch_gemv_w4a8_mlp<3>(xq,xs,xsum,Wq,sw,Y,IN,OUT,S,scale_dtype,st); break;
+               case 4: launch_gemv_w4a8_mlp<4>(xq,xs,xsum,Wq,sw,Y,IN,OUT,S,scale_dtype,st); break;
+               case 6: launch_gemv_w4a8_mlp<6>(xq,xs,xsum,Wq,sw,Y,IN,OUT,S,scale_dtype,st); break;
+               default: launch_gemv_w4a8_mlp<2>(xq,xs,xsum,Wq,sw,Y,IN,OUT,S,scale_dtype,st); }
+}
 
 // ── 소-batch W4A8 GEMV (verify Sq=2~8) ─────────────────────────────────────────
 // 챕터8 STEP D: warp 1개 = 출력 o 1개. weight를 1회만 적재(DRAM)하고 S개 활성화 컬럼에
