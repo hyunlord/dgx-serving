@@ -16,7 +16,7 @@ accept = mean_P( argmax(MTP_logits[P]) == argmax(body_logits[P+1]) ), P=0..S-2.
 사용:
   python tools/mtp_reference.py --model Qwen/Qwen3.5-0.8B --prompt "The capital of France is ..."
 """
-import argparse, glob, sys
+import argparse, glob, sys, os
 import numpy as np
 
 
@@ -44,7 +44,10 @@ def main():
     E = model.get_input_embeddings().weight.detach()    # [V,H], lm_head tied = E
 
     # --- MTP weights (safetensors 직접 로드; HF는 무시) ---
-    sf_path = glob.glob(f"/home/hyunlord/.cache/huggingface/hub/models--{args.model.replace('/','--')}/snapshots/*/model.safetensors*.safetensors")[0]
+    # HF 캐시 위치: HF_HUB_CACHE > $HF_HOME/hub > ~/.cache/huggingface/hub (이식성 — 로컬 경로 하드코딩 금지)
+    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+    sf_path = glob.glob(f"{hub}/models--{args.model.replace('/','--')}/snapshots/*/model.safetensors*.safetensors")[0]
     W = {}
     with safe_open(sf_path, framework="pt") as sf:
         for k in sf.keys():

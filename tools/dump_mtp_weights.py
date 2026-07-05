@@ -17,7 +17,10 @@ def main():
     args = ap.parse_args()
     from safetensors import safe_open
 
-    pat = f"/home/hyunlord/.cache/huggingface/hub/models--{args.model.replace('/','--')}/snapshots/*/*.safetensors"
+    # HF 캐시 위치: HF_HUB_CACHE > $HF_HOME/hub > ~/.cache/huggingface/hub (이식성 — 로컬 경로 하드코딩 금지)
+    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+    pat = f"{hub}/models--{args.model.replace('/','--')}/snapshots/*/*.safetensors"
     shards = sorted(s for s in glob.glob(pat) if "index" not in s)
     assert shards, f"no shards: {pat}"
     print(f"[dump_mtp] {len(shards)} shards, model={args.model}")
