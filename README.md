@@ -1,113 +1,94 @@
 # dgx-serving
 
-**NVIDIA DGX Spark GB10 (sm_121) 전용** 오픈소스 LLM 추론 엔진.
+**LLM serving engine for NVIDIA DGX Spark (GB10 / sm_121)** — with built-in Bayesian auto-tuning and one-file, reproducible serving recipes.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
-> ⚠️ **상표 고지**: "DGX", "DGX Spark", "GB10", "Grace Blackwell"은 NVIDIA Corporation의 상표입니다.
-> 본 프로젝트는 **독립 오픈소스 프로젝트로 NVIDIA와 무관**하며, 대상 하드웨어를 식별하기 위해서만 명칭을 사용합니다.
+Purpose-built for a single machine (GB10, ~273 GB/s unified LPDDR5X, 128 GB unified memory) rather than as a general-purpose engine. The design is a **model-independent CUDA kernel library (`kernels/`) + a thin per-model graph (`models/`)**: adding a model is a new graph, not new kernels.
 
-> **포지셔닝(정직)**: 이 프로젝트는 "GB10에서 LLM 추론에 무엇이 가능한지의 **측정 지도**"이자 그 위에 세운 서빙 엔진이다.
-> 범용 최속 엔진을 표방하지 않는다. **이기는 좌표도 지는 좌표도 measured 그대로** 공개한다 — 신뢰가 곧 제품.
+## Features
 
-## 무엇인가
+- **4 models served** out of the box: Qwen3.5-27B, Qwen3.5-35B-A3B (MoE), Gemma4-31B, 26B-A4B (MoE) — all W4A8.
+- **OpenAI-compatible API** (`/v1/completions`, `/v1/models`) with SSE streaming and online continuous batching.
+- **Built-in MTP speculative decoding** — the Multi-Token-Prediction head ships with the model; no separate draft model to host.
+- **Auto-tuning pipeline**: `probe → plan → tune (Bayesian, Optuna TPE) → recipe`, with a correctness (bit-identity) gate on every tuned config.
+- **One-file recipes**: a `recipe.yaml` captures a tuned serving policy (regime → config) plus verifiable claims; `verify` re-checks device fingerprint, memory budget, and reproduces the numbers on your machine.
+- **Pure CUDA kernels, sm_121-native** — no external kernel dependency (no cuBLAS/CUTLASS in the serving path).
+- **Large models on one box**: 27–35B-class models in 128 GB unified memory.
 
-- **단일 장비(GB10) × 특정 모델군**에 최적화된 서빙 엔진. GB10의 ~273 GB/s unified LPDDR5X 대역폭과
-  128GB unified 메모리를 전제로 설계.
-- **모델 독립 공용 커널 라이브러리(`kernels/`) + 모델별 얇은 graph(`models/`)** 구조. 4개 모델
-  (Qwen3.5-27B·Gemma4-31B·Qwen3.5-35B-A3B MoE·26B-A4B MoE)이 신규 커널 0으로 서빙됨(아키텍처 실증 → [확장 가이드](./docs/m6-backend-boundary.md)).
-- **자동튜닝(베이지안, Optuna TPE)** + **레시피 재현**: 장비×모델별 최적 config를 실측+정확성 게이트(ISO)로
-  자동 탐색하고, 검증 가능한 주장이 붙은 `recipe.yaml`로 배포/재현. (vLLM 수동 가이드·llama.cpp 휴리스틱과 차별)
-- **MTP-head 내장 speculative decoding** + tree-spec + 연속 배칭 결합(27b).
-- **128GB unified로 큰 모델**(27~35B급)을 단일 장비에서 서빙.
-
-## 무엇이 아닌가 (정직)
-
-- **범용 최속 엔진이 아니다.** llama.cpp/vLLM의 성숙한 커널을 raw 속도로 이기는 것이 목표가 아니다(아래 §정직 벤치).
-- **모든 GPU용이 아니다.** GB10(sm_121) 전용. probe가 장비를 자동 감지하나 다른 장비에선 튜닝 자산이 transfer만 됨.
-- **품질↔속도 트레이드 옵션이 없다.** q4 단일(measured 결론 — q2 붕괴·q3 속도역행 소거, §측정 지형도).
-
-## ★정직 벤치 (measured — 지는 좌표 포함이 원칙)
-
-### 2-way: dgx-serving vs llama.cpp (Gemma4-26B-A4B, 공정 조건, HTTP, warm, ~q4급)
-
-같은 26b MoE·같은 프롬프트/max_tokens·같은 동시성·warm 클럭. HTTP 클라이언트 관측(배포 현실).
-
-| 동시 N | dgx t/s | llama t/s | dgx/llama |
-|---|---|---|---|
-| 1 | 14.7 | 52.6 | **0.28×** (3.6× 느림) |
-| 4 | 48.4 | 65.3 | 0.74× |
-| 8 (=Bmax) | 80.6 | 168.3 | **0.48×** (2.1× 느림) |
-| 16·32 (초과구독) | ~81 포화 | ~145~163 | 0.50~0.56× |
-
-- **dgx가 진다(measured).** 이기는 raw-속도 좌표는 없다. 숨기지 않는다.
-- **왜 지는가(정직)**: 26b는 최신·미최적 MoE(decode graph를 갓 구현·perf 튜닝 0), llama는 수년 성숙한 fused/tiled 커널.
-  = **커널 성숙도 갭**(엔진 천장 아님 — 27b dense는 roofline 62.5% 달성). 남은 lever는 per-token 커널 속도(FP4·fused·tiled — 착수 전).
-- **배칭은 작동한다(긍정 신호)**: dgx 연속 배칭이 N=1→8에서 near-linear 5.5×(14.7→80.6)로 amortize·초과구독을 큐잉으로 흡수(크래시 없음).
-- vLLM 3rd leg = 후속(GB10 구동 자체는 실증됨 — 26b 체크포인트+docker HTTP만 남음, 정직히 범위 밖).
-
-### roofline 달성률 (상한 대비 — 상한이지 예측 아님)
-
-| 모드 | 상한(t/s) | 실측 | 달성률 |
-|---|---|---|---|
-| 27b single non-spec | 19.0 | 11.9 | 62.5% |
-| 27b spec serving (B16 K7W2) | 304.5 | 51.7 | 17.0% |
-| gemma4-31b single | 17.4 | 9.28 | 53.3% |
-| 35b-a3b MoE single | 165.3 | 51.8 | 29.8% (MoE 구조적 낮음) |
-
-### spec 곱 (27b — 워크로드 조건 명시)
-
-- chain K=3 = **1.40×**(plain 대비)·tree K4W3 = 1.11×·plain 배칭 = 1.21×(같은 Bmax).
-- ★**워크로드 민감**: accept 6.99(반복)~3.5(산문) measured — 반복 워크로드에서 지연 크게 유리·산문은 완만.
-
-### 측정 지형도 = 그 자체가 자산 ("이 장비에서 가능한 것의 지도")
-
-대역폭 돌파(2×급) 후보 시드를 **전부 측정으로 판정**(소거도 성과 — 환상 제거):
-L2 persist·KV 압축·dense sparsity·spec 극한·prefetch·unified 계층·q2/q3 양자화 = **전부 소거/modest**.
-**결론: 273GB/s × 토큰당 bytes가 근본 벽.** 4bit이 이 하드웨어 bytes↓ sweet spot(그 아래는 로드 마찰이 절약 초과).
-남은 큰 lever는 전부 엔진 밖(draft 모델·SOTA 2-bit) 또는 toolkit-gated(FP4, CUDA 13.2+ 대기).
-→ [`docs/performance.md`](./docs/performance.md) §4.
-
-## 방법론 (측정-먼저 문화 — 차별화 포인트)
-
-- **측정 먼저**: 시간만으로 성능 판단 금지 — ncu 지표(sectors/req·occupancy) 동반. "명백한" 오버헤드도 measured 비-지배인 경우 다수.
-- **격리 ≠ 엔진**: 격리 벤치 이득이 in-engine에서 감쇠/역전(X-shared·q3 함정 실증). in-engine 검증 필수.
-- **scheme-internal 정확성**: bit-identity는 스킴 내 개념(배치 형상·양자화 dispatch가 스킴). fp32-exact가 아님을 명시.
-- **정직 좌표**: "추월/delivered"는 measured로 실제 llama 추월(<1.0×) 확인 전까지 금지. overclaim 0.
-
-## 지원 모델 (4모델 — 커널 라이브러리 + 얇은 graph 실증)
-
-| 모델 | 구조 | 서빙 |
-|---|---|---|
-| Qwen3.5-27B | GDN 혼합 + MTP(spec) | spec 곱 + 연속 배칭 |
-| Gemma4-31B | dense(sliding/full·GeGLU·dual-rope·softcap) | plain 연속 배칭 |
-| Qwen3.5-35B-A3B | MoE(256 expert top-8) + GDN | fused-MoE plain 배칭 |
-| 26B-A4B | 병렬 MoE(dense∥MoE) | plain 배칭 |
-
-## 문서
-
-- [성능](./docs/performance.md) — GB10 측정 좌표(모델별 t/s·roofline 달성률)·정직 벤치(llama 대비 "진다" 포함)·대역폭 지형도·알려진 한계.
-- [확장 가이드 · 정확성 계약](./docs/m6-backend-boundary.md) — 커널 독립·graph 배선·config-주도, 새 모델 family 추가법, scheme-internal bit-id 계약.
-- [레시피 스키마](./docs/recipe-schema.md) — 검증 가능한 config 배포판(recipe.yaml + verify).
-
-## 알려진 갭 (숨기지 않고 로드맵으로)
-
-- spec 서빙 경계 미정(plain backend 훅 밖 — 별도 추상화 필요) · 26B 서빙 파레토 미측정 ·
-  gemma4 sliding KV 링버퍼 TODO(긴 context) · verify 자동화 갭(export/warm-start scheme-class 추상화) ·
-  FP4 텐서코어 toolkit-blocked(CUDA 13.2+ 대기).
-
-## 빌드 / 재현
+## Quick Start
 
 ```bash
-make            # 전체 빌드 (nvcc -arch=sm_120 — GB10 sm_121 호환). ARCH/NVCC 오버라이드 가능.
-make test       # 검증 테스트(레퍼런스 대조 golden)
+# 1. Build (nvcc -arch=sm_120, GB10 sm_121-compatible)
+git clone <repo-url> dgx-serving && cd dgx-serving
+make                              # builds test binaries; ARCH=/NVCC= overridable
+
+# 2. Prepare weights (not distributed — downloaded from HuggingFace and converted).
+#    Model licenses (Qwen/Gemma) apply and are your responsibility.
+pip install transformers safetensors torch      # reference/tokenizer deps
+python tools/extract_weights_qwen35.py --model Qwen/Qwen3.5-27B --out artifacts/qwen35-27b/weights
+python tools/make_reference_qwen35.py  --model Qwen/Qwen3.5-27B --out artifacts/qwen35-27b/golden
+
+# 3. Build the serving daemon and start the API server
+make tools/serve_daemon_qwen_online
+python tools/serve_api.py --model qwen \
+    --weights artifacts/qwen35-27b/weights \
+    --golden  artifacts/qwen35-27b/golden \
+    --port 8000
+
+# 4. Query it (OpenAI-compatible)
+curl http://localhost:8000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"qwen","prompt":"The capital of France is","max_tokens":16}'
 ```
 
-- **전제**: GB10(sm_121) + CUDA 13.0 + nvcc. 다른 장비에선 커널이 빌드될 수 있으나 튜닝 자산은 transfer만 됨.
-- 레퍼런스 골든 생성엔 Python(transformers/safetensors/torch) 필요 — HF 캐시는 `HF_HOME`/`HF_HUB_CACHE` 환경변수 존중.
-- **가중치는 배포하지 않는다**(모델 라이선스). HuggingFace에서 받아 `tools/extract_weights*.py`로 엔진 포맷 변환.
-  각 모델(Qwen/Gemma 등)의 라이선스 준수는 사용자 책임.
+Optional — the auto-tuning pipeline (device fingerprint → tune → shareable recipe):
 
-## 라이선스
+```bash
+python tools/autotune/probe.py   --out tools/autotune/artifacts/gb10-auto.json
+python tools/autotune/autotune.py --model tools/autotune/profiles/qwen35-27b.json --phase2b
+python tools/autotune/recipe.py  verify recipes/qwen35-27b-gb10.yaml   # reproduce claims locally
+```
 
-[Apache License 2.0](./LICENSE). 모델 가중치는 포함하지 않으며, 각 모델의 라이선스는 별도로 적용된다.
+> Serving with `--model gemma4` (dense) or `--model spec` (27B MTP speculative) follows the same shape;
+> see [`docs/recipe-schema.md`](./docs/recipe-schema.md). Weights are never bundled.
+
+## Performance
+
+Measured on GB10 (sm_121). Representative serving throughput (continuous batching, warm):
+
+| Model | Op point | Throughput | tpot95 | Conditions |
+|---|---|---|---|---|
+| Qwen3.5-27B (spec) | B16 K7W2, λ4 | ~51.7 tok/s | ~0.34 s | nreq60, w4a8+mtp_q4 |
+| Gemma4-31B (dense) | B8 (knee) | 36–38 tok/s | ~0.14 s | nreq48, maxlen384 |
+| Qwen3.5-35B-A3B (MoE) | B8 | ~62.7 tok/s | ~0.11 s | nreq40, maxlen256 |
+
+Roofline attainment (weight-movement upper bound): 27B dense single **62.5%**, Gemma4 53.3%, 35B MoE 29.8%.
+
+Honest comparison vs `llama.cpp` (same Gemma4-26B-A4B, ~q4, HTTP, warm):
+
+| Concurrency | dgx-serving | llama.cpp | ratio |
+|---|---|---|---|
+| 1 | 14.7 tok/s | 52.6 | 0.28× |
+| 8 (=Bmax) | 80.6 tok/s | 168.3 | 0.48× |
+
+We are slower here. The gap is **kernel maturity** (26B MoE is the newest, un-tuned path; llama.cpp's kernels are years-optimized), not an engine ceiling — continuous batching scales near-linearly (5.5× from N=1→8). This is **not** a general-purpose fastest-engine; it targets one machine and a fixed model set. Full coordinates, roofline breakdown, and the GB10 bandwidth landscape: [`docs/performance.md`](./docs/performance.md).
+
+## Requirements
+
+- **Hardware**: NVIDIA DGX Spark (GB10, sm_121). Kernels may build elsewhere, but tuning assets are GB10-specific.
+- **Toolkit**: CUDA 13.0 (`nvcc`), C++17.
+- **Python** (front-end/tokenizer & weight conversion): `transformers`, `safetensors`, `torch`.
+- **Disk**: space for model weights (converted from HuggingFace; not included).
+
+## Documentation
+
+- [`docs/performance.md`](./docs/performance.md) — measured coordinates, roofline attainment, honest benchmarks, bandwidth landscape, known limits.
+- [`docs/m6-backend-boundary.md`](./docs/m6-backend-boundary.md) — architecture, correctness contract, and how to add a new model family.
+- [`docs/recipe-schema.md`](./docs/recipe-schema.md) — recipe format and the `verify` / `run` workflow.
+
+## License
+
+[Apache License 2.0](./LICENSE). Model weights are **not** included; each model (Qwen, Gemma, …) is subject to its own license.
+
+*"DGX", "DGX Spark", and "GB10" are trademarks of NVIDIA Corporation. This is an independent open-source project, not affiliated with or endorsed by NVIDIA; the names are used only to identify the target hardware.*
