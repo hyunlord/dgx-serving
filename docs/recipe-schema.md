@@ -71,8 +71,7 @@ v0에 이미 있다.
 ## v0 한계 / v1 후보
 
 - ~~warm-start 훅은 안내 문구 수준~~ → **M2에서 실체화**: `autotune.py --warmstart recipe.yaml`이 regime
-  승자 config를 Optuna `enqueue_trial`로 주입(공간 밖 config는 스킵 보고). 효과는 controlled A/B로 정량
-  (docs/autotune-harness.md M2 STEP C).
+  승자 config를 Optuna `enqueue_trial`로 주입(공간 밖 config는 스킵 보고). 효과는 controlled A/B로 정량.
 - ~~장비 지문이 프로파일 파일 기반~~ → **M2에서 해소**: `probe.py`가 STREAM/deviceProp/meminfo/toolkit 컴파일
   시험으로 자동 생성, GB10 수동본 대조 PASS. `verify --device <auto.json>`로 그대로 사용 가능.
 - 정책이 정적 룩업(요청-경계 핫스위치·온라인 컨트롤러는 스킴 경계 해결 후).

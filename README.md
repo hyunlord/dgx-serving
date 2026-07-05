@@ -66,7 +66,7 @@
 L2 persist·KV 압축·dense sparsity·spec 극한·prefetch·unified 계층·q2/q3 양자화 = **전부 소거/modest**.
 **결론: 273GB/s × 토큰당 bytes가 근본 벽.** 4bit이 이 하드웨어 bytes↓ sweet spot(그 아래는 로드 마찰이 절약 초과).
 남은 큰 lever는 전부 엔진 밖(draft 모델·SOTA 2-bit) 또는 toolkit-gated(FP4, CUDA 13.2+ 대기).
-→ [`docs/c-bandwidth-seeds-verdict.md`](./docs/c-bandwidth-seeds-verdict.md).
+→ [`docs/performance.md`](./docs/performance.md) §4.
 
 ## 방법론 (측정-먼저 문화 — 차별화 포인트)
 
@@ -86,12 +86,9 @@ L2 persist·KV 압축·dense sparsity·spec 극한·prefetch·unified 계층·q2
 
 ## 문서
 
-- [설계 철학·경계·확장 가이드](./docs/m6-backend-boundary.md) — 커널 독립·graph 배선·config-주도, 새 모델 family 추가법.
-- [측정 지형도](./docs/c-bandwidth-seeds-verdict.md) — GB10 대역폭 돌파 시드 전수 판정("가능한 것의 지도").
-- [다목적 파레토](./docs/m3-multi-objective-pareto.md) — throughput/tpot/메모리/워크로드 축·SLO 제약 튜닝.
-- [레시피 스키마](./docs/recipe-schema.md) — 검증 가능한 config 배포판(v0).
-- [공개 문서 구조](./docs/m7-public-doc-structure.md) · [정립 노트](./docs/establishment-notes.md) — 설계 철학·정확성 계약·알려진 갭.
-- `docs/`의 `ch*`/`02*`/`m4*`/`m5*` 등은 개발 로그(worklog, 정제 전 — 측정 과정의 정직한 기록).
+- [성능](./docs/performance.md) — GB10 측정 좌표(모델별 t/s·roofline 달성률)·정직 벤치(llama 대비 "진다" 포함)·대역폭 지형도·알려진 한계.
+- [확장 가이드 · 정확성 계약](./docs/m6-backend-boundary.md) — 커널 독립·graph 배선·config-주도, 새 모델 family 추가법, scheme-internal bit-id 계약.
+- [레시피 스키마](./docs/recipe-schema.md) — 검증 가능한 config 배포판(recipe.yaml + verify).
 
 ## 알려진 갭 (숨기지 않고 로드맵으로)
 

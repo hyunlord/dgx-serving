@@ -108,4 +108,4 @@ spec(27b MTP)은 draft→verify→promote로 **스텝 구조가 plain과 상이*
 
 ## STEP C — 무회귀 + 정립 노트
 - **무회귀**: STEP A가 no-op(코드 변경 0)이라 4모델 게이트 자동 무회귀(정리가 없으니 계산 불변). 문서만 산출.
-- **정립 노트 2C 갱신**: backend 경계 확정(트리거 ② 충족) — 아래 establishment-notes.md 반영.
+- **backend 경계 확정**: plain backend 훅(ServingBackend·OnlineBackend)은 안정 인터페이스로 확정. spec은 별도 추상화 미정.
