@@ -20,7 +20,7 @@ Purpose-built for a single machine (GB10, ~273 GB/s unified LPDDR5X, 128 GB unif
 
 ```bash
 # 1. Build (nvcc -arch=sm_120, GB10 sm_121-compatible)
-git clone <repo-url> dgx-serving && cd dgx-serving
+git clone https://github.com/hyunlord/dgx-serving && cd dgx-serving
 make                              # builds test binaries; ARCH=/NVCC= overridable
 
 # 2. Prepare weights (not distributed — downloaded from HuggingFace and converted).
