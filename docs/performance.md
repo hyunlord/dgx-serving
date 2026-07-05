@@ -90,6 +90,7 @@ decode 속도 ≈ 대역폭 ÷ 토큰당 이동 bytes. 2×급 돌파 후보를 �
 
 - **26B 서빙 파레토 미측정**(roofline 상한만).
 - **spec 서빙 경계 미정**(plain backend 훅 밖 — 별도 추상화 필요).
+- **Gemma draft-spec 접음(measured)**: E2B draft accept 0.52·비용 c 0.27 → 순 곱 ~1.0×(<1.5× 문턱) = 동형 함정(draft 비용>절약). llama 66.9(spec)는 다른 draft 자산 필요 — 우리 12B는 plain near-parity(0.87×)로 유지. → [`docs/gemma-draft-spec-verdict.md`](./gemma-draft-spec-verdict.md).
 - **긴 context(>1024)**: gemma4 sliding KV 링버퍼 미구현.
 - **FP4**: toolkit-gated(CUDA 13.2+ 대기) — 최대 미사용 lever.
 - 벤치는 warm·측정 조건 명시분에 한함(cold 클럭 교란 제외). 3-way의 vLLM leg는 후속.
