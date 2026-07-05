@@ -7,7 +7,7 @@ Your kernel has 72.8% stall on `long_scoreboard` (L1TEX/global memory latency), 
 
 ## 1. MMVQ Decode GEMV (mul_mat_vec_q) Inner Loop Structure
 
-**File:** `/home/hyunlord/repos/llama.cpp-mtp/ggml/src/ggml-cuda/mmvq.cu:572–592`
+**File:** `<LLAMA_CPP_REPO>/ggml/src/ggml-cuda/mmvq.cu:572–592` (`<LLAMA_CPP_REPO>` = 분석 대상 llama.cpp 체크아웃, 사용자 로컬)
 
 ### Strategy: Multiple Outstanding Loads via Unrolling + Implicit Software Pipelining
 
@@ -55,7 +55,7 @@ for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
 
 ## 2. MMVQ Shared Memory Staging
 
-**File:** `/home/hyunlord/repos/llama.cpp-mtp/ggml/src/ggml-cuda/mmvq.cu:569`
+**File:** `<LLAMA_CPP_REPO>/ggml/src/ggml-cuda/mmvq.cu:569`
 
 ### Strategy: **NO Shared Memory for Weights** — Direct Global Loads with Register ILP
 
@@ -77,7 +77,7 @@ for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
 
 ## 3. MMQ Batched GEMM Double-Buffering (Multi-Token Decode)
 
-**File:** `/home/hyunlord/repos/llama.cpp-mtp/ggml/src/ggml-cuda/mmq.cuh:3485–3518`
+**File:** `<LLAMA_CPP_REPO>/ggml/src/ggml-cuda/mmq.cuh:3485–3518`
 
 ### Strategy: Explicit Double-Buffering of Shared Tiles
 

@@ -30,7 +30,8 @@
 
 ```bash
 # 27b, 30 trials (GPU 1개 — 직렬 실행 전제)
-~/github/emissary_llm/.venv/bin/python tools/autotune/autotune.py \
+# <PYTHON> = 레퍼런스 파이썬(사용자 환경에 맞게 치환)
+<PYTHON> tools/autotune/autotune.py \
     --model tools/autotune/profiles/qwen35-27b.json --trials 30 --seed 42 --lam 4 --nreq 40
 # 중단 후 재실행하면 sqlite에서 재개(완료 trial은 캐시 재사용)
 ```

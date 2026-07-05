@@ -52,12 +52,12 @@ GB10 하드웨어 특성 (모든 설계의 전제):
 - 컴파일러: `nvcc -arch=sm_120 -O2` (또는 `sm_121a`). 빌드 시스템은 Makefile.
 - 프로파일러: Nsight Compute (`ncu`) — 성능 분석의 1차 도구.
 - Python 레퍼런스 환경: transformers 5.12.1, safetensors 0.8.0, torch 2.12.1 (HF fp32 골든 생성용).
-  - venv 위치: `~/github/gb10-cuda-ht/07-engine/.venv` (레퍼런스 환경 재사용).
+  - venv 위치: `<REF_VENV>` (레퍼런스 환경 재사용, 사용자 환경 경로).
   - 주의: PyTorch가 sm_121 공식 미지원 경고를 띄우나 동작은 함.
 - 검증 모델 자산 (사용자 머신):
   - SmolLM3-3B (HF) — 첫 타깃, Llama 계열. HF 캐시: `~/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM3-3B`
   - Qwen3.5-0.8B (HF safetensors) — MTP 타깃. 본체가 GDN(linear attn)+full 혼합, MTP head weight 보유.
-- 학습 repo 자산 (참고/이식 출처): `~/github/gb10-cuda-ht/07-engine`
+- 학습 repo 자산 (참고/이식 출처): `<REF_ENGINE_REPO>` (사용자 로컬 repo)
   - 검증된 통짜 커널: `decode_batch.cu`, `decode_spec.cu`, `full_engine.cu` 등
   - SmolLM3 형상: H=2048, NQ=16, NKV=4, HD=128, FFN=11008, V=128256, L=36, QBLK=32
   - q4 weight 포맷: `ref_full/layers/`에 레이어별 q4.bin+scale.bin, 골든 `ref_full/full_logits.bin`

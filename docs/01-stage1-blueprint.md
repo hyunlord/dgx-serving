@@ -1,6 +1,6 @@
 # 1단계 블루프린트 — 공용 커널 + SmolLM3 graph
 
-> 레퍼런스(`~/github/gb10-cuda-ht/07-engine`, 특히 `full_engine.cu`, `quantize_*.py`, `dump_full.py`)에서
+> 레퍼런스(`<REF_ENGINE_REPO>` = 레퍼런스/이식 출처 repo(사용자 로컬), 특히 `full_engine.cu`, `quantize_*.py`, `dump_full.py`)에서
 > 추출한 정확한 사양. 이식의 기준 문서. compaction 견디게 여기 박아둠.
 
 ## SmolLM3-3B config (HF에서 확정)

@@ -50,8 +50,8 @@
 ## 5. 공개 시점 (timing) + 부수 결정
 
 - **공개 시점**: 즉시 vs (26B 파레토 측정·spec 경계 정리 등 알려진 갭 일부 해소 후). 권장: **README/라이선스 확정 즉시 공개 가능**(갭은 로드맵으로 정직 명시 — 완벽 대기 불필요). 결정은 사용자.
-- **author 이메일**: 커밋 이력 = `hyunlord@naver.com`(개인 이메일 노출). 후보: 그대로 / `git`의 noreply 전환(이력 재작성 필요·이력 공유 시 무거움) / 향후 커밋만 noreply. 권장: **향후 커밋 noreply 정도**(이력 재작성은 과함) — 결정은 사용자.
-- **문서 로컬 경로 scrub**: README env(venv 경로)·CLAUDE.md(로컬 자산)·docs/llama-mmvq-latency-analysis.md(`/home/hyunlord/repos/llama.cpp-mtp` 인용)·blueprint 문서들. 공개 범위 확정 후 일괄 scrub(Phase 1). python 툴 2개(HF 캐시 경로)는 **이번 세션 이미 이식성 수정 완료**.
+- **author 이메일**: 커밋 이력에 개인 이메일 노출. 후보: 그대로 / `git`의 noreply 전환(이력 재작성 필요·이력 공유 시 무거움) / 향후 커밋만 noreply. 권장: **향후 커밋 noreply 정도**(이력 재작성은 과함) — 결정은 사용자.
+- **문서 로컬 경로 scrub**: README env(venv 경로)·CLAUDE.md(로컬 자산)·docs/llama-mmvq-latency-analysis.md(분석 대상 llama.cpp 로컬 체크아웃 경로 인용)·blueprint 문서들. 공개 범위 확정 후 일괄 scrub(Phase 1). python 툴 2개(HF 캐시 경로)는 **이번 세션 이미 이식성 수정 완료**.
 
 ## ★결정됨 (사용자, 2026-07-05 — Phase 1 입력)
 
