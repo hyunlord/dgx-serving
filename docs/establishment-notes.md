@@ -12,13 +12,21 @@
   Phase 0는 표면 정의 + gemma4 plain 골격. **greedy만**(샘플링·logprobs·n>1 미지원 — 명시).
 - 정립 결정 필요(다음): API 버전 정책·안정 표면 범위·토크나이저 배포 형태(Python HF vs C++ 네이티브).
 
-## 2C — backend / spec 경계 (M4 유산 + API 노출 과제)
-- **plain 코어는 모델-중립 추상화 완료**(`serving_core.h` 훅5): 27b·35b MoE·gemma4가 QwenBackend/Gemma4Backend로
-  코드 변경 최소 서빙(M4 실증). MoE도 이 경계 안(35b fused-MoE = QwenBackend).
-- **spec(27b MTP)은 별도 경로**: draft→verify 사이클로 스텝 구조가 plain과 상이 → serving_core 훅에 안 들어감
-  (bench_serve_spec 별도). ★**API가 spec을 어떻게 노출**할지 = 열린 설계(completions 뒤에 draft/verify를 감추는 계층).
-  Phase 0는 plain(gemma4) 먼저 — spec/MoE API 연결은 코어 성숙 후(무리한 통합 = 정확성 리스크, 금지).
-- 경계 정립: "plain backend 훅5"는 안정 인터페이스 후보. spec은 별도 추상화(draft 커널 축)가 필요 — 미정.
+## 2C — backend / spec 경계 (★M6에서 확정 — 트리거 ② 충족)
+- **plain 코어는 모델-중립 추상화 완료**(`serving_core.h`·`serving_online.h`): 27b·35b MoE·gemma4가
+  QwenBackend/Gemma4Backend로 코드 변경 최소 서빙(M4 실증). MoE도 이 경계 안(35b fused-MoE = QwenBackend).
+- **★M6 경계 확정(`docs/m6-backend-boundary.md`)**: 코드 실사로 경계 인벤토리(공유 vs family-특수) + 개입 곡선 4점
+  정합 확인 + measured 중복 실사. **판정: backend 어댑터 = 25~33줄 얇은 어댑터·추출할 공통 로직 없음**(각 줄이
+  family primitive 배선) = 경계가 이미 얇음 = 리팩터 불필요(no-op). 진짜 중복은 전역 boilerplate(CK 매크로 96파일·
+  rf() 26파일)뿐 — cosmetic·blast-radius 96파일이라 YAGNI로 안 정리. **★플러그인/레지스트리 신설 안 함**(실존
+  family 2개·가상 3호 추상화는 투기). 산출물 = "새 family 추가 가이드"(공짜로 받는 것 vs 써야 하는 것·규모)
+  = 공개 확장 문서 원본. **개입 비용 = paradigm 거리 비례**(same-paradigm 3호=0·new-family 2호/new-paradigm 4호=graph+config·커널 0 신규).
+- **spec(27b MTP)은 별도 경로(미정 유지)**: draft→verify 사이클로 스텝 구조가 plain과 상이 → serving_core 훅에
+  안 들어감(bench_serve_spec·serve_daemon_qwen_spec_online 별도). serving_backend.h [spec 확장점] 주석에 플러그인
+  설계만(가변 accept out-배열). ★**API가 spec을 어떻게 노출**할지 = 열린 설계. 무리한 통합 = 정확성 리스크(금지).
+- **경계 정립 결론(M6)**: plain backend 훅(ServingBackend 7메서드 / OnlineBackend 8메서드·§경계 규약)은 **안정
+  인터페이스로 확정**(불변식: device op backend 소유·슬롯 격리 bit-id·scheme 명시·config 계약). spec은 별도 추상화
+  (draft 커널 축) 여전히 미정 — M7+ 과제. **트리거 ②(backend 경계 안정) 충족 = M7(정립·공개) 착수 가능.**
 
 ## 2F — 자동화 갭 (개입 곡선의 남은 수동 지점)
 레시피 3모델 일괄(스냅샷)에서 실사용으로 드러난 파이프 자동화 갭 (`docs/recipe-schema.md` v1 후보 상세):
