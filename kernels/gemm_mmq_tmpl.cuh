@@ -107,6 +107,13 @@ static inline void launch_gemm_mmq_tmpl(const int8_t*X,const float*xs,const uint
 static inline void launch_gemm_mmq_w4a8_auto(const int8_t*X,const float*xs,const uint8_t*Wq,
                                              const void*sw,float*Y,int M,int N,int K,int scale_dtype=0,cudaStream_t st=0){
     static int sh = getenv("MMQ256") ? atoi(getenv("MMQ256")) : 0;
-    if(sh) launch_gemm_mmq_tmpl<256,64,64,4,2>(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);   // tall 타일(W 트래픽 절반)
-    else   launch_gemm_mmq_w4a8(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);                  // 128×128 원본
+    // MMQ256=1: 전부 256×64. MMQ256=2: per-(N,K) 최적 형상 룩업(27b 스윕 표 — bmbn-in-engine).
+    //   256×64는 large-N FFN(gate/up N=17408·down K=17408)만 최적, qkv(8192,5120)/o(5120,6144)는 128×128이 나음.
+    if(sh==2){
+        bool tall = (N>=16384) || (K>=16384);   // FFN 계열(N or K 큰 것) → 256×64, 그 외 → 128×128(qkv/o)
+        if(tall) launch_gemm_mmq_tmpl<256,64,64,4,2>(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);
+        else     launch_gemm_mmq_w4a8(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);
+    }
+    else if(sh==1) launch_gemm_mmq_tmpl<256,64,64,4,2>(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);   // 전부 256×64
+    else           launch_gemm_mmq_w4a8(X,xs,Wq,sw,Y,M,N,K,scale_dtype,st);                  // 128×128 원본
 }
