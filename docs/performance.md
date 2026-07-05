@@ -10,11 +10,16 @@
 | Qwen3.5-27B | GDN+MTP(spec) | B16 K7W2 (λ4, long-heavy) | ~51.7 t/s | ~0.34s | nreq60·seed42·w4a8+mtp_q4 |
 | Gemma4-31B | dense | B8 (★knee) | 36~38 t/s | ~0.14s | nreq48·maxlen384·w4a8 |
 | Qwen3.5-35B-A3B | MoE(256e top8)+GDN | B8 (지배점) | ~62.7 t/s | ~0.11s | nreq40·maxlen256·fused-MoE |
-| 26B-A4B | 병렬 MoE | single(raw) | 45.4 t/s (W4A8) | — | roofline 126.0의 36% · 서빙 파레토 미측정 |
+| 26B-A4B | 병렬 MoE | single-stream(HTTP) | **43~46 t/s** (W4A8) | — | active-width 수정 후 · raw 45.4 회복 |
 
 - single(비배치) decode: 27b 11.9 · gemma4 9.28 · 35b MoE 51.8 · **26b MoE 45.4 t/s(raw 커널)**. **single 고throughput은 물리적으로 불가**
   (대역폭 벽 — 배치로만 집계 throughput↑, per-request 지연은 그대로).
-- ★**26b "24% 미스터리" 해소(measured)**: 3-way HTTP 14.7 t/s는 raw 커널이 아니라 **서빙 스케줄러** 좌표. raw single = 45.4 t/s(roofline 126의 36% — MoE 정상 범위). 14.7/45.4 = 서빙이 raw의 32% → 3배 손실은 **서빙 스케줄러**(chunked prefill이 decode 차단, 35b MoE 동일 패턴), 커널 아님. → [`docs/moe26b-decode-diagnosis.md`](./moe26b-decode-diagnosis.md).
+- ★**26b 서빙 single-stream 갭 해소(measured, active-width)**: 3-way HTTP 14.7/18.2 t/s는 online 루프가 **single 요청도 Bmax=8 전폭 decode**(7슬롯 더미 → batch-8 per-slot 처리량만) 탓. 3점 격리(raw 45.4 / daemon-direct 18.2 / HTTP 18.4)로 HTTP·python 계층 오버헤드 ≈0 확정 → serving_online.h를 **active-width**(active 슬롯 폭만 decode)로 수정 → **single-stream 18.2 → 45.76 t/s(raw 완전 회복, 2.5×)**. bit-id 유지(test_moe26b_online PASS). → [`docs/moe26b-decode-diagnosis.md`](./moe26b-decode-diagnosis.md).
+
+### 회계 정의 (표기 통일 — 혼동 방지)
+- **raw**: bench decode-only 정상상태(1슬롯, prefill·IPC 제외). 커널 상한 척도.
+- **decode-only tpot**: HTTP 벽시계에서 TTFT 뺀 것 = (n−1)/(elapsed−TTFT). 수정 후 26b = 45.76(raw 근접).
+- **전체회계 t/s**: HTTP 벽시계 전체 ÷ 생성토큰(TTFT 포함) = 브라우저 체감. 짧은 생성일수록 TTFT 비중↑(26b 긴 생성 43.0, 짧은 32.7).
 - spec 곱(27b): chain K=3 **1.40×**(plain 대비)·tree K4W3 1.11×·plain 배칭 1.21×. **워크로드 민감**(accept 6.99 반복 ~ 3.5 산문).
 
 ## 2. roofline 달성률 (weight-이동 상한 대비 — 상한이지 예측 아님)

@@ -52,3 +52,26 @@ malloc은 큰 lever 아님. (batch에선 GPU 오버랩으로 이득 0이었고, 
   스케줄러. 35b MoE와 동일 패턴 → serving-scheduler 트랙(별도·이미 알려진 갭).
 - raw 36% → 더 올리려면 MoE 구조적 launch 감축(CUDA graph·device-fused 심화) — 별도.
 - 산출물: bench_gemma4 26B MoE 측정 경로(measured 인프라)·이 문서. 코드 정확성 변경 0(측정만·31B 무회귀).
+
+## 후속 규명 — 서빙 갭의 정확한 메커니즘 = online 루프 Bmax 전폭 (active-width로 해소)
+
+위 진단은 "서빙 경로가 범인"까지 맞았으나 메커니즘은 chunked prefill로 추정했다. 후속 측정으로 정확히 규명:
+
+**3점 격리(measured, 26b W4A8 warm decode-only tpot)**:
+| 측정점 | t/s | 의미 |
+|---|---|---|
+| raw bench (1슬롯) | 45.4 | 커널 상한 |
+| daemon-direct (python IPC + serving_online.h 루프) | 18.2 | ★여기서 60% 손실 |
+| HTTP full (+ 서버 threading) | 18.4 | HTTP·python 계층 ≈0 |
+
+- daemon-direct(18.2) ≈ HTTP(18.4) → HTTP/python 오버헤드 무시. 갭 전부 serving_online.h 루프.
+- **Bmax=1 재측정 = 43.1**(raw의 95%) → 확정: online 루프가 **single 요청도 Bmax=8 전폭 decode**(free 7슬롯 더미) → batch-8 per-slot 처리량(156/8≈19.5)만 나옴. TTFT/prefill/chunked 아님(긴 생성 TTFT 2.9%).
+- detok 격리: incremental HF decode 0.013 ms/token(무시).
+
+**수정(active-width)**: serving_online.h decode 폭 = 최대 active 슬롯+1(W). single(slot0만)=W1=1슬롯 커널=raw.
+gemma4 backend에 `s->B=Bmax` 추가(qwen 대칭 — 미설정 시 alloc Bmax 고정으로 stale 슬롯 illegal access).
+- **측정: single-stream 18.2 → 45.76 t/s(raw 완전 회복, 2.5×)**. HTTP 전체회계(브라우저) 18 → 43(긴 생성).
+- 정확성 불변: 각 슬롯 KV/state 독립 → active row는 W와 무관하게 bit-id(test_moe26b_online PASS).
+- batch(다 active)면 W=Bmax(무영향). qwen daemon도 s->B=Bmax 이미 설정이라 재빌드만으로 적용.
+
+★교훈: "서빙 스케줄러"라는 첫 추정(chunked prefill)은 메커니즘 오귀속이었고, **3점 격리 + Bmax 스윕**이 진짜 원인(고정폭 decode)을 규명. 측정-먼저가 추정을 교정한 사례.
