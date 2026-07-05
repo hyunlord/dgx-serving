@@ -210,7 +210,11 @@ def check_constraints(c: dict) -> dict:
                 qb, f"미지원 quant_bits={qb}")
     for k in ("tpot95_cap_s", "ttft95_cap_s"):
         if k in c:
-            out["accepted"][k] = f"튜너 목적함수 페널티로 반영(score = tok/s − 100·max(0, {k.split('_')[0]}−cap))"
+            metric = k.split("_")[0]
+            out["accepted"][k] = (
+                f"soft 페널티(기본) 또는 hard SLO 제약(autotune --slo-mode): "
+                f"기본은 score = tok/s − 100·max(0, {metric}−cap)(페널티만, cap 초과해도 순위 참여) / "
+                f"--slo-mode는 {metric}<=cap 만족 config 중 throughput 최대(위반 config는 -1e6 페널티로 배제)")
     for k in ("fixed_bmax", "fixed_K", "fixed_W"):
         if k in c:
             out["accepted"][k] = "탐색 공간에서 해당 축 고정"

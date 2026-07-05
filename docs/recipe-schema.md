@@ -23,6 +23,23 @@ claims:          # regime별 실측: measured.screen(nreq12)/final(nreq60) + 조
 provenance:      # source_artifact+sha256, trial DB 참조, 검증 프로토콜 통과 기록(full ISO 등)
 ```
 
+## SLO(tpot 상한) 표현 — v0 내 이미 수용 (신설 아님)
+
+`target.user_constraints.tpot95_cap_s`(위 §구조, 이미 존재)가 튜닝 시 SLO 상한으로 쓰인다 —
+`autotune.py score()`가 이 값을 **soft 페널티(기본)** 또는 **hard SLO 제약(`--slo-mode`)**으로
+소비한다(`tpot95<=cap`이면 throughput만으로 순위, 초과면 배제 — `plan.py check_constraints()` 참조).
+게다가 `claims`의 regime별 measured에 `tpot95`가 이미 기록되므로 "이 SLO엔 이 config"의 재료는
+v0에 이미 있다.
+
+**레시피가 SLO별 config를 담는 방법**(v0로 표현 가능 — 신규 스키마 불필요):
+- 현재도 regime 테이블(`when: λ, short_ratio`)의 승자 config에 처리량 최선과 tpot 최선이 다르면
+  `latency_alt`가 이미 병기된다(`autotune.py`의 `by_tpot`, phase2b 산출). SLO에 민감한 사용자는
+  `latency_alt`를 골라 쓰면 된다.
+- 또는 `claims`의 regime별 `tpot95`(measured)를 사용자가 직접 필터링해 원하는 SLO를 만족하는
+  regime/config를 골라도 된다(소비자 쪽 로직 — 스키마 변경 불필요).
+- 즉 "SLO별 config 선택"은 **regime + latency_alt 병기 + claims 필터링**으로 v0 안에서 이미
+  표현 가능하다. 명시적인 "SLO 축" 자체는 없지만(§v1 후보) 없어도 동작한다.
+
 ## 로드 검증 순서 (`recipe.py verify` — 맹목 적용 금지)
 
 1. **장비 지문 대조**: toolkit 필수 caps 미충족 → **거부**(hard fail). 이름/대역폭/메모리 오차 초과 →
@@ -60,6 +77,10 @@ provenance:      # source_artifact+sha256, trial DB 참조, 검증 프로토콜 
   시험으로 자동 생성, GB10 수동본 대조 PASS. `verify --device <auto.json>`로 그대로 사용 가능.
 - 정책이 정적 룩업(요청-경계 핫스위치·온라인 컨트롤러는 스킴 경계 해결 후).
 - 서명(무결성)은 provenance sha256 수준(암호학적 서명은 배포 채널 정할 때).
+- **명시적 SLO regime 축**(`when.tpot_target_s`): 지금은 SLO별 config가 `latency_alt` 병기 /
+  `claims.tpot95` 필터링으로 암묵적으로만 표현된다(위 §SLO 표현 참조 — 동작은 하나 자기서술은 아님).
+  v1 후보: regime 테이블의 `when`에 `tpot_target_s`(hard SLO 상한)를 명시 축으로 추가해 정책이
+  "이 SLO엔 이 config"를 자기서술하게. (기록만 — 이번 구현 X.)
 
 ## v1 후보 — 3모델 일괄 스냅샷에서 실사용으로 드러난 한계 (기록만, 이번 구현 X)
 

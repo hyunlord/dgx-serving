@@ -5,7 +5,8 @@
 - config-주도: 커널 불변, bench_serve_spec의 argv/env만 조작.
 - 메모리 사전 필터: trial 실행 전 admission 예산 계산(bench와 같은 공식) — 초과 config는
   실행 없이 prune(GB10 unified oversubscribe = 시스템 전체 다운 전례).
-- 결정적 목적함수: 같은 seed/trace(controlled), λ4 단일점, tok/s 최대화 + tpot95 soft 제약.
+- 결정적 목적함수: 같은 seed/trace(controlled), λ4 단일점, tok/s 최대화 + tpot95 soft 페널티(기본).
+  --slo-mode: tpot95<=tpot_cap을 hard SLO 제약으로 승격("SLO 제약 하 throughput 최대", score() 참조).
 - ISO 2단: trial은 성능만, 최종 best만 full ISO(12/12) — 실패 시 무효(차점 승격은 수동 판단).
 - BO 코어 재발명 금지: Optuna TPE + sqlite(중단·재개). 우리 몫 = 래퍼/필터/게이트/아티팩트.
 
@@ -112,9 +113,23 @@ def run_bench(mp: dict, bmax: int, K: int, W: int, lam: float, nreq: int, seed: 
     return res, out
 
 
-def score(res: dict, tpot_cap: float) -> float:
-    """tok/s 최대화 + tpot95 soft 페널티(초과 1ms당 -0.1 tok/s 스케일 → 초과 0.1s = -10)."""
-    return res["tok_s"] - max(0.0, res["tpot95"] - tpot_cap) * 100.0
+def score(res: dict, tpot_cap: float, slo_mode: bool = False) -> float:
+    """목적함수: 페널티(soft, 기본) vs 제약(hard, --slo-mode).
+
+    slo_mode=False(기본, 무회귀): tok/s 최대화 + tpot95 soft 페널티
+      (초과 1ms당 -0.1 tok/s 스케일 → 초과 0.1s = -10). tpot_cap을 넘어도 여전히 순위에 참여
+      (넘을수록 감점만 커짐) — "throughput 최대(tpot는 페널티)".
+    slo_mode=True(--slo-mode): tpot_cap을 hard SLO 상한으로 취급 — "SLO 제약 하 throughput 최대"
+      로 정식화. tpot95<=tpot_cap(제약 만족)이면 tok_s 그대로(그 안에서는 throughput만으로 순위) —
+      제약 위반이면 큰 고정 페널티(-1e6)로 feasible 후보 전부보다 아래로 밀어내되, 초과분으로
+      infeasible 후보끼리도 tpot95가 낮은 쪽을 우선하도록 순위를 매긴다.
+    """
+    if not slo_mode:
+        return res["tok_s"] - max(0.0, res["tpot95"] - tpot_cap) * 100.0
+    excess = res["tpot95"] - tpot_cap
+    if excess <= 0.0:
+        return res["tok_s"]
+    return res["tok_s"] - 1e6 - excess * 100.0
 
 
 # ---------- warm 서버 (Phase 2): 모델 1회 로드, stdin trial 루프 ----------
@@ -241,7 +256,7 @@ def make_objective(mp, dp, args, cache, server=None):
             cache[key] = res
         for k in ("tok_s", "tpot95", "accept", "avgB", "wall_s"):
             trial.set_user_attr(k, res[k])
-        s = score(res, args.tpot_cap)
+        s = score(res, args.tpot_cap, args.slo_mode)
         envtag = " ".join(f"{k}={v}" for k, v in env_key) if env_key else ""
         print(f"  trial#{trial.number}: B{bmax} K{K} W{W} {envtag} -> {res['tok_s']:.1f} tok/s "
               f"tpot {res['tpot95']:.3f} accept {res['accept']:.2f} score {s:.1f}", flush=True)
@@ -296,7 +311,7 @@ def run_phase2b(mp, dp, args):
                     _cache[key] = res
                 for k in ("tok_s", "tpot95", "accept", "avgB"):
                     trial.set_user_attr(k, res[k])
-                s = score(res, args.tpot_cap)
+                s = score(res, args.tpot_cap, args.slo_mode)
                 print(f"  [{tag}] #{trial.number}: B{bmax} K{K} W{W} mw={mw} -> {res['tok_s']:.1f} "
                       f"tpot {res['tpot95']:.3f} score {s:.1f}", flush=True)
                 return s
@@ -325,7 +340,9 @@ def run_phase2b(mp, dp, args):
                 finals.append({"params": p, "screen": {k: t.user_attrs.get(k) for k in ("tok_s", "tpot95")},
                                "nreq60": {k: fin.get(k) for k in ("tok_s", "tpot95", "accept", "avgB")}})
                 print(f"[p2b {tag}] 확정 {p}: nreq60 {fin.get('tok_s')} tpot {fin.get('tpot95')}", flush=True)
-            finals.sort(key=lambda f: (f["nreq60"]["tok_s"] or 0) - max(0.0, (f["nreq60"]["tpot95"] or 9) - args.tpot_cap) * 100, reverse=True)
+            finals.sort(key=lambda f: score({"tok_s": f["nreq60"]["tok_s"] or 0,
+                                              "tpot95": f["nreq60"]["tpot95"] or 9},
+                                             args.tpot_cap, args.slo_mode), reverse=True)
             # 간이 파레토: throughput 최선 + tpot 최선(다르면) 병기
             by_tpot = min(finals, key=lambda f: f["nreq60"]["tpot95"] or 9)
             table.append({"regime": rg, "best": finals[0],
@@ -405,7 +422,7 @@ def run_warmstart_ab(mp, dp, args):
             res = cache[key]
             for k in ("tok_s", "tpot95"):
                 trial.set_user_attr(k, res[k])
-            return score(res, args.tpot_cap)
+            return score(res, args.tpot_cap, args.slo_mode)
         return objective
 
     arms = {}
@@ -445,7 +462,11 @@ def main():
     ap.add_argument("--seed", type=int, default=42, help="trace seed(목적함수 고정 — controlled)")
     ap.add_argument("--lam", type=float, default=4.0)
     ap.add_argument("--nreq", type=int, default=40)
-    ap.add_argument("--tpot-cap", type=float, default=0.35)
+    ap.add_argument("--tpot-cap", type=float, default=0.35,
+                     help="soft 모드(기본): 페널티 기준선. --slo-mode: hard SLO 상한(tpot95<=cap)")
+    ap.add_argument("--slo-mode", action="store_true",
+                     help="hard SLO 제약 모드: tpot95<=tpot-cap 만족 config 중 throughput 최대"
+                          "(기본은 soft 페널티 — 무회귀, score() 참조)")
     ap.add_argument("--study", default=None)
     ap.add_argument("--sampler-seed", type=int, default=7)
     ap.add_argument("--phase2", action="store_true", help="env 축 확장 + warm 서버 + 상위3 검증")
@@ -506,7 +527,7 @@ def main():
     done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     print(f"[autotune] {study_name}: 기존 완료 {done}, 목표 {args.trials} trials "
           f"(seed={args.seed} λ={args.lam} nreq={args.nreq} tpot_cap={args.tpot_cap} "
-          f"phase2={args.phase2})", flush=True)
+          f"slo_mode={args.slo_mode} phase2={args.phase2})", flush=True)
     server = WarmServer(mp) if args.phase2 else None
     try:
         study.optimize(make_objective(mp, dp, args, cache, server), n_trials=args.trials)
@@ -563,7 +584,9 @@ def main():
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "device_profile": dp, "model_profile": mp,
         "objective": {"lam": args.lam, "nreq": args.nreq, "seed": args.seed,
-                      "tpot_cap": args.tpot_cap, "metric": "tok_s - 100*max(0,tpot95-cap)",
+                      "tpot_cap": args.tpot_cap, "slo_mode": args.slo_mode,
+                      "metric": ("hard SLO: tok_s if tpot95<=cap else tok_s-1e6-100*excess"
+                                 if args.slo_mode else "soft penalty: tok_s - 100*max(0,tpot95-cap)"),
                       "phase2_axes": list(P2_ENV_AXES) if args.phase2 else [],
                       "excluded_axes": {"compile_time": ["SMAX", "GdnStateT", "MMQ tile"],
                                         "no_knob": ["chunk size", "canonical M boundary", "splitk gate"],
