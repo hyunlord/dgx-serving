@@ -1,0 +1,101 @@
+meta:
+  schema: dgx-recipe/v0
+  created: '2026-07-06T02:02:31'
+  tool: dgx-serving M6 same-family 조립 (Gemma4 12B plain, 5호)
+  engine_commit: d8e9021
+  note: |
+    Gemma4 12B는 31B와 same-family dense(dims만 작음: L48 H3840 FFN15360 NQ16 NKV8 hd256).
+    M6 확장 가이드 실전 — 신규 커널 0(gemma4 graph 재사용·config만). MTP 부재 → plain 서빙(spec 없음).
+    scheme=W4A8 + batch dispatch(SMAX 버킷). bit-id는 버킷 내에서만(경계=스킴 변경).
+    ★튜닝 결과: Bmax=8이 전 regime 최적(throughput plateau ~96 tok/s@c1tok, B16은 λ16에서 +2.4%에
+    tpot 2× — 무가치). 저부하는 B8이 throughput·tpot 모두 우위(B16=underfill 역효과).
+target:
+  device:
+    name: GB10
+    gpu_probe: NVIDIA GB10
+    bandwidth_gbps: 273
+    mem_total_gb: 128
+    unified_memory: true
+    toolkit_required:
+      cp_async: true
+      mma_int8: true
+      fp4_mma: false
+    tolerance:
+      bandwidth_pct: 10
+      mem_total_pct: 10
+  model:
+    id: Gemma4-12B-it
+    params_b: 11.6
+    gdn: false
+    tied_lm_head: true
+    moe: false
+    mtp: false
+    quant: w4a8
+  user_constraints:
+    quant_bits: 4
+    tpot95_cap_s: 0.35
+settings:
+  policy:
+    type: static_regime_lookup
+    note: |
+      plain 서빙(spec 사이클 없음) — regime=λ만(gen mix 70%short/30%long 고정, short_ratio 축 미스윕:
+      한계로 기록). tpot95 cap 0.35s 내 throughput-max로 Bmax 선택. 측정상 Bmax=8이 전 regime을 지배
+      (저부하 B16=역효과, 고부하 B16=+2.4%에 tpot 2×) → 단일 Bmax=8.
+    regimes:
+    - when:
+        lam: 1.0
+        short_ratio: 0.7
+      config:
+        bmax: 8
+      backend_env: {}
+    - when:
+        lam: 4.0
+        short_ratio: 0.7
+      config:
+        bmax: 8
+      backend_env: {}
+    - when:
+        lam: 16.0
+        short_ratio: 0.7
+      config:
+        bmax: 8
+      backend_env: {}
+  backend:
+    engine_bin: tools/bench_serve_gemma4
+    uq: 2
+    fixed_env: {}
+    quant_path:
+      prefill: q4(gemm_tiled) or chunked(c-ch, W4A8 bit-id)
+      decode: w4a8(sb dispatch)
+    note: |
+      decode W4A8(sb, single 23.3 t/s=roofline 40.4의 57.6%) · 프리필 q4 GEMM 혼용.
+      c-ch(chunked prefill)이 c1tok 대비 +2~4% throughput(순수 스케줄링, W4A8 bit-id 게이트 통과) —
+      claims는 c1tok(historical claim 모드=verify 재현 기준). c-ch은 현 서빙 개선분.
+claims:
+- regime: {lam: 1.0, short_ratio: 0.7}
+  config: {bmax: 8}
+  scheme: w4a8+sb(SMAX8 버킷, B≤8) — bit-id within bucket
+  measured:
+    screen: {tok_s: 64.5, tpot95: 0.054, conditions: {nreq: 48, seed: 42, maxlen: 384, mode: c1tok}}
+    final: {tok_s: 64.5, tpot95: 0.054, conditions: {nreq: 48, seed: 42, maxlen: 384, mode: c1tok}}
+- regime: {lam: 4.0, short_ratio: 0.7}
+  config: {bmax: 8}
+  scheme: w4a8+sb(SMAX8 버킷, B≤8) — bit-id within bucket
+  measured:
+    screen: {tok_s: 93.5, tpot95: 0.054, conditions: {nreq: 48, seed: 42, maxlen: 384, mode: c1tok}}
+    final: {tok_s: 93.5, tpot95: 0.054, conditions: {nreq: 48, seed: 42, maxlen: 384, mode: c1tok}}
+- regime: {lam: 16.0, short_ratio: 0.7}
+  config: {bmax: 8}
+  scheme: w4a8+sb(SMAX8 버킷, B≤8) — bit-id within bucket
+  measured:
+    screen: {tok_s: 96.3, tpot95: 0.054, conditions: {nreq: 48, seed: 42, maxlen: 384, mode: c1tok}}
+    final: {tok_s: 96.3, tpot95: 0.054, conditions: {nreq: 48, seed: 42, maxlen: 384, mode: c1tok}}
+verification:
+  scope: plain 서빙(spec 비교 없음 — MTP 부재). context maxlen=384(sliding 링버퍼 전 짧은 범위).
+  golden: W4A8 op-level fp32 rel 1.44e-2(<1.5e-2) + full-depth argmax ALL(test_gemma4 uq=2). q4 rel 7.5e-4.
+  engine_bin: tools/bench_serve_gemma4 (dummy rope 타이밍 — 값 무관, 현실 길이). warm 프로토콜 필수.
+  caveats: |
+    - short_ratio 축 미스윕(gen mix 고정 70/30) — regime은 λ만.
+    - avgB<Bmax(λ16 B8서 6.8) → 서빙 aggr tok/s(96)는 이론 raw batch보다 낮음(정직).
+    - 긴 context(>1024)는 sliding KV 링버퍼 미구현으로 범위 밖.
+    - single decode 23.3 t/s(W4A8 sb) vs llama.cpp plain(Q4_K_M) 26.8 t/s = 1.15× 갭(near-parity, spec OFF 공정).

@@ -9,10 +9,11 @@
 |---|---|---|---|---|---|
 | Qwen3.5-27B | GDN+MTP(spec) | B16 K7W2 (λ4, long-heavy) | ~51.7 t/s | ~0.34s | nreq60·seed42·w4a8+mtp_q4 |
 | Gemma4-31B | dense | B8 (★knee) | 36~38 t/s | ~0.14s | nreq48·maxlen384·w4a8 |
+| Gemma4-12B | dense (31B same-family) | B8 (전 regime 지배) | ~96 t/s (aggr) | ~0.05s | nreq48·maxlen384·w4a8·c1tok |
 | Qwen3.5-35B-A3B | MoE(256e top8)+GDN | B8 (지배점) | ~62.7 t/s | ~0.11s | nreq40·maxlen256·fused-MoE |
 | 26B-A4B | 병렬 MoE | single-stream(HTTP) | **43~46 t/s** (W4A8) | — | active-width 수정 후 · raw 45.4 회복 |
 
-- single(비배치) decode: 27b 11.9 · gemma4 9.28 · 35b MoE 51.8 · **26b MoE 45.4 t/s(raw 커널)**. **single 고throughput은 물리적으로 불가**
+- single(비배치) decode: 27b 11.9 · gemma4-31b 9.28 · **gemma4-12b 23.3** · 35b MoE 51.8 · **26b MoE 45.4 t/s(raw 커널)**. **single 고throughput은 물리적으로 불가**
   (대역폭 벽 — 배치로만 집계 throughput↑, per-request 지연은 그대로).
 - ★**26b 서빙 single-stream 갭 해소(measured, active-width)**: 3-way HTTP 14.7/18.2 t/s는 online 루프가 **single 요청도 Bmax=8 전폭 decode**(7슬롯 더미 → batch-8 per-slot 처리량만) 탓. 3점 격리(raw 45.4 / daemon-direct 18.2 / HTTP 18.4)로 HTTP·python 계층 오버헤드 ≈0 확정 → serving_online.h를 **active-width**(active 슬롯 폭만 decode)로 수정 → **single-stream 18.2 → 45.76 t/s(raw 완전 회복, 2.5×)**. bit-id 유지(test_moe26b_online PASS). → [`docs/moe26b-decode-diagnosis.md`](./moe26b-decode-diagnosis.md).
 
@@ -29,9 +30,13 @@
 | 27b single non-spec | 19.0 | 11.9 | 62.5% |
 | 27b spec serving (B16 K7W2) | 304.5 | 51.7 | 17.0% |
 | gemma4-31b single | 17.4 | 9.28 | 53.3% |
+| gemma4-12b single (W4A8 sb) | 40.4 | 23.3 | 57.6% |
 | 35b-a3b MoE single | 165.3 | 51.8 | 29.8% (MoE 구조적으로 낮음) |
 
 하회 요인(measured): batch=GDN state per-slot 운반, spec=draft/MTP 오버헤드+accept<천장, MoE=토큰당 다수 expert-gemv launch.
+
+> 상한 basis 주의: 27b/31b 행은 273(nominal)기준 historical 좌표. gemma4-12b 행은 **255.8 GB/s(probe 실측 read) + active-bytes**
+> (k_eq_v V-proj 공유 반영 → bench_gemma4 config-주도 산출, 하드코딩 제거). 같은 basis로 31b는 15.7이 되나 historical 표기 유지.
 
 ## 3. 정직 벤치 — vs llama.cpp (Gemma4-26B-A4B, 공정 2-way, HTTP, warm, ~q4급)
 
@@ -49,6 +54,21 @@
   **커널 성숙도 갭**(엔진 천장 아님 — 27b dense는 roofline 62.5% 달성). 남은 lever = per-token 커널 속도(FP4·fused·tiled).
 - **배칭은 작동**: dgx 연속 배칭 N=1→8 near-linear 5.5×(14.7→80.6)·초과구독을 큐잉으로 흡수(크래시 없음).
 - vLLM 3rd leg = 후속(GB10 구동 실증됨·26b 체크포인트+docker HTTP만 남음, 정직히 범위 밖).
+
+### 3b. 정직 벤치 — vs llama.cpp (Gemma4-12B, **plain vs plain**, single decode, warm)
+
+★**회계 명시(중요)**: 아래는 **spec OFF plain끼리** 공정 비교다. llama의 12B **speculative 포함 66.9 t/s와 직접 비교 금지**
+(plain roofline 40.4 위 = spec 없인 물리 불가). llama-bench(tg64)=speculative 없는 순수 decode.
+
+| 척도 | dgx plain (W4A8 sb) | llama plain (Q4_K_M, spec OFF) | dgx/llama |
+|---|---|---|---|
+| single decode | 23.3 t/s | 26.8 t/s (llama-bench tg64, ngl99) | **0.87×** (1.15× 느림) |
+| roofline 달성률 | 57.6% | 66.4% (동일 40.4 상한) | — |
+
+- **near-parity plain(measured)** — 26b MoE(0.28~0.48×)와 대조적으로 12B dense는 llama plain에 **1.15× 갭**까지 근접.
+- **원인(정직)**: 12B는 27b와 same-family dense W4A8 gemv 경로(성숙 자산) 재사용 → 남은 갭=작은 잔여 커널 성숙도(fused/tiled).
+  spec 곱(별도 lever)은 Gemma MTP 부재로 이번 미적용 — draft-spec 트랙에서 추가 가능(정직).
+- 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
 
 ## 4. 대역폭 지형도 (측정 결론 — "이 장비에서 가능한 것")
 

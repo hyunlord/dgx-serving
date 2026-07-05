@@ -114,9 +114,11 @@ int main(int argc,char**argv){
     //   batch-path(gemm_batch M=1)와 달리 single은 gemv_w4a8(W4A8)/gemm_tiled(q4). 27b 11.9/62.5%는 W4A8 gemv.
     //   q4=검증된 경로. W4A8=27b와 동일 gemv족(perf-preview — gemma4 W4A8 correctness golden 미검증, 성능만).
     printf("\n  === single-path decode (n_past=0 시작 matmul 바운드) ===\n");
-    // 26B roofline 상한(active-bytes÷255.8GB/s) — 헤드라인 달성률 기준. 31B(dense)는 17.4.
-    const double single_roof = is_moe ? moe_single_roofline_ts(c,255.8) : 17.4;
-    if(is_moe) printf("  ★26B MoE roofline 상한: %.1f t/s (active-bytes÷255.8GB/s, 병렬 dense FFN 포함)\n", single_roof);
+    // roofline 상한(active-bytes÷255.8GB/s) — 헤드라인 달성률 기준. config 주도(dense=E/K=0이면 헬퍼가
+    //   lm_head+attn+3·H·FFN로 자동 축소 → dense weight-per-token 정확). 하드코딩 금지(모델별 자동 산출).
+    const double single_roof = moe_single_roofline_ts(c,255.8);
+    printf("  ★%s roofline 상한: %.1f t/s (active-bytes÷255.8GB/s%s)\n",
+           is_moe?"MoE":"dense", single_roof, is_moe?", 병렬 dense FFN 포함":"");
     for(int sq : std::vector<int>{1,2}){   // 1=q4(검증), 2=W4A8(perf-preview)
         G4DecodeState st=alloc_g4_decode_state(c,MAXLEN); reset_g4_decode_state(st);
         int tok=1; int* d1; CK(cudaMalloc(&d1,4)); CK(cudaMemcpy(d1,&tok,4,cudaMemcpyHostToDevice));
