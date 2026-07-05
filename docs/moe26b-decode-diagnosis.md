@@ -1,0 +1,54 @@
+# 26B-A4B MoE decode "24% 미스터리" 진단 — measured가 전제를 교정
+
+> 가설: 3-way에서 26B single 14.7 t/s = roofline ~24%로 비정상 저조 → 26B decode 커널이 튜닝 안 됨(malloc churn 등).
+> ★measured 결론: **24%는 raw 커널이 아니라 서빙 스케줄러 좌표.** raw 커널 single decode는 이미 **36%**(정상 MoE 범위).
+
+## STEP 1 — 측정 인프라 (bench에 26B MoE decode 추가)
+
+기존 `bench_gemma4`는 gemma4_moe.cu 미링크 → 26B MoE single decode raw 측정 불가(3-way 14.7은 HTTP 서버=스케줄러 포함).
+`tools/bench_gemma4.cu`에 `is_moe`(num_experts>0) 분기 추가 + `gemma4_moe.cu` 링크 + active-bytes roofline 계산.
+31B(num_experts=0)는 else로 기존 경로 불변(additive·무회귀).
+
+## STEP 2 — baseline (measured, 26B W4A8, warm, ngen=64)
+
+| 항목 | measured | 비고 |
+|---|---|---|
+| **single decode (W4A8)** | **45.43 t/s** | roofline 126.0의 **36.1%** |
+| single decode (q4) | 41.50 t/s | 32.9% |
+| batch B1/B8/B16 aggr | 45.8 / 156 / 179 t/s | amortization 작동 |
+| prefill (B=1, 256tok) | 171.55 t/s | 참고치 |
+| **roofline 상한** | **126.0 t/s** | active-bytes÷255.8GB/s (dense∥MoE 병렬 포함) |
+
+★roofline 상한이 앞선 추정(50+)이 아니라 **126.0**: 26B는 dense FFN + 8 expert **병렬**(dense∥MoE 제3 구조)이라
+active-bytes가 더 큼(H2816·dense FFN2112·moe 8×704). 정확 계산은 bench `moe_single_roofline_ts`.
+
+## ★핵심 반전 (measured — 프롬프트 전제 교정)
+
+- **3-way HTTP 14.7 t/s ≠ raw 커널.** raw single = **45.4 t/s**. **14.7 / 45.4 = 서빙이 raw의 32%.**
+- 즉 "3배가 테이블에 남았다"의 진짜 범인 = **서빙 스케줄러**(HTTP 온라인 배칭 경로), 커널 아님.
+  → 35b MoE에서 이미 measured한 패턴과 **동일**(서빙 63 ≪ raw 195 = chunked prefill이 decode 차단·단순 continuous 스케줄러).
+- raw 36%는 27B dense 62.5%보다 낮으나 **MoE 구조적**(토큰당 640 expert-gemv launch·tiny 704폭 matmul·dense∥MoE 이중 MLP) —
+  이미 알려진 MoE 낮은 달성률(24.2~29.8% 기록과 정합, 여기선 fused로 36%). **24% 아님**.
+
+## STEP B — 소거 후보 산술 판정 (measured-먼저)
+
+프롬프트가 지목한 후보들을 measured 산술로 사전 판정:
+
+| 후보 | 산술 | 판정 |
+|---|---|---|
+| **persistent scratch**(malloc/free churn) | single 22ms/token(1408ms÷64) 중 22 malloc + 22 free ≈ 220us/token = **~1%** | 24% lever 아님(예상 소폭). 27B가 이미 쓰는 `ws()` 이식은 가능하나 이득 미미 예상 |
+| dense∥MoE 중복 read | roofline 이미 병렬 포함(126)·달성률 36%라 과잉 read 아님 | 범인 아님 |
+| 서빙 스케줄러 | raw 45.4 → HTTP 14.7 = **-68%** | ★진짜 범인(별도 트랙) |
+
+★"malloc churn이 24% 범인" 가설은 **measured 산술로 약화**(single 커널 22ms 중 malloc ~1%). raw가 이미 36%면
+malloc은 큰 lever 아님. (batch에선 GPU 오버랩으로 이득 0이었고, single도 산술상 ~1% — persistent scratch는
+정확성 위험 대비 이득 낮아 보류. 원하면 measured 확인 가능하나 24% 답 아님.)
+
+## 판정 / 다음
+
+- **"24% 미스터리" 해소(measured): raw 커널은 36%(MoE 정상), 24%(14.7)는 서빙 스케줄러 오버헤드.**
+  커널 튜닝(persistent scratch 등)은 24% lever가 아님 — measured가 프롬프트 전제를 교정.
+- **진짜 lever = 서빙 스케줄러**(raw 45.4 → HTTP 14.7, -68%): chunked prefill이 decode 차단·단순 continuous
+  스케줄러. 35b MoE와 동일 패턴 → serving-scheduler 트랙(별도·이미 알려진 갭).
+- raw 36% → 더 올리려면 MoE 구조적 launch 감축(CUDA graph·device-fused 심화) — 별도.
+- 산출물: bench_gemma4 26B MoE 측정 경로(measured 인프라)·이 문서. 코드 정확성 변경 0(측정만·31B 무회귀).

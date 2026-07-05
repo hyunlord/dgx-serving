@@ -132,8 +132,8 @@ tools/serve_daemon_qwen_spec_online: tools/serve_daemon_qwen_spec_online.cu mode
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_qwen_spec_online.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@ -lpthread
 
 # M4 STEP B: Gemma4 성능 벤치(single/batch decode t/s + prefill, roofline 대조). 사용법: ./tools/bench_gemma4 <w> [uq] [ctx] [ngen] [B..]
-tools/bench_gemma4: tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
+tools/bench_gemma4: tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu models/gemma4_moe.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu models/gemma4_moe.cu runtime/weights_gemma4.cu -o $@
 
 # M4 STEP C: Gemma4 plain 서빙 튜닝 스윕(λ×Bmax, dummy rope, 메모리 필터). 사용법: ./tools/bench_serve_gemma4 <w> [uq] [nreq] [seed] [pmax] [maxlen] [B..] -- [λ..]
 tools/bench_serve_gemma4: tools/bench_serve_gemma4.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)

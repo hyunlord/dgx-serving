@@ -10,10 +10,11 @@
 | Qwen3.5-27B | GDN+MTP(spec) | B16 K7W2 (λ4, long-heavy) | ~51.7 t/s | ~0.34s | nreq60·seed42·w4a8+mtp_q4 |
 | Gemma4-31B | dense | B8 (★knee) | 36~38 t/s | ~0.14s | nreq48·maxlen384·w4a8 |
 | Qwen3.5-35B-A3B | MoE(256e top8)+GDN | B8 (지배점) | ~62.7 t/s | ~0.11s | nreq40·maxlen256·fused-MoE |
-| 26B-A4B | 병렬 MoE | — | (서빙 파레토 미측정) | — | roofline 상한 139.7 t/s만 |
+| 26B-A4B | 병렬 MoE | single(raw) | 45.4 t/s (W4A8) | — | roofline 126.0의 36% · 서빙 파레토 미측정 |
 
-- single(비배치) decode: 27b 11.9 · gemma4 9.28 · 35b MoE 51.8 t/s. **single 고throughput은 물리적으로 불가**
+- single(비배치) decode: 27b 11.9 · gemma4 9.28 · 35b MoE 51.8 · **26b MoE 45.4 t/s(raw 커널)**. **single 고throughput은 물리적으로 불가**
   (대역폭 벽 — 배치로만 집계 throughput↑, per-request 지연은 그대로).
+- ★**26b "24% 미스터리" 해소(measured)**: 3-way HTTP 14.7 t/s는 raw 커널이 아니라 **서빙 스케줄러** 좌표. raw single = 45.4 t/s(roofline 126의 36% — MoE 정상 범위). 14.7/45.4 = 서빙이 raw의 32% → 3배 손실은 **서빙 스케줄러**(chunked prefill이 decode 차단, 35b MoE 동일 패턴), 커널 아님. → [`docs/moe26b-decode-diagnosis.md`](./moe26b-decode-diagnosis.md).
 - spec 곱(27b): chain K=3 **1.40×**(plain 대비)·tree K4W3 1.11×·plain 배칭 1.21×. **워크로드 민감**(accept 6.99 반복 ~ 3.5 산문).
 
 ## 2. roofline 달성률 (weight-이동 상한 대비 — 상한이지 예측 아님)
