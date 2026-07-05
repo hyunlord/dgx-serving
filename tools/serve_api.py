@@ -44,9 +44,9 @@ def load_and_verify_recipe(recipe_path, device_json, model_json):
 # ★직렬화 안 함: 동시 HTTP 스레드가 각자 태그드 요청을 daemon에 주입 → daemon 배치 루프가 연속 배칭.
 #   stdin 쓰기만 락(라인 원자성). stdout은 단일 reader 스레드가 읽어 req_id로 연결별 큐에 분배(경합 방지).
 class OnlineDaemon:
-    def __init__(self, cmd):                               # cmd = [daemon_bin, args...] (모델별 레이아웃은 main이 구성)
+    def __init__(self, cmd, env=None):                     # cmd = [daemon_bin, args...] · env = STOP_IDS 등 주입(EOS 종료)
         if not os.path.exists(cmd[0]): sys.exit(f"[serve_api] daemon 바이너리 없음: {cmd[0]} (make {os.path.relpath(cmd[0],REPO)})")
-        self.p = subprocess.Popen(cmd,
+        self.p = subprocess.Popen(cmd, env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
         self.wlock = threading.Lock()                      # stdin 쓰기 직렬화(요청 라인 원자성)
         self.idlock = threading.Lock(); self._next = 0     # req_id 할당 카운터
@@ -62,17 +62,21 @@ class OnlineDaemon:
         """단일 스레드: daemon stdout 인터리브 출력 → req_id로 연결별 큐 분배. 'END'=완료 센티넬(None)."""
         for line in self.p.stdout:
             parts = line.split()
-            if len(parts) != 2: continue
+            if len(parts) < 2: continue
             rid = int(parts[0])
             with self.qlock: q = self.queues.get(rid)
             if q is None: continue                         # 이미 정리된 요청(방어)
-            q.put(None if parts[1] == "END" else int(parts[1]))
+            if parts[1] == "END":                          # "rid END <reason>"(stop/length) — daemon 권위 종료 사유
+                q.put(("__END__", parts[2] if len(parts) > 2 else "stop"))
+            elif len(parts) == 2:                          # "rid <tok>"
+                q.put(int(parts[1]))
         # daemon 종료(EOF): 대기 중 연결에 센티넬 방출(무한 대기 방지)
         with self.qlock:
-            for q in self.queues.values(): q.put(None)
+            for q in self.queues.values(): q.put(("__END__", "length"))
 
-    def stream(self, ids, max_tokens):
-        """token-ID 요청 → 태그드 비동기 주입 → 생성 token-ID를 큐에서 순서대로 yield(스트리밍)."""
+    def stream(self, ids, max_tokens, out=None):
+        """token-ID 요청 → 태그드 비동기 주입 → 생성 token-ID를 큐에서 순서대로 yield(스트리밍).
+        out(dict, 선택): 종료 시 out['finish_reason']에 daemon 권위 사유(stop=EOS / length=max_tokens/maxlen) 기록."""
         with self.idlock: rid = self._next; self._next += 1
         q = queue.Queue()
         with self.qlock: self.queues[rid] = q
@@ -81,7 +85,9 @@ class OnlineDaemon:
         try:
             while True:
                 tok = q.get()                              # reader 스레드가 넣을 때까지 블록(다른 요청은 병행)
-                if tok is None: break                      # END 센티넬
+                if isinstance(tok, tuple) and tok[0] == "__END__":  # 종료 센티넬(사유 포함)
+                    if out is not None: out["finish_reason"] = tok[1]
+                    break
                 yield tok
         finally:
             with self.qlock: self.queues.pop(rid, None)
@@ -165,13 +171,14 @@ class Handler(BaseHTTPRequestHandler):
         cid = ("chatcmpl-" if chat else "cmpl-")+uuid.uuid4().hex[:24]; created = int(time.time())
         obj = "chat.completion.chunk" if (chat and stream) else ("chat.completion" if chat else "text_completion")
         t0 = time.time(); t_first = None; acc = []; prev_text = ""
+        rinfo = {"finish_reason": "length"}                # daemon이 END 사유(stop=EOS/length) 기록 → 권위 finish_reason
         if stream:
             self.send_response(200); self.send_header("Content-Type","text/event-stream")
             self.send_header("Cache-Control","no-cache"); self.end_headers()
             if chat:                                       # chat 관례: 첫 청크에 role
                 self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
                            "choices":[{"delta":{"role":"assistant"},"index":0,"finish_reason":None}]})
-            for tid in self.daemon.stream(ids, max_tokens):
+            for tid in self.daemon.stream(ids, max_tokens, rinfo):
                 if t_first is None: t_first = time.time()
                 acc.append(tid)
                 cur = self.tok.decode(acc, skip_special_tokens=True)
@@ -181,18 +188,18 @@ class Handler(BaseHTTPRequestHandler):
                            "choices":[{**ch,"index":0,"finish_reason":None}]})
             # 종료 청크: finish_reason + usage + timings(메트릭 — 마지막 이벤트에 포함)
             tm = self._timings(len(ids), acc, t0, t_first)
-            fr = "length" if len(acc) >= max_tokens else "stop"   # daemon은 max_tokens/maxlen 캡까지(EOS 조기중단 없음)
+            fr = rinfo["finish_reason"]                    # daemon 권위(stop=EOS 만남 / length=max_tokens·maxlen)
             fin = ({"delta":{}} if chat else {"text":""})
             self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
                        "choices":[{**fin,"index":0,"finish_reason":fr}], "usage":tm["usage"], "timings":tm["timings"]})
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
         else:
-            for tid in self.daemon.stream(ids, max_tokens):
+            for tid in self.daemon.stream(ids, max_tokens, rinfo):
                 if t_first is None: t_first = time.time()
                 acc.append(tid)
             text = self.tok.decode(acc, skip_special_tokens=True)
             tm = self._timings(len(ids), acc, t0, t_first)
-            fr = "length" if len(acc) >= max_tokens else "stop"   # 기존 /v1/completions "length" 보존(무회귀)
+            fr = rinfo["finish_reason"]                    # daemon 권위(stop=EOS / length=max_tokens·maxlen)
             choice = ({"message":{"role":"assistant","content":text}} if chat else {"text":text})
             self._json(200, {"id":cid,"object":obj,"created":created,"model":self.model_id,
                              "choices":[{**choice,"index":0,"finish_reason":fr}], "usage":tm["usage"], "timings":tm["timings"]})
@@ -239,6 +246,21 @@ def main():
     os.environ.setdefault("HF_HUB_OFFLINE","1"); os.environ.setdefault("TRANSFORMERS_OFFLINE","1")
     from transformers import AutoTokenizer
     Handler.tok = AutoTokenizer.from_pretrained(args.tokenizer)
+
+    # ★EOS/stop 토큰 = generation_config.eos_token_id 권위(다중 가능 — gemma [1,106,50]·qwen [248046,248044]).
+    #   tokenizer.eos_token_id는 단일이라 chat 종료 토큰(<end_of_turn>/<|im_end|>)을 놓칠 수 있어 gen_config 우선.
+    stop_ids = []
+    try:
+        from transformers import GenerationConfig
+        gc = GenerationConfig.from_pretrained(args.tokenizer)
+        e = gc.eos_token_id
+        stop_ids = list(e) if isinstance(e,(list,tuple)) else ([e] if e is not None else [])
+    except Exception as ex:
+        print(f"  [경고] generation_config 로드 실패({ex}) — tokenizer.eos_token_id로 폴백", file=sys.stderr)
+    if Handler.tok.eos_token_id is not None and Handler.tok.eos_token_id not in stop_ids:
+        stop_ids.append(Handler.tok.eos_token_id)          # 폴백/보강(중복 제거)
+    daemon_env = {**os.environ, "STOP_IDS": ",".join(str(x) for x in stop_ids)}
+    print(f"  [stop] EOS 종료 토큰 IDs = {stop_ids} (generation_config 권위)", file=sys.stderr)
     if args.model == "gemma4":
         cmd = [os.path.join(REPO,"tools","serve_daemon_gemma4_online"), args.weights, str(uq), str(args.maxlen), str(args.bmax)]
     elif args.model == "spec":                                     # 27b MTP spec(draft→verify→accept) — golden(rope+MTP) 필수
@@ -247,7 +269,7 @@ def main():
     else:                                                          # qwen(27b·35b plain) — golden(rope) 필수
         if not args.golden: sys.exit("[serve_api] --model qwen 은 --golden(rope dir) 필수")
         cmd = [os.path.join(REPO,"tools","serve_daemon_qwen_online"), args.weights, args.golden, str(uq), str(args.maxlen), str(args.bmax)]
-    Handler.daemon = OnlineDaemon(cmd)
+    Handler.daemon = OnlineDaemon(cmd, env=daemon_env)
     Handler.model_id = model_id
     Handler.quant = {2:"w4a8", 1:"q4", 0:"fp32"}.get(uq, "w4a8")
     Handler.spec = (args.model == "spec")                  # 모델 배지(/v1/models·웹UI)용

@@ -43,7 +43,18 @@ namespace serving_online_detail {
 
 // 모델-중립 온라인 daemon 루프. be=구성된 backend(weight 로드 완료), Bmax=동시 활성 슬롯 상한.
 //   반환 시 daemon 종료(stdin EOF/SHUTDOWN). 호출자가 backend 정리.
-inline void run_online_daemon(OnlineBackend& be, int Bmax){
+// STOP_IDS 환경변수 파서(config 주도 — serve_api가 generation_config.eos_token_id를 콤마 목록으로 주입).
+//   예: STOP_IDS="1,106,50"(gemma) / "248046,248044"(qwen). 미설정 시 빈 집합(종료 감지 없음 = 기존 동작).
+inline std::vector<int> parse_stop_ids_env(){
+    std::vector<int> v; const char* e = getenv("STOP_IDS");
+    if(e){ std::stringstream ss(e); std::string t; while(std::getline(ss,t,',')) if(!t.empty()) v.push_back(atoi(t.c_str())); }
+    return v;
+}
+
+//   stop_ids: EOS/종료 토큰 집합(모델 generation_config 권위 — hardcode 금지). 슬롯 argmax가 이 집합이면 종료
+//     (그 토큰은 출력 안 함 = EOS는 사용자 텍스트 아님). 종료 사유는 프로토콜 "END <reason>"(stop/length).
+//     ★계산 불변: argmax 값은 그대로 판정 — stop_id 만나기 전 토큰들은 stop 없을 때와 bit-identical(종료 조건만 추가).
+inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int>& stop_ids = {}){
     using namespace serving_online_detail;
     const int V = be.vocab(), maxlen = be.max_len();
     void* st = be.alloc_state(Bmax);
@@ -71,6 +82,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax){
     auto argmax_row = [&](int b)->int{ float*p=&hlog[(size_t)b*V]; int bi=0; float bv=p[0];
         for(int j=1;j<V;j++) if(p[j]>bv){bv=p[j];bi=j;} return bi; };
     auto n_active = [&](){ int a=0; for(int b=0;b<Bmax;b++) if(slot[b].req>=0)a++; return a; };
+    auto is_stop = [&](int t){ for(int s:stop_ids) if(t==s) return true; return false; };  // EOS 집합(config 주도)
 
     while(true){
         // 1) admit: 대기 큐 → free slot(스텝 경계). prefill(슬롯 KV) + 첫 토큰(prefill 마지막 logit argmax).
@@ -92,8 +104,12 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax){
                 be.logits_to_host(hlog.data(), 1);
                 int first=0; { float*p=hlog.data(); float bv=p[0]; for(int j=1;j<V;j++) if(p[j]>bv){bv=p[j];first=j;} }
                 slot[b] = Slot{r.id, P, 0, r.max_tokens, first};
-                if(r.max_tokens>0){ printf("%ld %d\n", r.id, first); fflush(stdout); slot[b].gen=1; }
-                if(slot[b].gen>=slot[b].max_tokens){ printf("%ld END\n", r.id); fflush(stdout); slot[b]=Slot(); }
+                if(r.max_tokens>0 && is_stop(first)){        // 첫 토큰이 EOS = 빈 응답(즉시 종료·토큰 미출력)
+                    printf("%ld END stop\n", r.id); fflush(stdout); slot[b]=Slot();
+                } else {
+                    if(r.max_tokens>0){ printf("%ld %d\n", r.id, first); fflush(stdout); slot[b].gen=1; }
+                    if(slot[b].req>=0 && slot[b].gen>=slot[b].max_tokens){ printf("%ld END length\n", r.id); fflush(stdout); slot[b]=Slot(); }
+                }
                 lk.lock();
             }
         }
@@ -114,9 +130,10 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax){
         // 3) 슬롯별 argmax → 스트림 → greedy 피드백 → 완료(슬롯 격리: 각 슬롯 자기 logit row만). active는 0..W-1.
         for(int b=0;b<W;b++){ Slot&s=slot[b]; if(s.req<0) continue;
             int next=argmax_row(b);
+            if(is_stop(next)){ printf("%ld END stop\n", s.req); fflush(stdout); s=Slot(); continue; }  // ★EOS: 토큰 미출력·종료(계산 불변 — 값 그대로 판정)
             printf("%ld %d\n", s.req, next); fflush(stdout);
             s.last=next; s.pos++; s.gen++;
-            if(s.gen>=s.max_tokens || s.pos>=maxlen-1){ printf("%ld END\n", s.req); fflush(stdout); s=Slot(); }
+            if(s.gen>=s.max_tokens || s.pos>=maxlen-1){ printf("%ld END length\n", s.req); fflush(stdout); s=Slot(); }
         }
     }
     shutdown=true; cv.notify_all();

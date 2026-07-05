@@ -57,7 +57,7 @@ int main(int argc,char**argv){
     CK(cudaMalloc(&be.d_logit,(size_t)Bmax*be.V*4));
     fprintf(stderr,"[online] ready: gemma4%s uq=%d maxlen=%d Bmax=%d V=%d (연속 배칭 greedy, 태그드 ID-in/out)\n", be.moe?"-MoE(26B)":"", uq,maxlen,Bmax,be.V); fflush(stderr);
 
-    run_online_daemon(be, Bmax);      // 모델-중립 루프(serving_online.h)
+    run_online_daemon(be, Bmax, parse_stop_ids_env());      // 모델-중립 루프(serving_online.h) + EOS 종료(STOP_IDS env)
 
     cudaFree(be.d_tok);cudaFree(be.d_pos);cudaFree(be.d_pf);cudaFree(be.d_logit);
     cudaFree(be.d_cf);cudaFree(be.d_sf);cudaFree(be.d_cs);cudaFree(be.d_ss);
