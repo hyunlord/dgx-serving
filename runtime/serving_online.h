@@ -100,14 +100,19 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax){
         int A=n_active();
         if(A==0){ if(shutdown){ std::lock_guard<std::mutex> lk(mtx); if(queue.empty()) break; } continue; }
 
-        // 2) decode 스텝: ragged(Bmax 전폭, free 슬롯 더미·출력 무시). 슬롯별 위치 pos[b]=slot[b].pos.
-        std::vector<int> toks(Bmax,0), pos(Bmax,0);
-        for(int b=0;b<Bmax;b++) if(slot[b].req>=0){ toks[b]=slot[b].last; pos[b]=slot[b].pos; }
-        be.decode_step(st, toks.data(), pos.data(), Bmax);
-        be.logits_to_host(hlog.data(), Bmax);
+        // 2) decode 스텝: ★active-width(최대 active 슬롯+1까지만 forward — single-stream의 Bmax 전폭 낭비 제거).
+        //    현재 admit이 b=0부터 채우므로 active는 앞쪽에 몰림. W=최대 active 인덱스+1.
+        //    ★정확성 불변(bit-id): 각 슬롯 KV/state/logit은 독립 → active 슬롯(<W) 결과는 W와 무관하게 동일.
+        //    free 슬롯(req<0, W 미만)은 더미 계산이나 출력 무시. single(slot0만)=W1=raw 근접(측정: B8 18→B1 43 t/s).
+        //    batch(다 active)면 W=Bmax(무영향). 흩어진 free(중간 완료)는 약간 더미 잔존하나 정확성 무관.
+        int W=0; for(int b=0;b<Bmax;b++) if(slot[b].req>=0) W=b+1;
+        std::vector<int> toks(W,0), pos(W,0);
+        for(int b=0;b<W;b++) if(slot[b].req>=0){ toks[b]=slot[b].last; pos[b]=slot[b].pos; }
+        be.decode_step(st, toks.data(), pos.data(), W);
+        be.logits_to_host(hlog.data(), W);
 
-        // 3) 슬롯별 argmax → 스트림 → greedy 피드백 → 완료(슬롯 격리: 각 슬롯 자기 logit row만).
-        for(int b=0;b<Bmax;b++){ Slot&s=slot[b]; if(s.req<0) continue;
+        // 3) 슬롯별 argmax → 스트림 → greedy 피드백 → 완료(슬롯 격리: 각 슬롯 자기 logit row만). active는 0..W-1.
+        for(int b=0;b<W;b++){ Slot&s=slot[b]; if(s.req<0) continue;
             int next=argmax_row(b);
             printf("%ld %d\n", s.req, next); fflush(stdout);
             s.last=next; s.pos++; s.gen++;

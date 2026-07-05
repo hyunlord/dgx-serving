@@ -30,6 +30,8 @@ struct Gemma4OnlineBackend : OnlineBackend {
     }
     void  decode_step(void* st, const int* h_toks, const int* h_pos, int Bmax) override {
         G4BatchState* s=(G4BatchState*)st;
+        s->B = Bmax;   // ★실행-B를 인자(active-width W)로 설정 — decode_batch가 st.B 슬롯만 forward(qwen 대칭).
+                       //   미설정 시 alloc Bmax(8) 고정 → serving_online active-width(W<8)서 stale 슬롯 illegal access.
         CK(cudaMemcpy(d_tok, h_toks, Bmax*4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_pos, h_pos, Bmax*4, cudaMemcpyHostToDevice));
         std::vector<int> hp(h_pos, h_pos+Bmax);
