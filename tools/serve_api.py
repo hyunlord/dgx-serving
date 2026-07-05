@@ -223,6 +223,7 @@ def main():
     ap.add_argument("--uq", type=int, default=2)                   # recipe 없을 때 양자화(2=W4A8·1=q4·0=fp32)
     ap.add_argument("--model-id", default="")                      # recipe 없을 때 모델 표시명
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--host", default="127.0.0.1", help="바인드 주소(기본 127.0.0.1=로컬만). 0.0.0.0=내부망 전체 노출 — ★인증 없는 서버라 내부망 전용·공유기 포트포워딩으로 외부 노출 금지")
     args = ap.parse_args()
 
     if args.recipe:
@@ -255,9 +256,11 @@ def main():
         request_queue_size = 128       # SYN backlog 상향(기본 5) — 동시 연결 폭주(초과구독)서 커널 리셋 방지
         daemon_threads = True          # 종료 시 핸들러 스레드 대기 안 함(빠른 셧다운)
         allow_reuse_address = True     # 재起動 시 TIME_WAIT 포트 재사용
-    httpd = _Server(("0.0.0.0", args.port), Handler)
-    print(f"[serve_api] listening :{args.port} — 웹 채팅 UI http://localhost:{args.port}/ · "
+    httpd = _Server((args.host, args.port), Handler)
+    print(f"[serve_api] listening {args.host}:{args.port} — 웹 채팅 UI http://localhost:{args.port}/ · "
           f"/v1/completions · /v1/chat/completions · /v1/models (greedy 온라인 배칭 Bmax={args.bmax}, model={model_id})", file=sys.stderr)
+    if args.host == "0.0.0.0":
+        print("  [보안] 0.0.0.0 = 내부망 전체 노출·인증 없음 — 신뢰된 내부망에서만 사용, 외부 포트포워딩 금지", file=sys.stderr)
     try: httpd.serve_forever()
     except KeyboardInterrupt: pass
     finally: Handler.daemon.close()
