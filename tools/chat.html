@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dgx-serving · chat</title>
+<style>
+  /* zero-dependency, self-contained. dark, function over form. */
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --muted:#8b949e;
+          --user:#1f6feb; --assist:#21262d; --accent:#2ea043; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;
+         display:flex; flex-direction:column; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  #badge { font-size:12px; color:var(--muted); background:var(--panel); border:1px solid var(--line);
+           border-radius:999px; padding:2px 10px; }
+  #chat { flex:1; overflow-y:auto; padding:18px 16px; display:flex; flex-direction:column; gap:14px; }
+  .msg { max-width:760px; width:fit-content; padding:10px 14px; border-radius:10px; white-space:pre-wrap;
+         word-wrap:break-word; }
+  .user { align-self:flex-end; background:var(--user); color:#fff; }
+  .assistant { align-self:flex-start; background:var(--assist); border:1px solid var(--line); }
+  .meta { align-self:flex-start; font-size:12px; color:var(--muted); margin-top:-8px; }
+  footer { border-top:1px solid var(--line); padding:12px 16px; display:flex; gap:10px; align-items:flex-end; }
+  #input { flex:1; resize:none; background:var(--panel); color:var(--fg); border:1px solid var(--line);
+           border-radius:8px; padding:10px 12px; font:inherit; max-height:160px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px; font:inherit;
+           cursor:pointer; font-weight:600; }
+  button.stop { background:#da3633; }
+  button:disabled { opacity:.5; cursor:default; }
+  .empty { color:var(--muted); align-self:center; margin:auto; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>dgx-serving</h1>
+  <span id="badge">connecting…</span>
+</header>
+<div id="chat"><div class="empty">Ask something. Greedy decoding · online continuous batching.</div></div>
+<footer>
+  <textarea id="input" rows="1" placeholder="Message…  (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send">Send</button>
+</footer>
+
+<script>
+"use strict";
+const chatEl = document.getElementById("chat");
+const inputEl = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const badgeEl = document.getElementById("badge");
+const history = [];            // [{role, content}] — multi-turn context
+let controller = null;         // AbortController for stop
+let modelId = "model";
+
+// model badge from /v1/models
+fetch("/v1/models").then(r => r.json()).then(d => {
+  const m = (d.data && d.data[0]) || {};
+  modelId = m.id || "model";
+  const bits = [modelId, m.quant, m.spec ? "spec" : null].filter(Boolean);
+  badgeEl.textContent = bits.join(" · ");
+}).catch(() => { badgeEl.textContent = "offline"; });
+
+function clearEmpty(){ const e = chatEl.querySelector(".empty"); if (e) e.remove(); }
+function addMsg(role, text){
+  clearEmpty();
+  const d = document.createElement("div");
+  d.className = "msg " + role; d.textContent = text || "";
+  chatEl.appendChild(d); chatEl.scrollTop = chatEl.scrollHeight; return d;
+}
+function addMeta(text){
+  const d = document.createElement("div"); d.className = "meta"; d.textContent = text;
+  chatEl.appendChild(d); chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function setBusy(busy){
+  inputEl.disabled = busy;
+  sendBtn.textContent = busy ? "Stop" : "Send";
+  sendBtn.className = busy ? "stop" : "";
+}
+
+async function send(){
+  if (controller){ controller.abort(); return; }   // button acts as Stop while streaming
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = ""; inputEl.style.height = "auto";
+  history.push({role:"user", content:text});
+  addMsg("user", text);
+  const bubble = addMsg("assistant", "");
+  setBusy(true);
+  controller = new AbortController();
+  let acc = "";
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({model:modelId, messages:history, max_tokens:512, stream:true}),
+      signal: controller.signal,
+    });
+    if (!resp.ok){ bubble.textContent = "[error] " + (await resp.text()); throw new Error("http"); }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder(); let buf = "";
+    let timings = null;
+    while (true){
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream:true});
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0){
+        const evt = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const line = evt.replace(/^data: ?/, "");
+        if (line === "[DONE]") continue;
+        let obj; try { obj = JSON.parse(line); } catch { continue; }
+        const delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
+        if (delta && delta.content){ acc += delta.content; bubble.textContent = acc; chatEl.scrollTop = chatEl.scrollHeight; }
+        if (obj.timings) timings = obj.timings;
+      }
+    }
+    history.push({role:"assistant", content:acc});
+    if (timings){
+      addMeta(`${timings.completion_tokens} tokens · ${timings.elapsed_s}s · ${timings.tokens_per_s} tok/s · TTFT ${timings.ttft_s}s`);
+    }
+  } catch (e){
+    if (e.name === "AbortError"){ bubble.textContent = acc + "  [stopped]"; if (acc) history.push({role:"assistant", content:acc}); }
+  } finally {
+    controller = null; setBusy(false); inputEl.focus();
+  }
+}
+
+sendBtn.addEventListener("click", send);
+inputEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); send(); }
+});
+inputEl.addEventListener("input", () => { inputEl.style.height = "auto"; inputEl.style.height = inputEl.scrollHeight + "px"; });
+inputEl.focus();
+</script>
+</body>
+</html>

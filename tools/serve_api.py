@@ -16,6 +16,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "autotune"))
 
+# 웹 채팅 UI(정적 HTML 1장 — 외부 의존 0). tools/chat.html에서 로드(리포 자립); 없으면 최소 폴백.
+try:
+    with open(os.path.join(HERE, "chat.html"), encoding="utf-8") as _f: WEBUI_HTML = _f.read()
+except OSError:
+    WEBUI_HTML = "<!doctype html><meta charset=utf-8><title>dgx-serving</title><p>chat.html not found</p>"
+
 # ---- recipe verify 재사용(recipe.py — 지문·메모리 가드; 미니벤치는 생략=verify --skip-bench 등가) ----
 def load_and_verify_recipe(recipe_path, device_json, model_json):
     from recipe import load_recipe, fingerprint_check, local_memory_check  # noqa: E402
@@ -84,9 +90,23 @@ class OnlineDaemon:
         try: self.p.stdin.write("SHUTDOWN\n"); self.p.stdin.flush(); self.p.stdin.close(); self.p.terminate()
         except Exception: pass
 
+# ---- 채팅 템플릿(정확성 지점) — messages를 모델별 chat template로 감싸 토큰화 ----
+#   ★단일 소스: /v1/chat/completions과 template 게이트(test_chat_template.py)가 이 함수를 공유 →
+#   손수 concat 같은 오적용 차단. HF apply_chat_template를 add_generation_prompt=True로 호출(모델별 자동).
+def chat_ids(tok, messages):
+    if getattr(tok, "chat_template", None) is None:
+        raise ValueError(f"tokenizer({tok.name_or_path})에 chat_template 없음 — /v1/chat/completions 불가(--tokenizer로 chat 모델 지정)")
+    # ★transformers 버전에 따라 tokenize=True가 list[int] 또는 BatchEncoding(dict) 반환 → 둘 다 안전하게 input_ids 추출.
+    #   (dict를 그냥 list()하면 키 ['input_ids','attention_mask']를 토큰으로 오인 = 조용한 붕괴 — 방지.)
+    out = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+    if hasattr(out, "input_ids"): out = out["input_ids"]   # BatchEncoding
+    elif isinstance(out, dict):   out = out["input_ids"]
+    if out and isinstance(out[0], (list, tuple)): out = out[0]   # 배치 중첩 해제
+    return [int(x) for x in out]
+
 # ---- OpenAI 호환 HTTP 핸들러 ----
 class Handler(BaseHTTPRequestHandler):
-    daemon = None; tok = None; model_id = "gemma4"       # 클래스 변수(서버 起動 시 주입)
+    daemon = None; tok = None; model_id = "gemma4"; quant = "w4a8"; spec = False  # 클래스 변수(서버 起動 시 주입)
     def log_message(self, *a): pass                       # 접근 로그 억제
 
     def _json(self, code, obj):
@@ -95,45 +115,99 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(b)
 
     def do_GET(self):
-        if self.path.rstrip("/") == "/v1/models":
-            self._json(200, {"object":"list","data":[{"id":self.model_id,"object":"model","owned_by":"dgx-serving"}]})
+        p = self.path.rstrip("/")
+        if p == "/v1/models":
+            self._json(200, {"object":"list","data":[{"id":self.model_id,"object":"model","owned_by":"dgx-serving",
+                                                       "quant":self.quant,"spec":self.spec}]})
+        elif p in ("", "/index.html"):                    # 웹 채팅 UI(정적 HTML 1장 — 의존성 0)
+            b = WEBUI_HTML.encode()
+            self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8")
+            self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
         else: self._json(404, {"error":{"message":"not found","type":"invalid_request_error"}})
 
+    # 미지원 파라미터(greedy·bit-id 전제 깨는 것) 명시 거부 — 공통.
+    def _reject_unsupported(self, req):
+        for k in ("logprobs","n","best_of","suffix"):
+            if req.get(k) not in (None,1):
+                self._json(400, {"error":{"message":f"unsupported: {k} (greedy only)","type":"invalid_request_error"}}); return True
+        if req.get("temperature",0) not in (0,None,0.0):
+            print(f"  [경고] temperature={req.get('temperature')} 무시(greedy만)", file=sys.stderr)
+        return False
+
     def do_POST(self):
-        if self.path.rstrip("/") != "/v1/completions":
-            return self._json(404, {"error":{"message":"Phase 0: /v1/completions만 지원","type":"invalid_request_error"}})
+        p = self.path.rstrip("/")
+        if p not in ("/v1/completions", "/v1/chat/completions"):
+            return self._json(404, {"error":{"message":"지원: /v1/completions, /v1/chat/completions","type":"invalid_request_error"}})
         try:
             n = int(self.headers.get("Content-Length",0)); req = json.loads(self.rfile.read(n) or b"{}")
         except Exception as e:
             return self._json(400, {"error":{"message":f"bad json: {e}","type":"invalid_request_error"}})
-        # Phase 0 미지원 명시 거부(greedy 전제 깨는 것)
-        for k in ("logprobs","n","best_of","suffix"):
-            if req.get(k) not in (None,1): return self._json(400, {"error":{"message":f"Phase 0 미지원: {k}(greedy만)","type":"invalid_request_error"}})
-        if req.get("temperature",0) not in (0,None,0.0):
-            print(f"  [경고] temperature={req.get('temperature')} 무시(Phase 0 greedy만)", file=sys.stderr)
-        prompt = req.get("prompt","");  max_tokens = int(req.get("max_tokens",16)); stream = bool(req.get("stream",False))
-        if isinstance(prompt, list): prompt = prompt[0] if prompt else ""
-        ids = self.tok(prompt).input_ids                  # HF 토큰화(BOS 포함 — Gemma 관례)
-        cid = "cmpl-"+uuid.uuid4().hex[:24]; created = int(time.time())
+        if self._reject_unsupported(req): return
+        chat = (p == "/v1/chat/completions")
+        max_tokens = int(req.get("max_completion_tokens", req.get("max_tokens",256))); stream = bool(req.get("stream",False))
+        # 입력 → token ids: chat=템플릿 적용(정확성 본체) / completions=원시 프롬프트 토큰화(기존 경로 불변)
+        try:
+            if chat:
+                msgs = req.get("messages",[])
+                if not isinstance(msgs, list) or not msgs:
+                    return self._json(400, {"error":{"message":"messages 필요","type":"invalid_request_error"}})
+                ids = chat_ids(self.tok, msgs)
+            else:
+                prompt = req.get("prompt","")
+                if isinstance(prompt, list): prompt = prompt[0] if prompt else ""
+                ids = self.tok(prompt).input_ids           # HF 토큰화(BOS 포함 — Gemma 관례)
+        except Exception as e:
+            return self._json(400, {"error":{"message":str(e),"type":"invalid_request_error"}})
+        self._generate(ids, max_tokens, stream, chat)
 
+    # 생성 실행(스트림/논스트림 공통) — daemon.stream(불변) + incremental detok + 메트릭(front 계산·daemon 불변).
+    def _generate(self, ids, max_tokens, stream, chat):
+        cid = ("chatcmpl-" if chat else "cmpl-")+uuid.uuid4().hex[:24]; created = int(time.time())
+        obj = "chat.completion.chunk" if (chat and stream) else ("chat.completion" if chat else "text_completion")
+        t0 = time.time(); t_first = None; acc = []; prev_text = ""
         if stream:
             self.send_response(200); self.send_header("Content-Type","text/event-stream")
             self.send_header("Cache-Control","no-cache"); self.end_headers()
-            acc = []; prev_text = ""                       # incremental detok: 누적 디코드 후 신규 suffix가 delta
+            if chat:                                       # chat 관례: 첫 청크에 role
+                self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
+                           "choices":[{"delta":{"role":"assistant"},"index":0,"finish_reason":None}]})
             for tid in self.daemon.stream(ids, max_tokens):
+                if t_first is None: t_first = time.time()
                 acc.append(tid)
                 cur = self.tok.decode(acc, skip_special_tokens=True)
                 delta = cur[len(prev_text):]; prev_text = cur
-                chunk = {"id":cid,"object":"text_completion","created":created,"model":self.model_id,
-                         "choices":[{"text":delta,"index":0,"finish_reason":None}]}
-                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode()); self.wfile.flush()
+                ch = ({"delta":{"content":delta}} if chat else {"text":delta})
+                self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
+                           "choices":[{**ch,"index":0,"finish_reason":None}]})
+            # 종료 청크: finish_reason + usage + timings(메트릭 — 마지막 이벤트에 포함)
+            tm = self._timings(len(ids), acc, t0, t_first)
+            fr = "length" if len(acc) >= max_tokens else "stop"   # daemon은 max_tokens/maxlen 캡까지(EOS 조기중단 없음)
+            fin = ({"delta":{}} if chat else {"text":""})
+            self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
+                       "choices":[{**fin,"index":0,"finish_reason":fr}], "usage":tm["usage"], "timings":tm["timings"]})
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
         else:
-            gen_ids = list(self.daemon.stream(ids, max_tokens))
-            text = self.tok.decode(gen_ids, skip_special_tokens=True)
-            self._json(200, {"id":cid,"object":"text_completion","created":created,"model":self.model_id,
-                             "choices":[{"text":text,"index":0,"finish_reason":"length"}],
-                             "usage":{"prompt_tokens":len(ids),"completion_tokens":len(gen_ids),"total_tokens":len(ids)+len(gen_ids)}})
+            for tid in self.daemon.stream(ids, max_tokens):
+                if t_first is None: t_first = time.time()
+                acc.append(tid)
+            text = self.tok.decode(acc, skip_special_tokens=True)
+            tm = self._timings(len(ids), acc, t0, t_first)
+            fr = "length" if len(acc) >= max_tokens else "stop"   # 기존 /v1/completions "length" 보존(무회귀)
+            choice = ({"message":{"role":"assistant","content":text}} if chat else {"text":text})
+            self._json(200, {"id":cid,"object":obj,"created":created,"model":self.model_id,
+                             "choices":[{**choice,"index":0,"finish_reason":fr}], "usage":tm["usage"], "timings":tm["timings"]})
+
+    def _sse(self, obj):
+        self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode()); self.wfile.flush()
+
+    # 메트릭(캡처의 "N tokens · S s · X t/s") — front 관측(daemon 불변). 측정 지점: 요청 주입~마지막 토큰.
+    def _timings(self, n_prompt, gen_ids, t0, t_first):
+        n = len(gen_ids); t_end = time.time()
+        elapsed = t_end - t0; ttft = (t_first - t0) if t_first else 0.0
+        tps = (n / elapsed) if elapsed > 0 else 0.0        # client-observed(주입~완료 기준) — 정직 명시
+        return {"usage":{"prompt_tokens":n_prompt,"completion_tokens":n,"total_tokens":n_prompt+n},
+                "timings":{"completion_tokens":n,"elapsed_s":round(elapsed,3),"ttft_s":round(ttft,3),
+                           "tokens_per_s":round(tps,2),"measured":"client-observed (submit→last token)"}}
 
 def main():
     ap = argparse.ArgumentParser()
@@ -174,13 +248,16 @@ def main():
         cmd = [os.path.join(REPO,"tools","serve_daemon_qwen_online"), args.weights, args.golden, str(uq), str(args.maxlen), str(args.bmax)]
     Handler.daemon = OnlineDaemon(cmd)
     Handler.model_id = model_id
+    Handler.quant = {2:"w4a8", 1:"q4", 0:"fp32"}.get(uq, "w4a8")
+    Handler.spec = (args.model == "spec")                  # 모델 배지(/v1/models·웹UI)용
 
     class _Server(ThreadingHTTPServer):
         request_queue_size = 128       # SYN backlog 상향(기본 5) — 동시 연결 폭주(초과구독)서 커널 리셋 방지
         daemon_threads = True          # 종료 시 핸들러 스레드 대기 안 함(빠른 셧다운)
         allow_reuse_address = True     # 재起動 시 TIME_WAIT 포트 재사용
     httpd = _Server(("0.0.0.0", args.port), Handler)
-    print(f"[serve_api] listening :{args.port} (/v1/completions greedy 온라인 배칭 Bmax={args.bmax}, /v1/models). recipe={os.path.basename(args.recipe)}", file=sys.stderr)
+    print(f"[serve_api] listening :{args.port} — 웹 채팅 UI http://localhost:{args.port}/ · "
+          f"/v1/completions · /v1/chat/completions · /v1/models (greedy 온라인 배칭 Bmax={args.bmax}, model={model_id})", file=sys.stderr)
     try: httpd.serve_forever()
     except KeyboardInterrupt: pass
     finally: Handler.daemon.close()
