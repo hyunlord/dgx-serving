@@ -150,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error":{"message":f"bad json: {e}","type":"invalid_request_error"}})
         if self._reject_unsupported(req): return
         chat = (p == "/v1/chat/completions")
-        max_tokens = int(req.get("max_completion_tokens", req.get("max_tokens",256))); stream = bool(req.get("stream",False))
+        max_tokens = int(req.get("max_completion_tokens", req.get("max_tokens",2048))); stream = bool(req.get("stream",False))  # 서버 maxlen이 실제 캡(budget=maxlen-P)
         # 입력 → token ids: chat=템플릿 적용(정확성 본체) / completions=원시 프롬프트 토큰화(기존 경로 불변)
         try:
             if chat:

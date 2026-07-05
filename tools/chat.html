@@ -36,6 +36,10 @@
 <header>
   <h1>dgx-serving</h1>
   <span id="badge">connecting…</span>
+  <label style="font-size:12px;color:var(--muted);margin-left:auto;">max tokens
+    <input id="maxtok" type="number" min="1" max="4096" value="2048" step="128"
+           style="width:72px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 6px;font:inherit;margin-left:4px;">
+  </label>
 </header>
 <div id="chat"><div class="empty">Ask something. Greedy decoding · online continuous batching.</div></div>
 <footer>
@@ -49,6 +53,8 @@ const chatEl = document.getElementById("chat");
 const inputEl = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const badgeEl = document.getElementById("badge");
+const maxtokEl = document.getElementById("maxtok");
+function maxTokens(){ const v = parseInt(maxtokEl.value, 10); return (v > 0 && v <= 4096) ? v : 2048; }  // 요청당 상한(서버 maxlen이 실제 캡)
 const history = [];            // [{role, content}] — multi-turn context
 let controller = null;         // AbortController for stop
 let modelId = "model";
@@ -93,13 +99,13 @@ async function send(){
   try {
     const resp = await fetch("/v1/chat/completions", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({model:modelId, messages:history, max_tokens:512, stream:true}),
+      body: JSON.stringify({model:modelId, messages:history, max_tokens:maxTokens(), stream:true}),
       signal: controller.signal,
     });
     if (!resp.ok){ bubble.textContent = "[error] " + (await resp.text()); throw new Error("http"); }
     const reader = resp.body.getReader();
     const dec = new TextDecoder(); let buf = "";
-    let timings = null;
+    let timings = null; let finish = null;
     while (true){
       const {done, value} = await reader.read();
       if (done) break;
@@ -113,11 +119,14 @@ async function send(){
         const delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
         if (delta && delta.content){ acc += delta.content; bubble.textContent = acc; chatEl.scrollTop = chatEl.scrollHeight; }
         if (obj.timings) timings = obj.timings;
+        const fr = obj.choices && obj.choices[0] && obj.choices[0].finish_reason;
+        if (fr) finish = fr;
       }
     }
     history.push({role:"assistant", content:acc});
     if (timings){
-      addMeta(`${timings.completion_tokens} tokens · ${timings.elapsed_s}s · ${timings.tokens_per_s} tok/s · TTFT ${timings.ttft_s}s`);
+      const trunc = finish === "length" ? "  ⚠ truncated (max tokens / context limit)" : "";
+      addMeta(`${timings.completion_tokens} tokens · ${timings.elapsed_s}s · ${timings.tokens_per_s} tok/s · TTFT ${timings.ttft_s}s${trunc}`);
     }
   } catch (e){
     if (e.name === "AbortError"){ bubble.textContent = acc + "  [stopped]"; if (acc) history.push({role:"assistant", content:acc}); }
