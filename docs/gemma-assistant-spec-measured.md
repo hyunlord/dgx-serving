@@ -72,6 +72,11 @@ bf16 argmax) → ③ 사이클 e2e(accept·곱 실측 vs 위 전이 산술) → 
 > **① 통과(a81f686)**: `gemma4_verify_batch` + `test_gemma4_verify` — perfect-draft K∈{2,3,4,8} 전 위치 로짓
 > **bit-identical(diff 0)** vs plain greedy·오염 24사이클 거부/교정/롤백 정확·결정성 30회·batch==solo 전부 PASS.
 > gemma4 경로는 전 구간 행-독립이라 verify 로짓이 plain과 같은 비트 = **tie-flip 구조적 불가**(HF와 대조).
+>
+> **② 통과(7182f57)**: `gemma4_assistant.{h,cu}` + HF 골든(`make_reference_assistant.py`) — 스텝별 로짓
+> MEAN-rel **3~6e-07**(fp32 동급)·argmax 8/8==HF·**재귀 8스텝 draft 전부 일치**(오차 축적 없음)·결정성 30회.
+> 신규 커널 0(cross-attn=attn_decode base=len-1 매핑이 HF flip-마스크 의미와 정확 일치). ★③ de-risk 실측:
+> target concat용 hidden = `hidden_states[-1]` = **final-norm 전**(층 출력) — target-side는 pre-norm residual 노출.
 
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
