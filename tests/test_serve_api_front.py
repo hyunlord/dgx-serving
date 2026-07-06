@@ -21,10 +21,12 @@ from http.server import ThreadingHTTPServer  # noqa: E402
 CANDIDATES = ["Qwen/Qwen3-4B-Instruct-2507","Qwen/Qwen2.5-3B-Instruct","Qwen/Qwen2.5-0.5B-Instruct"]
 
 class FakeDaemon:
-    """실 OnlineDaemon.stream 계약만 흉내: 입력 ids를 max_tokens 만큼 결정적 echo(계산 대체)."""
-    def stream(self, ids, max_tokens):
+    """실 OnlineDaemon.stream 계약만 흉내: 입력 ids를 max_tokens 만큼 결정적 echo(계산 대체).
+    ★시그니처는 실 계약과 동일 유지(out — d2759ab EOS가 추가·미러 누락으로 front 게이트가 깨져 있었음)."""
+    def stream(self, ids, max_tokens, out=None):
         for i in range(min(max_tokens, max(1, len(ids)))):
             yield ids[i % len(ids)]
+        if out is not None: out["finish_reason"] = "length"   # 실 daemon 권위 사유 계약 미러
     def close(self): pass
 
 def post(port, path, body):
