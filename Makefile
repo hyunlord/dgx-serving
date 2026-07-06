@@ -14,7 +14,7 @@ ENGINE_SRCS := models/smollm3.cu runtime/weights.cu
 # *_27b/*_35b/moe 테스트는 대형모델 artifacts 필요, test_gemv_q4_scale 는 측정 도구 → 기본 스위트 제외(수동).
 TEST_SRCS := $(filter-out tests/test_27b.cu tests/test_gdn_27b.cu tests/test_attn_27b.cu tests/test_gemv_q4_scale.cu \
              tests/test_35b.cu tests/test_gdn_35b.cu tests/test_moe_expert.cu tests/test_rope_gen.cu tests/test_chunk_prefill.cu \
-             tests/test_gemma4.cu tests/test_gemma4_decode.cu tests/test_gemma4_gen.cu tests/test_gemma4_batch.cu tests/test_gemma4_ragged.cu tests/test_gemma4_prefill_slot.cu tests/test_gemma4_verify.cu tests/test_gemma4_moe.cu tests/test_gemma4_moe_golden.cu tests/test_gemma4_moe_router_iso.cu \
+             tests/test_gemma4.cu tests/test_gemma4_decode.cu tests/test_gemma4_gen.cu tests/test_gemma4_batch.cu tests/test_gemma4_ragged.cu tests/test_gemma4_prefill_slot.cu tests/test_gemma4_verify.cu tests/test_gemma4_assistant.cu tests/test_gemma4_moe.cu tests/test_gemma4_moe_golden.cu tests/test_gemma4_moe_router_iso.cu \
              tests/test_long_ctx.cu tests/test_treeamort.cu tests/test_treespec.cu tests/test_treespec_depth.cu, $(wildcard tests/*.cu))
 TEST_BINS := $(TEST_SRCS:.cu=)
 
@@ -191,3 +191,7 @@ tests/test_gemma4_prefill_slot: tests/test_gemma4_prefill_slot.cu models/gemma4_
 # draft-spec 1관문: gemma4_verify_batch POC 게이트(spec==greedy bit-id·거부/롤백·결정성·batch==solo). 12B artifacts+gen_rope 필요 → 수동.
 tests/test_gemma4_verify: tests/test_gemma4_verify.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_verify.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+
+# draft-spec 2관문: assistant graph HF 골든 게이트(스텝별+재귀+결정성). assistant artifacts+골든 필요 → 수동.
+tests/test_gemma4_assistant: tests/test_gemma4_assistant.cu models/gemma4_assistant.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_assistant.cu models/gemma4_assistant.cu -o $@
