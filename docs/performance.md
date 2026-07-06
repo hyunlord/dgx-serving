@@ -10,7 +10,7 @@
 | Qwen3.5-27B | GDN+MTP(spec) | B16 K7W2 (λ4, long-heavy) | ~51.7 t/s | ~0.34s | nreq60·seed42·w4a8+mtp_q4 |
 | Gemma4-31B | dense | B8 (★knee) | 36~38 t/s | ~0.14s | nreq48·maxlen384·w4a8 |
 | Gemma4-12B | dense (31B same-family) | B8 (전 regime 지배) | ~96 t/s (aggr) | ~0.05s | nreq48·maxlen384·w4a8·c1tok |
-| Gemma4-12B **spec** | +0.4B assistant(EAGLE류) | K=4 single-stream | **30.6~34.6 t/s** | — | HTTP client-observed·출력==plain greedy·drafter fp32 |
+| Gemma4-12B **spec** | +0.4B assistant(EAGLE류) | K=4 single-stream | **46.7~50.5 t/s** | — | HTTP client-observed·출력==plain greedy·drafter W4A8 |
 | Qwen3.5-35B-A3B | MoE(256e top8)+GDN | B8 (지배점) | ~62.7 t/s | ~0.11s | nreq40·maxlen256·fused-MoE |
 | 26B-A4B | 병렬 MoE | single-stream(HTTP) | **43~46 t/s** (W4A8) | — | active-width 수정 후 · raw 45.4 회복 |
 
@@ -71,11 +71,12 @@
 
 - **near-parity plain(measured)** — 26b MoE(0.28~0.48×)와 대조적으로 12B dense는 llama plain에 **1.15× 갭**까지 근접.
 - **원인(정직)**: 12B는 27b와 same-family dense W4A8 gemv 경로(성숙 자산) 재사용 → 남은 갭=작은 잔여 커널 성숙도(fused/tiled).
-- **★spec 서빙(구현 완료·measured)**: 공식 0.4B assistant(EAGLE류) draft-spec 서빙 — HTTP client-observed
-  **chat 34.6 t/s(plain 22.0의 1.57×)·code 30.6(1.40×)**, 출력==plain greedy 토큰-동일(불변식 게이트).
-  llama 12B spec 66.9 대비 **0.46~0.52×** — 이제 같은 개념(spec)끼리의 좌표(apples-to-apples). 남은 lever(측정
-  명명): drafter fp32(7.9ms/draft→bf16/q4 ~2×↓)·accept 갭(엔진 1.46 vs HF 2.66@K4 — W4A8 target 조건화 가설,
-  도달 시 ~2.5×) → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
+- **★spec 서빙(구현 완료·measured)**: 공식 0.4B assistant(EAGLE류) draft-spec 서빙, drafter W4A8(골든 재게이트
+  PASS·draft 2.0ms) — HTTP client-observed **chat 50.5 t/s(plain 22.0의 2.30×)·code 46.7(2.12×)**, 출력==plain
+  greedy 토큰-동일(불변식 게이트). llama 12B spec 66.9 대비 **0.70~0.75×**(같은 개념 apples-to-apples).
+  accept 갭 진단(measured): 활성화-양자화·rope-정밀 가설 **기각** — 잔여 후보=target q4 가중치 조건화/궤적 차이
+  (bf16-target 실험=후속). 남은 lever: accept 갭(HF-tier 시 ~2.5×+)·verify concat 분할상환·spec 배칭
+  → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
 
 ## 4. 대역폭 지형도 (측정 결론 — "이 장비에서 가능한 것")

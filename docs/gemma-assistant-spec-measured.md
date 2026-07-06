@@ -93,6 +93,29 @@ bf16 argmax) → ③ 사이클 e2e(accept·곱 실측 vs 위 전이 산술) → 
 > llama 12B spec 66.9 대비 **0.46~0.52×** = 같은 개념끼리의 정직 좌표. 후속(선택): drafter bf16/q4·accept 갭
 > 진단(uq 대조)·verify concat 분할상환·spec 배칭.
 
+## Lever 세션 (곱 키우기 — 명명된 2 lever measured)
+
+**Lever1 = drafter W4A8화(적용)**: 큰 matmul 전부(embed=tied lm_head 포함 — 룩업 아님이라 안전) target blueprint
+스킴 q4 + 활성화 int8, 커널 전부 재사용(quantize_x_q8·gemv_w4a8 — 신규 0). 골든 재게이트(HF q4-라운드트립
+`golden_q4`): 로짓 rel 1.0e-2(<2e-2)·h_out 2.7e-2(<5e-2 — 양자화 2단 경로)·argmax 8/8·재귀 8/8·결정성 PASS.
+draft 비용 **7.9 → 2.0ms**(≈4×↓). ★사이클 곱(N96·warm·spec==greedy 전 구성 유지):
+
+| wl(최적 K) | fp32 drafter | **W4A8 drafter** | t/s |
+|---|---|---|---|
+| code K4 | 1.54× | **2.16×** | **48.2** |
+| chat K4 | 1.34× | **1.80×** | **40.1** |
+| prose K2 | 1.22× | **1.59×** | 35.5 |
+
+**Lever2 = accept 갭 진단(가설 2개 기각·measured)**: ① uq=1(활성화 fp32) 대조 — accept 불변(chat K4 1.46 동일)
+→ **활성화-양자화 조건화 기각**. ② fp32 rope 테이블(rotary 모듈 직접 생성·bf16 캡처와 Δ1.95e-3) 대조 — accept
+불변 → **rope 정밀 기각**. 남은 후보(분리엔 bf16 target 필요=대형 후속): target **q4 가중치** 조건화 or 궤적
+차이(우리 q4-greedy 텍스트 ≠ HF bf16 텍스트 = 본질적 draft 난이도 차). HF-tier accept(2.66) 도달 시 ~2.5×
+산술은 유효하게 남음.
+
+**서빙 재측정(W4A8 drafter 기본화)**: 서빙 게이트 전부 재PASS(spec==plain daemon 토큰-동일·동시 격리·생존).
+★캡처 재현(HTTP client-observed·128tok): **chat 50.5 t/s(2.30×)·code 46.7(2.12×)** — llama 12B spec 66.9 대비
+**0.70~0.75×**(시작 0.46~0.52×에서 접근). 남은 lever: accept 갭(위 잔여 후보)·verify concat 분할상환·spec 배칭.
+
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
 - 메모리: 12B(24GB) + assistant(0.9GB) 동시 상주 — W4A8 시 ~7.5GB로 여유(128GB 가드 내).

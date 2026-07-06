@@ -81,9 +81,9 @@ python tools/serve_api.py --model gemma4-spec --tokenizer google/gemma-4-12B-it 
 ```
 
 Speculative output is verified token-identical to plain greedy (the drafts are only accepted when
-they match the target's own argmax), and measures ~1.4–1.6× faster end-to-end today
-(client-observed; the drafter currently runs fp32 — drafter quantization and acceptance tuning are
-known remaining levers, see [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md)).
+they match the target's own argmax), and measures **~2.1–2.3× faster** end-to-end (client-observed;
+drafter runs W4A8 by default — acceptance tuning and verify amortization are the known remaining
+levers, see [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md)).
 
 ## 3. Start the API server
 
