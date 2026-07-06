@@ -28,23 +28,26 @@ struct AstConfig {
     float attn_scaling;       // 1.0
 };
 
+#include "../runtime/weights_qwen.h"   // QMat(wq/sc/wf — 공용 매트 컨테이너)
+
 struct AstLayer {
     int    is_full;
     float  layer_scalar;                                      // host 스칼라(≠1 가능 — 학습값)
     float *input_ln, *q_norm, *post_attn_ln, *pre_ffn_ln, *post_ffn_ln;   // device fp32
-    float *q, *o, *gate, *up, *down;                          // device fp32 [OUT,IN]
+    QMat   q, o, gate, up, down;                              // use_q4=0→wf(fp32) / 2→wq+sc(W4A8, Lever1)
 };
 
 struct AstWeights {
-    float   *embed;        // [V,1024] (tied lm_head)
+    QMat     embed;        // [V,1024] tied lm_head(매트멀 전용 — 룩업 아님이라 q4 안전)
     float   *final_norm;   // [1024]
-    float   *pre_proj;     // [1024, 7680]
-    float   *post_proj;    // [3840, 1024]
+    QMat     pre_proj;     // [1024, 7680]
+    QMat     post_proj;    // [3840, 1024]
     AstLayer layers[64];
 };
 
 AstConfig  load_config_assistant(const char *manifest_path);
-AstWeights load_weights_assistant(const char *dir, const AstConfig &c);
+// use_q4: 0=fp32(wf — 골든 기준) / 2=W4A8(wq/sc — draft bytes 8×↓, 스킴은 target blueprint 동일)
+AstWeights load_weights_assistant(const char *dir, const AstConfig &c, int use_q4 = 0);
 void       free_weights_assistant(AstWeights &w, const AstConfig &c);
 
 // 1 draft 스텝(Sq=1, fp32): d_in7680 = [emb | h_prev] concat(device, 호출자 준비).
@@ -60,6 +63,6 @@ void gemma4_assistant_step(const AstConfig &c, const AstWeights &w,
                            const float *d_ks, const float *d_vs, int len_s,
                            const float *d_cos_f1, const float *d_sin_f1,
                            const float *d_cos_s1, const float *d_sin_s1,
-                           float *d_logits, float *d_hout);
+                           float *d_logits, float *d_hout, int use_q4 = 0);
 
 #endif // DGX_GEMMA4_ASSISTANT_H

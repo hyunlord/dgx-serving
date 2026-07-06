@@ -8,7 +8,7 @@ rope는 assistant rotary_emb가 실제 낸 cos/sin 행(고정 위치)을 직접 
 ★hidden_states[-1]의 final-norm 여부 실측 판정(③ 통합 de-risk)도 meta에 기록.
 사용: python tools/make_reference_assistant.py --out artifacts/gemma4-12b-assistant/golden [--k 8]
 """
-import argparse, json, os
+import argparse, json, os, sys
 import numpy as np
 
 TARGET = "google/gemma-4-12B-it"
@@ -19,6 +19,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--prompt", default="Explain why the sky is blue in one paragraph.")
+    ap.add_argument("--q4", action="store_true",
+                    help="assistant 가중치 q4 라운드트립(dequant(quant(W)) — extract 스킴 동일) 후 forward = 엔진 W4A8 게이트용 골든(target golden_q4 전례)")
     args = ap.parse_args()
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -29,6 +31,20 @@ def main():
     print("[golden-ast] loading target(bf16)+assistant(fp32) → cuda ...", flush=True)
     tgt = AutoModelForCausalLM.from_pretrained(TARGET, dtype=torch.bfloat16).to("cuda").eval()
     ast = AutoModelForCausalLM.from_pretrained(ASSIST, dtype=torch.float32).to("cuda").eval()
+    if args.q4:   # 큰 matmul(2D — extract is_q4 동일 집합·tied lm_head는 embed 스토리지 공유로 함께) q4 라운드트립
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from extract_weights import QBLK
+        with torch.no_grad():
+            nq = 0
+            for k, v in ast.state_dict().items():
+                if k == "lm_head.weight" or v.ndim != 2: continue
+                wnp = v.detach().float().cpu().numpy()          # ★이름 주의: w는 덤프 함수(shadow 금지)
+                wr = wnp.reshape(-1, QBLK)
+                s = np.abs(wr).max(axis=1) / 7.0; s[s == 0] = 1e-8
+                q = np.clip(np.round(wr / s[:, None]) + 8, 0, 15)
+                v.copy_(torch.from_numpy(((q - 8) * s[:, None]).reshape(wnp.shape).astype(np.float32)).to(v.device))
+                nq += 1
+        print(f"[golden-ast] q4 라운드트립 적용: {nq} tensors (QBLK={QBLK})", flush=True)
 
     msgs = [{"role": "user", "content": args.prompt}]
     ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")

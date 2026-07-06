@@ -48,6 +48,7 @@ int main(int argc,char**argv){
     std::string WL = std::string(argc>4?argv[4]:"artifacts/gemma4-12b-assistant/golden")+"/";
     const int uq = argc>5?atoi(argv[5]):2;
     int N = argc>6?atoi(argv[6]):96;
+    const int ast_uq = argc>7?atoi(argv[7]):0;               // drafter 정밀도(0=fp32 / 2=W4A8 — Lever1)
 
     ModelConfig c = load_config_gemma4((TW+"/manifest.json").c_str());
     AstConfig  ca = load_config_assistant((AW+"/manifest.json").c_str());
@@ -55,13 +56,13 @@ int main(int argc,char**argv){
     const int total=(int)(fsz(TG+"gen_rope_full_cos.bin")/4/hd_f);
     int lf=-1, ls=-1;                                          // target 마지막 full/sliding 층(shared KV 소스)
     for(int l=0;l<c.num_layers;l++){ if(c.layer_is_full[l]) lf=l; else ls=l; }
-    printf("[spec_e2e] uq=%d N=%d rope_total=%d | KV소스: full L%d·sliding L%d | assistant L%d fp32\n",
-           uq,N,total,lf,ls,ca.num_layers);
+    printf("[spec_e2e] uq=%d N=%d rope_total=%d | KV소스: full L%d·sliding L%d | assistant L%d %s\n",
+           uq,N,total,lf,ls,ca.num_layers, ast_uq==2?"W4A8":"fp32");
 
     float *d_cf=up(rff(TG+"gen_rope_full_cos.bin",(size_t)total*hd_f)), *d_sf=up(rff(TG+"gen_rope_full_sin.bin",(size_t)total*hd_f));
     float *d_cs=up(rff(TG+"gen_rope_sliding_cos.bin",(size_t)total*hd_s)), *d_ss=up(rff(TG+"gen_rope_sliding_sin.bin",(size_t)total*hd_s));
     G4Weights w = load_weights_gemma4(TW.c_str(), c, uq!=0?1:0, uq==0?1:0);
-    AstWeights wa = load_weights_assistant(AW.c_str(), ca);
+    AstWeights wa = load_weights_assistant(AW.c_str(), ca, ast_uq);
 
     const int KMAX=8;
     int *d_tok; CK(cudaMalloc(&d_tok,(size_t)64*4));
@@ -116,7 +117,7 @@ int main(int argc,char**argv){
                 if(c.embed_scale>0.f) launch_scale(d_in,d_in,c.embed_scale,(size_t)ca.backbone);
                 gemma4_assistant_step(ca,wa,d_in, st.Kc[lf],st.Vc[lf],L, st.Kc[ls],st.Vc[ls],L,
                                       d_cf+(size_t)L*hd_f, d_sf+(size_t)L*hd_f,
-                                      d_cs+(size_t)L*hd_s, d_ss+(size_t)L*hd_s, d_alg, d_ho);
+                                      d_cs+(size_t)L*hd_s, d_ss+(size_t)L*hd_s, d_alg, d_ho, ast_uq);
                 launch_argmax(d_alg,ca.vocab_size,d_am); CK(cudaMemcpy(&dt,d_am,4,cudaMemcpyDeviceToHost));
                 chunk[j+1]=dt;
                 CK(cudaMemcpy(d_in+ca.backbone, d_ho, (size_t)ca.backbone*4, cudaMemcpyDeviceToDevice));  // h 재귀

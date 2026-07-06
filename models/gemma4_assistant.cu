@@ -10,6 +10,8 @@
 #include "../runtime/manifest.h"      // mf_* 헬퍼(manifest.json 파싱)
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemv_f32.cuh"
+#include "../kernels/quantize_x.cuh"  // W4A8: 활성화 int8 양자화(Lever1)
+#include "../kernels/gemv_w4a8.cuh"   // W4A8: q4 weight gemv(target 스킴 동일·신규 커널 0)
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/swiglu.cuh"
@@ -47,27 +49,40 @@ AstConfig load_config_assistant(const char *manifest_path){
     return c;
 }
 
-static float* ast_load(const std::string &dir, const std::string &name, size_t n){
-    std::string p = dir + "/" + name + ".bin";
+static void* ast_load_raw(const std::string &p, size_t bytes){
     FILE *f = fopen(p.c_str(),"rb");
     if(!f){ fprintf(stderr,"[ast] weight 없음: %s\n",p.c_str()); exit(1); }
     fseek(f,0,SEEK_END); long b=ftell(f); fseek(f,0,SEEK_SET);
-    if((size_t)b != n*4){ fprintf(stderr,"[ast] %s 크기 %ld != 기대 %zu*4 — 형상 불일치, 중단.\n",p.c_str(),b,n); exit(1); }
-    float *h=(float*)malloc(n*4);
-    if(fread(h,4,n,f)!=n){ fprintf(stderr,"[ast] short read: %s\n",p.c_str()); exit(1); }
+    if((size_t)b != bytes){ fprintf(stderr,"[ast] %s 크기 %ld != 기대 %zu — 형상 불일치, 중단.\n",p.c_str(),b,bytes); exit(1); }
+    void *h=malloc(bytes);
+    if(fread(h,1,bytes,f)!=bytes){ fprintf(stderr,"[ast] short read: %s\n",p.c_str()); exit(1); }
     fclose(f);
-    float *d; AK(cudaMalloc(&d,n*4)); AK(cudaMemcpy(d,h,n*4,cudaMemcpyHostToDevice)); free(h);
+    void *d; AK(cudaMalloc(&d,bytes)); AK(cudaMemcpy(d,h,bytes,cudaMemcpyHostToDevice)); free(h);
     return d;
 }
+static float* ast_load(const std::string &dir, const std::string &name, size_t n){
+    return (float*)ast_load_raw(dir+"/"+name+".bin", n*4);
+}
+// 매트: use_q4=0→wf(fp32) / 2→wq(_q4.bin 팩드 [n/2 uint8])+sc(_scale.bin fp32 [n/QBLK]) — extract 스킴 그대로
+static QMat ast_load_mat(const std::string &dir, const std::string &name, size_t rows, size_t cols, int use_q4){
+    QMat m{}; size_t n=rows*cols;
+    if(use_q4==2){
+        m.wq=(uint8_t*)ast_load_raw(dir+"/"+name+"_q4.bin", n/2);
+        m.sc=ast_load_raw(dir+"/"+name+"_scale.bin", (n/QBLK)*4);
+    } else {
+        m.wf=ast_load(dir,name,n);
+    }
+    return m;
+}
 
-AstWeights load_weights_assistant(const char *dir_, const AstConfig &c){
+AstWeights load_weights_assistant(const char *dir_, const AstConfig &c, int use_q4){
     std::string dir(dir_);
     AstWeights w{};
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, B=c.backbone;
-    w.embed      = ast_load(dir,"model_embed_tokens",(size_t)V*H);
+    w.embed      = ast_load_mat(dir,"model_embed_tokens",(size_t)V,H,use_q4);
     w.final_norm = ast_load(dir,"model_norm",H);
-    w.pre_proj   = ast_load(dir,"pre_projection",(size_t)H*2*B);
-    w.post_proj  = ast_load(dir,"post_projection",(size_t)B*H);
+    w.pre_proj   = ast_load_mat(dir,"pre_projection",(size_t)H,2*(size_t)B,use_q4);
+    w.post_proj  = ast_load_mat(dir,"post_projection",(size_t)B,H,use_q4);
     for(int l=0;l<c.num_layers;l++){
         AstLayer &L=w.layers[l];
         L.is_full = c.layer_is_full[l];
@@ -80,11 +95,11 @@ AstWeights load_weights_assistant(const char *dir_, const AstConfig &c){
         L.post_attn_ln = ast_load(dir,P+"post_attention_layernorm",H);
         L.pre_ffn_ln   = ast_load(dir,P+"pre_feedforward_layernorm",H);
         L.post_ffn_ln  = ast_load(dir,P+"post_feedforward_layernorm",H);
-        L.q    = ast_load(dir,P+"self_attn_q_proj",(size_t)qdim*H);
-        L.o    = ast_load(dir,P+"self_attn_o_proj",(size_t)H*qdim);
-        L.gate = ast_load(dir,P+"mlp_gate_proj",(size_t)FFN*H);
-        L.up   = ast_load(dir,P+"mlp_up_proj",(size_t)FFN*H);
-        L.down = ast_load(dir,P+"mlp_down_proj",(size_t)H*FFN);
+        L.q    = ast_load_mat(dir,P+"self_attn_q_proj",(size_t)qdim,H,use_q4);
+        L.o    = ast_load_mat(dir,P+"self_attn_o_proj",(size_t)H,qdim,use_q4);
+        L.gate = ast_load_mat(dir,P+"mlp_gate_proj",(size_t)FFN,H,use_q4);
+        L.up   = ast_load_mat(dir,P+"mlp_up_proj",(size_t)FFN,H,use_q4);
+        L.down = ast_load_mat(dir,P+"mlp_down_proj",(size_t)H,FFN,use_q4);
         // layer_scalar: 1 float — host로 읽어 launch_scale에 사용
         std::string sp = dir+"/"+P+"layer_scalar.bin";
         FILE *f=fopen(sp.c_str(),"rb");
@@ -95,12 +110,15 @@ AstWeights load_weights_assistant(const char *dir_, const AstConfig &c){
     return w;
 }
 
+static void free_mat(QMat &m){ if(m.wf)cudaFree(m.wf); if(m.wq)cudaFree(m.wq); if(m.sc)cudaFree(m.sc); m=QMat{}; }
 void free_weights_assistant(AstWeights &w, const AstConfig &c){
-    cudaFree(w.embed); cudaFree(w.final_norm); cudaFree(w.pre_proj); cudaFree(w.post_proj);
+    free_mat(w.embed); cudaFree(w.final_norm); free_mat(w.pre_proj); free_mat(w.post_proj);
     for(int l=0;l<c.num_layers;l++){
         AstLayer &L=w.layers[l];
-        float *ps[]={L.input_ln,L.q_norm,L.post_attn_ln,L.pre_ffn_ln,L.post_ffn_ln,L.q,L.o,L.gate,L.up,L.down};
+        float *ps[]={L.input_ln,L.q_norm,L.post_attn_ln,L.pre_ffn_ln,L.post_ffn_ln};
         for(float *p:ps) cudaFree(p);
+        QMat *ms[]={&L.q,&L.o,&L.gate,&L.up,&L.down};
+        for(QMat *m:ms) free_mat(*m);
     }
 }
 
@@ -110,6 +128,19 @@ static float* ab(int i, size_t n){
     if(g_abcap[i]<n){ if(g_ab[i])cudaFree(g_ab[i]); AK(cudaMalloc(&g_ab[i],n*4)); g_abcap[i]=n; }
     return g_ab[i];
 }
+// W4A8 활성화 양자화 버퍼(S=1) — gemma4_decode mm()과 동일 규약(quantize_x_q8 → gemv_w4a8, scale fp32)
+static int8_t *g_axq=nullptr; static float *g_axs=nullptr; static int32_t *g_axsum=nullptr; static size_t g_axcap=0;
+static inline void amm(const QMat &m, const float *X, float *Y, int IN, int OUT, int use_q4){
+    if(use_q4==2){
+        size_t n=(size_t)IN;
+        if(g_axcap<n){ if(g_axq)cudaFree(g_axq); if(g_axs)cudaFree(g_axs); if(g_axsum)cudaFree(g_axsum);
+            AK(cudaMalloc(&g_axq,n)); AK(cudaMalloc(&g_axs,(n/QBLK)*4)); AK(cudaMalloc(&g_axsum,(n/QBLK)*4)); g_axcap=n; }
+        launch_quantize_x_q8(X,g_axq,g_axs,g_axsum,IN,1);
+        launch_gemv_w4a8(g_axq,g_axs,g_axsum,m.wq,m.sc,Y,IN,OUT,1,0);   // sdtype=0(scale fp32)
+    } else {
+        launch_gemv_f32(X,m.wf,Y,IN,OUT,1);
+    }
+}
 
 void gemma4_assistant_step(const AstConfig &c, const AstWeights &w,
                            const float *d_in7680,
@@ -117,7 +148,7 @@ void gemma4_assistant_step(const AstConfig &c, const AstWeights &w,
                            const float *d_ks, const float *d_vs, int len_s,
                            const float *d_cos_f1, const float *d_sin_f1,
                            const float *d_cos_s1, const float *d_sin_s1,
-                           float *d_logits, float *d_hout){
+                           float *d_logits, float *d_hout, int use_q4){
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const float eps=c.rms_norm_eps;
     const int hd_max = c.global_head_dim>c.head_dim ? c.global_head_dim : c.head_dim;
@@ -125,7 +156,7 @@ void gemma4_assistant_step(const AstConfig &c, const AstWeights &w,
     float *qb=ab(4,(size_t)NQ*hd_max), *qn=ab(5,(size_t)NQ*hd_max), *attn=ab(6,(size_t)NQ*hd_max);
     float *g=ab(7,FFN), *u=ab(8,FFN), *act=ab(9,FFN);
 
-    launch_gemv_f32(d_in7680, w.pre_proj, x, 2*c.backbone, H, 1);   // pre-projection(concat → 트렁크 입력·스케일 없음)
+    amm(w.pre_proj, d_in7680, x, 2*c.backbone, H, use_q4);   // pre-projection(concat → 트렁크 입력·스케일 없음)
     for(int l=0;l<c.num_layers;l++){
         const AstLayer &L=w.layers[l];
         const int hd   = L.is_full ? c.global_head_dim      : c.head_dim;
@@ -137,27 +168,27 @@ void gemma4_assistant_step(const AstConfig &c, const AstWeights &w,
         const int qdim = NQ*hd;
 
         launch_rmsnorm(x, L.input_ln, norm, 1, H, eps);
-        launch_gemv_f32(norm, L.q, qb, H, qdim, 1);
+        amm(L.q, norm, qb, H, qdim, use_q4);
         launch_rmsnorm(qb, L.q_norm, qn, NQ, hd, eps);              // per-head q_norm
         launch_rope(qn, cosR, sinR, 1, NQ, hd);                     // 고정 위치 행(호출자 준비)
         // ★cross-attn: target KV 직독. base=len-1 → attendlen=len(전체)·sliding lo=len-window
         //   (HF bidirectional-flip 마스크의 q_len=1 의미와 정확히 일치 — KV 끝 기준 마지막 w개).
         launch_attn_decode(qn, K, Vv, attn, 1, NQ, NKV, hd, len-1, 0, c.attn_scaling, window);
-        launch_gemv_f32(attn, L.o, tmp, qdim, H, 1);
+        amm(L.o, attn, tmp, qdim, H, use_q4);
         launch_rmsnorm(tmp, L.post_attn_ln, norm, 1, H, eps);
         launch_add(after, x, norm, H);
 
         launch_rmsnorm(after, L.pre_ffn_ln, norm, 1, H, eps);
-        launch_gemv_f32(norm, L.gate, g, H, FFN, 1);
-        launch_gemv_f32(norm, L.up,   u, H, FFN, 1);
+        amm(L.gate, norm, g, H, FFN, use_q4);
+        amm(L.up,   norm, u, H, FFN, use_q4);
         launch_geglu(g, u, act, (size_t)FFN);
-        launch_gemv_f32(act, L.down, tmp, FFN, H, 1);
+        amm(L.down, act, tmp, FFN, H, use_q4);
         launch_rmsnorm(tmp, L.post_ffn_ln, norm, 1, H, eps);
         launch_add(x, after, norm, H);
         if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, H);
     }
     launch_rmsnorm(x, w.final_norm, norm, 1, H, eps);
-    launch_gemv_f32(norm, w.embed, d_logits, H, V, 1);              // tied lm_head(softcap 없음 — 코드 실사)
-    launch_gemv_f32(norm, w.post_proj, d_hout, H, c.backbone, 1);   // 재귀 hidden(다음 스텝 h_prev)
+    amm(w.embed, norm, d_logits, H, V, use_q4);                     // tied lm_head(softcap 없음 — 코드 실사)
+    amm(w.post_proj, norm, d_hout, H, c.backbone, use_q4);          // 재귀 hidden(다음 스텝 h_prev)
     AK(cudaDeviceSynchronize());
 }

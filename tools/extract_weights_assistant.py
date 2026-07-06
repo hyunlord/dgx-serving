@@ -3,11 +3,15 @@
 구조(코드 실사·docs/gemma-assistant-spec-measured.md): pre_projection[1024,7680]·4층 트렁크(q_proj/q_norm/o_proj만 —
 k/v는 target KV 직독이라 없음·sandwich 4-norm·layer_scalar·GeGLU 8192)·model.norm·post_projection[3840,1024]·
 tied lm_head(=embed_tokens [262144,1024])·centroid 비활성(텐서 자체 없음 확인).
-★fp32 전량 덤프(0.4B → ~1.7GB — 골든 게이트 우선. W4A8/q4 양자화는 ③ perf에서 판단).
+★fp32 전량 + 큰 matmul q4(_q4/_scale, target blueprint 스킴 동일 — Lever1: draft 비용 bytes 8×↓).
+q4 대상: q/o/gate/up/down·pre/post_projection·embed(assistant embed는 룩업이 아니라 tied lm_head 매트멀 전용
+— target embed[룩업]와 달리 q4 안전). norm/layer_scalar/q_norm은 fp32 유지.
 파일명 = state_dict 키(layers.{i}. → L{i}_, .weight strip) — weights_qwen/gemma4 관례.
 사용: python tools/extract_weights_assistant.py --model google/gemma-4-12B-it-assistant --out artifacts/gemma4-12b-assistant/weights
 """
-import argparse, json, os
+import argparse, json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from extract_weights import quantize_int4, QBLK
 
 def main():
     ap = argparse.ArgumentParser()
@@ -25,14 +29,22 @@ def main():
     m.eval()
     sd = m.state_dict()
 
-    n = 0
+    def is_q4(k, v):   # 큰 matmul 전부(embed 포함 — lm_head 전용) q4. 1D(norm/scalar)는 fp32.
+        return v.ndim == 2
+    n = nq = 0
     for k, v in sd.items():
         if k == "lm_head.weight":  # tied(embed_tokens와 동일 스토리지) — embed만 저장
             continue
         name = k.replace("model.layers.", "L").replace(".weight", "").replace(".", "_")
-        v.detach().float().numpy().tofile(os.path.join(args.out, name + ".bin"))
+        w = v.detach().float().numpy()
+        w.tofile(os.path.join(args.out, name + ".bin"))
+        if is_q4(k, v):
+            packed, scale = quantize_int4(w)
+            packed.tofile(os.path.join(args.out, name + "_q4.bin"))
+            scale.tofile(os.path.join(args.out, name + "_scale.bin"))
+            nq += 1
         n += 1
-    print(f"[extract-ast] {n} tensors → {args.out}", flush=True)
+    print(f"[extract-ast] {n} tensors ({nq} q4+scale) → {args.out}", flush=True)
 
     mani = {
         "model": args.model,
@@ -53,6 +65,7 @@ def main():
         "tie_word_embeddings": True,                # lm_head = embed_tokens
         "final_logit_softcapping": 0.0,             # null → softcap 없음(코드 실사)
         "use_ordered_embeddings": bool(getattr(cfg, "use_ordered_embeddings", False)),  # False=centroid OFF
+        "qblk": QBLK, "scale_dtype": 0,             # q4 스킴(blueprint 동일·scale fp32)
     }
     json.dump(mani, open(os.path.join(args.out, "manifest.json"), "w"), indent=2)
     print(f"[extract-ast] manifest: L={mani['num_layers']} H={mani['hidden_size']} FFN={mani['intermediate_size']} "

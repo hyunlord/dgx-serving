@@ -6,7 +6,7 @@
 //   stdout "<rid> <tok>"/"<rid> END <stop|length>", stderr "[online] ready". serve_api OnlineDaemon 그대로 붙음.
 //   동시성 = 슬롯별 라운드로빈 사이클(per-slot 순차 = 단독과 동일 계산 = 격리 구성적 — 배칭 이득은 후속 perf).
 //   rope = 온디바이스 생성(plain daemon 동일 — target/assistant 같은 테이블 = 내적 일관·spec 불변식 성립).
-//   사용법: serve_daemon_gemma4_spec_online <tgt_weights> <ast_weights> [uq=2] [maxlen=384] [Bmax=4] [K=4]
+//   사용법: serve_daemon_gemma4_spec_online <tgt_weights> <ast_weights> [uq=2] [maxlen=384] [Bmax=4] [K=4] [ast_uq=2]
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +49,7 @@ int main(int argc,char**argv){
     const int maxlen = argc>4?atoi(argv[4]):384;
     const int Bmax   = argc>5?atoi(argv[5]):4;
     const int K      = argc>6?atoi(argv[6]):4;         // 3관문 최적점(code 1.54×·chat 1.34×)
+    const int ast_uq = argc>7?atoi(argv[7]):2;         // drafter 정밀도(2=W4A8 기본[Lever1 게이트 후]·0=fp32)
     double ma = mem_avail_gb();
     fprintf(stderr,"[spec-online] MemAvailable=%.1fGB (필요 ~12GB: 12B q4 7.5+assistant fp32 1.7+KV)\n", ma);
     if(ma>0 && ma<14){ fprintf(stderr,"[spec-online] 메모리 여유 부족(<14GB) — 크래시 가드 중단.\n"); return 1; }
@@ -69,7 +70,7 @@ int main(int argc,char**argv){
     launch_gen_rope(d_cf,d_sf,maxlen,hd_f,1e4f); launch_gen_rope(d_cs,d_ss,maxlen,hd_s,1e4f); CK(cudaDeviceSynchronize());
 
     G4Weights  w  = load_weights_gemma4(TW.c_str(), c, uq!=0?1:0, uq==0?1:0);
-    AstWeights wa = load_weights_assistant(AW.c_str(), ca);
+    AstWeights wa = load_weights_assistant(AW.c_str(), ca, ast_uq);
     G4BatchState bs = alloc_g4_batch_state(c, Bmax, maxlen);
 
     int   *d_tok;  CK(cudaMalloc(&d_tok,(size_t)(maxlen>K+1?maxlen:K+1)*4));
@@ -99,8 +100,8 @@ int main(int argc,char**argv){
 
     const std::vector<int> stop_ids = parse_stop_ids_env();
     auto is_stop=[&](int t){ for(int s:stop_ids) if(t==s) return true; return false; };
-    fprintf(stderr,"[online] ready: gemma4-spec 12B+0.4B uq=%d maxlen=%d Bmax=%d K=%d V=%d (슬롯별 spec 사이클·spec==greedy)\n",
-            uq,maxlen,Bmax,K,V); fflush(stderr);
+    fprintf(stderr,"[online] ready: gemma4-spec 12B+0.4B uq=%d maxlen=%d Bmax=%d K=%d drafter=%s V=%d (슬롯별 spec 사이클·spec==greedy)\n",
+            uq,maxlen,Bmax,K,ast_uq==2?"W4A8":"fp32",V); fflush(stderr);
 
     // reader 스레드(serving_online.h 프로토콜 동일)
     using serving_online_detail::Req;
@@ -171,7 +172,7 @@ int main(int argc,char**argv){
                 CK(cudaMemcpy(d_in+H, j==0? d_h+(size_t)b*H : d_ho, (size_t)H*4, cudaMemcpyDeviceToDevice));
                 gemma4_assistant_step(ca,wa,d_in, vK[b][lf],vV[b][lf],s.pos, vK[b][ls],vV[b][ls],s.pos,
                                       d_cf+(size_t)s.pos*hd_f, d_sf+(size_t)s.pos*hd_f,
-                                      d_cs+(size_t)s.pos*hd_s, d_ss+(size_t)s.pos*hd_s, d_alg, d_ho);
+                                      d_cs+(size_t)s.pos*hd_s, d_ss+(size_t)s.pos*hd_s, d_alg, d_ho, ast_uq);
                 launch_argmax(d_alg,V,d_am); CK(cudaMemcpy(&dt,d_am,4,cudaMemcpyDeviceToHost));
                 chunk[j+1]=dt;
             }

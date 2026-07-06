@@ -4,8 +4,10 @@
 //       (스텝 단위 정확성 격리 — cross-attn KV 직독·pre/post proj·트렁크 전부 이 게이트가 잡음)
 //   [B] 재귀: h를 엔진 자신의 post_proj 출력으로 이어감(EAGLE 재귀) → K스텝 draft 토큰 전부 == HF
 //   [C] 결정성 30회: 같은 스텝 로짓 bit-동일
-// 사용: ./tests/test_gemma4_assistant [ast_weights] [ast_golden]
-//   fp32 vs fp32(HF GPU) — 합산 순서만 다름 → MEAN-rel 게이트(1e-4)+argmax ALL. max-abs는 보고만(비척도).
+// 사용: ./tests/test_gemma4_assistant [ast_weights] [ast_golden] [uq=0]
+//   uq=0: fp32 vs fp32(HF GPU) — 합산 순서만 다름 → MEAN-rel 게이트(1e-4)+argmax ALL. max-abs는 보고만(비척도).
+//   uq=2: 엔진 W4A8 vs HF q4-라운드트립 골든(golden_q4·make_reference_assistant --q4) — 활성화 int8 차이만
+//         남음 → 로짓 MEAN-rel<2e-2(측정 1.0e-2)·h_out<5e-2(측정 2.7e-2 — 양자화 2단 경로)+argmax ALL+재귀.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +37,12 @@ static long ndiff(const float *a, const float *b, size_t n){ long d=0; for(size_
 int main(int argc,char**argv){
     std::string WD = argc>1?argv[1]:"artifacts/gemma4-12b-assistant/weights";
     GD = std::string(argc>2?argv[2]:"artifacts/gemma4-12b-assistant/golden")+"/";
+    const int uq = argc>3?atoi(argv[3]):0;
+    // 스킴별 톨러런스: fp32=1e-4(합산 순서만). W4A8=로짓 2e-2(target op-level 1.44e-2 tier·측정 1.0e-2),
+    //   h_out 5e-2(측정 2.7e-2×여유 — post_projection은 활성화 양자화 2단[입력 h·출력] 경로라 로짓보다 큼.
+    //   기능 정확성은 argmax 8/8 + ★재귀 게이트[엔진 자신의 h_out으로 8스텝 draft==HF]가 직접 보증).
+    const double TOL_L = (uq==2) ? 2e-2 : 1e-4;
+    const double TOL_H = (uq==2) ? 5e-2 : 1e-4;
 
     AstConfig c = load_config_assistant((WD+"/manifest.json").c_str());
     const int H=c.hidden_size, V=c.vocab_size, B=c.backbone;
@@ -45,7 +53,7 @@ int main(int argc,char**argv){
            c.num_layers,H,c.intermediate_size,hd_s,hd_f,NKVs,NKVf,V,len_f,len_s,K);
     if(len_f<=0||len_s<=0||K<=0){ fprintf(stderr,"골든 파일 불완전 — make_reference_assistant.py 먼저.\n"); return 1; }
 
-    AstWeights w = load_weights_assistant(WD.c_str(), c);
+    AstWeights w = load_weights_assistant(WD.c_str(), c, uq);
     float *d_kf=up(rf("ast_kf.bin",(size_t)len_f*NKVf*hd_f)), *d_vf=up(rf("ast_vf.bin",(size_t)len_f*NKVf*hd_f));
     float *d_ks=up(rf("ast_ks.bin",(size_t)len_s*NKVs*hd_s)), *d_vs=up(rf("ast_vs.bin",(size_t)len_s*NKVs*hd_s));
     float *d_cf=up(rf("ast_rope_cos_f.bin",hd_f)), *d_sf=up(rf("ast_rope_sin_f.bin",hd_f));
@@ -65,7 +73,7 @@ int main(int argc,char**argv){
         snprintf(nm,sizeof(nm),"step%d_hin.bin",j);  auto hin=rf(nm,B);
         memcpy(in.data(),emb.data(),(size_t)B*4); memcpy(in.data()+B,hin.data(),(size_t)B*4);   // concat[emb|h]
         CK(cudaMemcpy(d_in,in.data(),(size_t)2*B*4,cudaMemcpyHostToDevice));
-        gemma4_assistant_step(c,w,d_in,d_kf,d_vf,len_f,d_ks,d_vs,len_s,d_cf,d_sf,d_cs,d_ss,d_lg,d_ho);
+        gemma4_assistant_step(c,w,d_in,d_kf,d_vf,len_f,d_ks,d_vs,len_s,d_cf,d_sf,d_cs,d_ss,d_lg,d_ho,uq);
         CK(cudaMemcpy(hlg.data(),d_lg,(size_t)V*4,cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(hho.data(),d_ho,(size_t)B*4,cudaMemcpyDeviceToHost));
         snprintf(nm,sizeof(nm),"step%d_logits.bin",j); auto rlg=rf(nm,V);
@@ -77,7 +85,7 @@ int main(int argc,char**argv){
         printf("  [A step%d] logits MEAN-rel=%.3e (max-abs %.3e) h_out MEAN-rel=%.3e | argmax=%d HF=%d %s\n",
                j,lrel,labs,hrel,am,drafts[j],am==drafts[j]?"OK":"MISMATCH");
     }
-    bool okA = (am_bad==0 && worst_lrel<1e-4 && worst_hrel<1e-4);
+    bool okA = (am_bad==0 && worst_lrel<TOL_L && worst_hrel<TOL_H);
     printf("  [Gate A] argmax %d/%d 일치 · worst logits rel %.3e · worst h rel %.3e → %s\n",
            K-am_bad,K,worst_lrel,worst_hrel,okA?"PASS":"FAIL");
     if(!okA) fails++;
@@ -90,7 +98,7 @@ int main(int argc,char**argv){
             char nm[64]; snprintf(nm,sizeof(nm),"step%d_emb.bin",j); auto emb=rf(nm,B);
             memcpy(in.data(),emb.data(),(size_t)B*4); memcpy(in.data()+B,h.data(),(size_t)B*4);
             CK(cudaMemcpy(d_in,in.data(),(size_t)2*B*4,cudaMemcpyHostToDevice));
-            gemma4_assistant_step(c,w,d_in,d_kf,d_vf,len_f,d_ks,d_vs,len_s,d_cf,d_sf,d_cs,d_ss,d_lg,d_ho);
+            gemma4_assistant_step(c,w,d_in,d_kf,d_vf,len_f,d_ks,d_vs,len_s,d_cf,d_sf,d_cs,d_ss,d_lg,d_ho,uq);
             CK(cudaMemcpy(hlg.data(),d_lg,(size_t)V*4,cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(h.data(),d_ho,(size_t)B*4,cudaMemcpyDeviceToHost));   // ★재귀: 엔진 h_out
             int am=amax(hlg.data(),V);
@@ -110,7 +118,7 @@ int main(int argc,char**argv){
         CK(cudaMemcpy(d_in,in.data(),(size_t)2*B*4,cudaMemcpyHostToDevice));
         std::vector<float> first(V); long dsum=0;
         for(int r=0;r<30;r++){
-            gemma4_assistant_step(c,w,d_in,d_kf,d_vf,len_f,d_ks,d_vs,len_s,d_cf,d_sf,d_cs,d_ss,d_lg,d_ho);
+            gemma4_assistant_step(c,w,d_in,d_kf,d_vf,len_f,d_ks,d_vs,len_s,d_cf,d_sf,d_cs,d_ss,d_lg,d_ho,uq);
             if(r==0) CK(cudaMemcpy(first.data(),d_lg,(size_t)V*4,cudaMemcpyDeviceToHost));
             else { CK(cudaMemcpy(hlg.data(),d_lg,(size_t)V*4,cudaMemcpyDeviceToHost)); dsum+=ndiff(hlg.data(),first.data(),V); }
         }
