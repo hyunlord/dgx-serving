@@ -71,13 +71,25 @@
 
 - **near-parity plain(measured)** — 26b MoE(0.28~0.48×)와 대조적으로 12B dense는 llama plain에 **1.15× 갭**까지 근접.
 - **원인(정직)**: 12B는 27b와 same-family dense W4A8 gemv 경로(성숙 자산) 재사용 → 남은 갭=작은 잔여 커널 성숙도(fused/tiled).
-- **★spec 서빙(구현 완료·measured)**: 공식 0.4B assistant(EAGLE류) draft-spec 서빙, drafter W4A8(골든 재게이트
-  PASS·draft 2.0ms) — HTTP client-observed **chat 50.5 t/s(plain 22.0의 2.30×)·code 46.7(2.12×)**, 출력==plain
-  greedy 토큰-동일(불변식 게이트). llama 12B spec 66.9 대비 **0.70~0.75×**(같은 개념 apples-to-apples).
-  accept 갭 규명(진단 완결·measured): 활성화·rope·궤적 가설 전부 **기각**, **code 갭=target q4 가중치 조건화 확정**
-  (fp32-target 실험서 1.74→2.56≈HF — q4 유지 시 개선 불가 = 현 좌표가 q4-스택 상한 근처), chat/prose 잔여는
-  미확정 미시 축(신규 후보: bf16-반올림 분포 정합 — 미시험). 남은 lever: verify concat 분할상환·spec 배칭
-  → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
+- **★spec 서빙 GB10-vs-GB10(캡처값 검증 완료·진짜 좌표)**: MTP fork llama-server를 **같은 조건**(같은 프롬프트·
+  K4·client-observed·warm·single-stream·같은 공식 0.4B assistant[f16 GGUF])으로 GB10 직접 벤치
+  (`tools/bench_llama_gb10.py`) — 우리 spec 서빙(drafter W4A8·출력==plain greedy 불변식 게이트)과 나란히:
+
+  | 12B spec (K4·128tok·client-observed) | llama-GB10 | dgx | dgx/llama | spec 곱 (llama/dgx) |
+  |---|---|---|---|---|
+  | plain | 25.6 t/s | 22.0~22.3 | 0.86× | — |
+  | spec chat | 56.2 | **50.5** | **0.90×** | 2.20× / **2.30×** |
+  | spec code | 69.6 | 46.7 | 0.67× | 2.72× / 2.12× |
+  | spec prose | 45.6 | 31.9 | 0.70× | 1.78× / 1.43× |
+
+  기존 "66.9 대비 0.70~0.75×"의 66.9는 캡처값이었고 **GB10서 재현 확인**(code 69.6) — 진짜 좌표는 워크로드 분해:
+  **chat 0.90×(근접)·code 0.67×·prose 0.70×**. spec 곱 자체는 chat서 우리 우세(2.30 vs 2.20). ★새 함의: llama도
+  4bit(Q4_K_M) target인데 code accept가 높음 → accept 갭 규명의 "q4 조건화"가 정밀화됨 — **양자화 스킴 품질**
+  (K-quant super-block vs 우리 blueprint q4 rel 0.1016)이 accept에 직결 = **수정 가능 축으로 승격**. 조건 차 명시:
+  target Q4_K_M(6.9GB) vs w4a8(동급 4bit·다른 스킴)·drafter f16 vs W4A8(llama에 고정밀 유리 제공).
+  accept 갭 규명(진단·measured): 활성화·rope·궤적 가설 전부 기각, code 갭=target 양자화 조건화 확정(fp32-target
+  1.74→2.56≈HF), chat/prose 잔여=미시 축(후보: bf16-반올림 정합). 남은 lever: **target 양자화 스킴(K-quant급)**·
+  verify concat 분할상환·spec 배칭 → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
 
 ## 4. 대역폭 지형도 (측정 결론 — "이 장비에서 가능한 것")

@@ -138,6 +138,26 @@ HF-스택 궤적-난이도 대조(`tools/probe_traj_difficulty.py` — 위치별
   **bf16-반올림 분포 정합**(drafter가 bf16-연산 스택에 학습 — 엔진 h/KV를 bf16 반올림해 투입하는 실험이 다음 분리).
   풀리면 chat ~2.66-tier(산술 ~60 t/s) 여지.
 
+## llama-on-GB10 공정 벤치 (캡처값 검증 — 진짜 기준선)
+
+기존 비교의 llama 66.9는 캡처값(출처 장비 불명)이었음 → MTP fork `llama-server`(gemma4-assistant 네이티브)를
+**같은 GB10·같은 조건**(같은 프롬프트·같은 공식 assistant를 f16 GGUF로 변환·K4=`--spec-draft-n-max 4`·greedy·
+warm·single-stream·client-observed 동일 회계·전층 GPU)으로 직접 벤치(`tools/bench_llama_gb10.py`):
+
+| K4·128tok | llama-GB10 | dgx | dgx/llama | 곱(llama/dgx) |
+|---|---|---|---|---|
+| plain | 25.6 | 22.0~22.3 | 0.86× | — |
+| spec chat | 56.2 | 50.5 | **0.90×** | 2.20×/**2.30×** |
+| spec code | **69.6** | 46.7 | 0.67× | 2.72×/2.12× |
+| spec prose | 45.6 | 31.9 | 0.70× | 1.78×/1.43× |
+
+- **66.9는 GB10 실좌표로 확인**(code 69.6서 재현) — "0.70~0.75×" 뭉뚱그림의 진짜 분해 = chat 0.90×·code 0.67×.
+- **spec 곱은 chat에서 우리 우세**(2.30 vs 2.20) — chat 갭의 대부분은 plain 갭(0.86×)의 상속.
+- ★**q4 조건화의 정밀화**: llama도 4bit(Q4_K_M) target인데 code accept 우위 → 원인은 "4bit이라서"가 아니라
+  **양자화 스킴 품질**(K-quant super-block·6bit scale vs 우리 blueprint q4 rel-err 0.1016) = 수정 가능 축 승격.
+- 조건 차 명시(정직): target Q4_K_M 6.9GB vs w4a8(동급 4bit·다른 스킴)·drafter f16 vs W4A8(llama에 유리)·
+  prose는 우리만 EOS 조기종료(106tok — t/s 회계는 n/dt로 유효).
+
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
 - 메모리: 12B(24GB) + assistant(0.9GB) 동시 상주 — W4A8 시 ~7.5GB로 여유(128GB 가드 내).

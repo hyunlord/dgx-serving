@@ -84,14 +84,16 @@ engine ceiling — continuous batching itself scales near-linearly.
 llama-bench tg64, speculative off on both sides).
 
 **Gemma4-12B speculative (`--model gemma4-spec`, official 0.4B assistant drafter, W4A8):** serving
-measures **50.5 tok/s chat / 46.7 code** vs 22.0 plain = **2.12–2.30×**, with output verified
-token-identical to plain greedy (drafts are only accepted when they match the target's own argmax).
-llama.cpp reaches 66.9 tok/s with its draft setup — we are at **~0.7×** of that coordinate,
-apples-to-apples (same speculative concept). The remaining draft-acceptance gap is fully diagnosed:
-activation-precision, RoPE-precision, and trajectory-difficulty hypotheses were tested and rejected;
-for code workloads the cause is confirmed as **q4 target-weight conditioning** (a bf16-value target
-recovers HF-tier acceptance — so the current numbers sit near the q4-stack ceiling), with a residual
-micro-axis on chat/prose still open ([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
+measures **50.5 tok/s chat / 46.7 code / 31.9 prose** vs ~22 plain = **1.43–2.30×**, with output
+verified token-identical to plain greedy (drafts are only accepted when they match the target's own
+argmax). Benchmarked head-to-head on the same GB10 against the MTP-fork `llama-server` under
+identical conditions (same prompts, same official assistant, K=4, same client-observed accounting):
+llama measures 56.2 / 69.6 / 45.6 tok/s — we are at **0.90× on chat** (the speculative multiplier
+itself is ours to win there, 2.30× vs 2.20×), **0.67× on code**, 0.70× on prose. The acceptance gap
+is fully diagnosed: the dominant cause is **target-weight quantization conditioning**, and llama's
+higher code acceptance on an equally-4-bit target (Q4_K_M vs our simpler q4 scheme) marks
+quantization-scheme quality as the next actionable lever
+([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
 
 We are still slower at these coordinates and say so. This is **not** a general-purpose
 fastest-engine; it targets one machine and a fixed model set. Full coordinates, accounting
