@@ -116,6 +116,28 @@ draft 비용 **7.9 → 2.0ms**(≈4×↓). ★사이클 곱(N96·warm·spec==gre
 ★캡처 재현(HTTP client-observed·128tok): **chat 50.5 t/s(2.30×)·code 46.7(2.12×)** — llama 12B spec 66.9 대비
 **0.70~0.75×**(시작 0.46~0.52×에서 접근). 남은 lever: accept 갭(위 잔여 후보)·verify concat 분할상환·spec 배칭.
 
+## accept 갭 규명 (진단 완결 — bf16 target 실험 · 전 축 measured)
+
+메모리 가드 하 fp32(bf16값) target 12B 엔진 실험(예산 50.3GB 사전 산정=실측 51.2GB·가용 117GB) +
+HF-스택 궤적-난이도 대조(`tools/probe_traj_difficulty.py` — 위치별 1스텝 일치율 a1, ★a1(HF,HF텍스트)=0.844
+→accept4 환산 2.66 = HF 실측 2.66 정확 재현으로 방법론 자체 검증):
+
+| 가설 | 실험 | 판정 |
+|---|---|---|
+| W4A8 활성화 조건화 | uq=1(활성화 fp32) 대조 | **기각**(accept 불변) |
+| rope bf16 정밀 | fp32 테이블 × q4·fp32 target 양쪽 | **기각**(fp32-target 조합서도 소수점 동일) |
+| 궤적/텍스트 난이도 | HF-스택 a1 on 우리 q4/fp32 궤적 | **기각**(q4 텍스트 a1 0.885=오히려 쉬움·fp32 chat 0.844=정상) |
+| **target q4 가중치 조건화** | fp32-target 엔진 accept | **code 확정**: K4 1.74→**2.56**(≈HF 2.66)·K8 1.91→3.92 |
+| assistant graph 결함 | ②게이트(HF 입력→엔진==HF) | 무죄 |
+| chat/prose 잔여 | 위 전부 소거 후 | **미확정 미시 축** — chat fp32-target 1.56 vs 같은 텍스트 HF-a1 2.66 |
+
+- **prose 해소**: HF 스택도 prose는 a1 0.60(→1.32) = 본질적 어려운 워크로드(HF 실측 1.13과 정합) — 엔진 0.83과의
+  잔여는 chat과 동류.
+- **실용 결론(정직)**: 현 q4 서빙 좌표(50.5/46.7 t/s)는 **q4-스택의 상한 근처** — code는 조건화 확정이라 q4 유지
+  시 accept 개선 불가(fp32 target은 plain 4.9 t/s=서빙 비실용·진단 전용). chat 잔여 축의 신규 후보(미시험):
+  **bf16-반올림 분포 정합**(drafter가 bf16-연산 스택에 학습 — 엔진 h/KV를 bf16 반올림해 투입하는 실험이 다음 분리).
+  풀리면 chat ~2.66-tier(산술 ~60 t/s) 여지.
+
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
 - 메모리: 12B(24GB) + assistant(0.9GB) 동시 상주 — W4A8 시 ~7.5GB로 여유(128GB 가드 내).

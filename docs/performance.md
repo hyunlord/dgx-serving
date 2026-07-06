@@ -74,8 +74,9 @@
 - **★spec 서빙(구현 완료·measured)**: 공식 0.4B assistant(EAGLE류) draft-spec 서빙, drafter W4A8(골든 재게이트
   PASS·draft 2.0ms) — HTTP client-observed **chat 50.5 t/s(plain 22.0의 2.30×)·code 46.7(2.12×)**, 출력==plain
   greedy 토큰-동일(불변식 게이트). llama 12B spec 66.9 대비 **0.70~0.75×**(같은 개념 apples-to-apples).
-  accept 갭 진단(measured): 활성화-양자화·rope-정밀 가설 **기각** — 잔여 후보=target q4 가중치 조건화/궤적 차이
-  (bf16-target 실험=후속). 남은 lever: accept 갭(HF-tier 시 ~2.5×+)·verify concat 분할상환·spec 배칭
+  accept 갭 규명(진단 완결·measured): 활성화·rope·궤적 가설 전부 **기각**, **code 갭=target q4 가중치 조건화 확정**
+  (fp32-target 실험서 1.74→2.56≈HF — q4 유지 시 개선 불가 = 현 좌표가 q4-스택 상한 근처), chat/prose 잔여는
+  미확정 미시 축(신규 후보: bf16-반올림 분포 정합 — 미시험). 남은 lever: verify concat 분할상환·spec 배칭
   → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
 

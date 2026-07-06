@@ -153,6 +153,11 @@ int main(int argc,char**argv){
         std::vector<int> ptoks, stoks; double pms, sms; int cyc; double md,mv;
         plain_run(ids,ptoks,pms);                                // warm-up
         plain_run(ids,ptoks,pms);                                // 측정
+        if(const char* dp=getenv("DUMP_PLAIN")){                 // 진단용: plain 궤적 덤프(HF 궤적-난이도 대조 실험)
+            char pp[512]; snprintf(pp,sizeof(pp),"%s/traj_%s.bin",dp,wls[wi]);
+            FILE*f=fopen(pp,"wb"); if(f){ fwrite(ptoks.data(),4,ptoks.size(),f); fclose(f); }
+        }
+        if(getenv("SKIP_SPEC")){ printf("%-6s plain %.2f t/s (SKIP_SPEC — 궤적 덤프 전용)\n",wls[wi],N/(pms/1e3)); continue; }  // 진단용
         double ptps=N/(pms/1e3);
         for(int K : {2,4,8}){
             spec_run(ids,K,stoks,sms,cyc,md,mv);                 // warm-up

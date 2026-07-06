@@ -87,10 +87,11 @@ llama-bench tg64, speculative off on both sides).
 measures **50.5 tok/s chat / 46.7 code** vs 22.0 plain = **2.12–2.30×**, with output verified
 token-identical to plain greedy (drafts are only accepted when they match the target's own argmax).
 llama.cpp reaches 66.9 tok/s with its draft setup — we are at **~0.7×** of that coordinate,
-apples-to-apples (same speculative concept). The remaining gap is measured and named — a
-draft-acceptance gap against the bf16-trained drafter (activation-precision and RoPE-precision
-hypotheses tested and rejected; weight-quantization conditioning remains) plus verify amortization
-and spec batching ([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
+apples-to-apples (same speculative concept). The remaining draft-acceptance gap is fully diagnosed:
+activation-precision, RoPE-precision, and trajectory-difficulty hypotheses were tested and rejected;
+for code workloads the cause is confirmed as **q4 target-weight conditioning** (a bf16-value target
+recovers HF-tier acceptance — so the current numbers sit near the q4-stack ceiling), with a residual
+micro-axis on chat/prose still open ([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
 
 We are still slower at these coordinates and say so. This is **not** a general-purpose
 fastest-engine; it targets one machine and a fixed model set. Full coordinates, accounting
