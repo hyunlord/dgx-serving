@@ -21,6 +21,7 @@ build/
 /tools/serve_daemon_gemma4_online
 /tools/serve_daemon_qwen_online
 /tools/serve_daemon_qwen_spec_online
+/tools/serve_daemon_gemma4_spec_online
 /tools/bench_w4a8_sb
 /tools/bench_mmq_tune
 /tools/bench_mmq_shape
