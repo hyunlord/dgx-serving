@@ -90,9 +90,10 @@ argmax). Benchmarked head-to-head on the same GB10 against the MTP-fork `llama-s
 identical conditions (same prompts, same official assistant, K=4, same client-observed accounting):
 llama measures 56.2 / 69.6 / 45.6 tok/s — we are at **0.90× on chat** (the speculative multiplier
 itself is ours to win there, 2.30× vs 2.20×), **0.67× on code**, 0.70× on prose. The acceptance gap
-is fully diagnosed: the dominant cause is **target-weight quantization conditioning**, and llama's
-higher code acceptance on an equally-4-bit target (Q4_K_M vs our simpler q4 scheme) marks
-quantization-scheme quality as the next actionable lever
+is fully diagnosed, including a zero-implementation K-quant-quality injection experiment: even with
+32%-more-accurate weights (Q4_K_M values), code acceptance barely moves — **the code wall is 4-bit
+quantization itself, not scheme quality** (prose, interestingly, recovers fully). The next named
+levers are adaptive draft length (llama drafts adaptively; we use fixed K) and verify amortization
 ([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
 
 We are still slower at these coordinates and say so. This is **not** a general-purpose
