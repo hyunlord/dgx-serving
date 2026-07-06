@@ -77,6 +77,13 @@ bf16 argmax) → ③ 사이클 e2e(accept·곱 실측 vs 위 전이 산술) → 
 > MEAN-rel **3~6e-07**(fp32 동급)·argmax 8/8==HF·**재귀 8스텝 draft 전부 일치**(오차 축적 없음)·결정성 30회.
 > 신규 커널 0(cross-attn=attn_decode base=len-1 매핑이 HF flip-마스크 의미와 정확 일치). ★③ de-risk 실측:
 > target concat용 hidden = `hidden_states[-1]` = **final-norm 전**(층 출력) — target-side는 pre-norm residual 노출.
+>
+> **③ 통과(사이클 e2e — 곱 첫 실측)**: draft②→verify①→accept 연결(`test_gemma4_spec_e2e`·target hook =
+> `gemma4_decode` d_prenorm). ★**spec==greedy 사이클 유지**: 3워크로드×K{2,4,8} 전부 출력==plain greedy 토큰-동일.
+> ★곱 실측(12B W4A8·N96·warm): 비분할상환 verify는 0.24~0.81×(verify가 0.7×(K+1)×T_dec 지배 — measured) →
+> `amort_mm=1`(SB==gemv bit-id 기게이트 성질·[A] 재검증) 후 **code K4 1.54×(34.1 t/s)·chat K4 1.34×(29.7)·
+> prose ~1.0×**. 남은 lever(측정 명명): assistant fp32 7.9ms/스텝(bf16/q4화 → 산술 ~1.7-1.9×)·**accept 갭**
+> (chat K4 1.46 vs HF 2.66 — W4A8 target 조건화 가설, 도달 시 ~2.5×=전이 산술 정합)·serving 통합(④).
 
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
