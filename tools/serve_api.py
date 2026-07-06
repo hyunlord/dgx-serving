@@ -225,8 +225,10 @@ def main():
     ap.add_argument("--model-profile", default=os.path.join(HERE,"autotune","profiles","gemma4-31b.json"))  # recipe verify용 프로파일 json(--model과 별개)
     ap.add_argument("--maxlen", type=int, default=384)
     ap.add_argument("--bmax", type=int, default=8)                 # 동시 활성 슬롯 상한(온라인 배칭 폭)
-    ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen","spec"])  # daemon 종류(arg 레이아웃 상이; spec=27b MTP spec)
+    ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen","spec","gemma4-spec"])  # daemon 종류(arg 레이아웃 상이; spec=27b MTP·gemma4-spec=12B+0.4B assistant)
     ap.add_argument("--golden", default="")                        # qwen/spec rope+MTP golden dir(필수 — gemma4는 dummy rope)
+    ap.add_argument("--assistant", default="")                     # gemma4-spec: 0.4B assistant weights dir(extract_weights_assistant.py)
+    ap.add_argument("--spec-k", type=int, default=4)               # gemma4-spec: draft 길이 K(3관문 최적 4)
     ap.add_argument("--uq", type=int, default=2)                   # recipe 없을 때 양자화(2=W4A8·1=q4·0=fp32)
     ap.add_argument("--model-id", default="")                      # recipe 없을 때 모델 표시명
     ap.add_argument("--port", type=int, default=8000)
@@ -263,6 +265,10 @@ def main():
     print(f"  [stop] EOS 종료 토큰 IDs = {stop_ids} (generation_config 권위)", file=sys.stderr)
     if args.model == "gemma4":
         cmd = [os.path.join(REPO,"tools","serve_daemon_gemma4_online"), args.weights, str(uq), str(args.maxlen), str(args.bmax)]
+    elif args.model == "gemma4-spec":                              # 12B + 0.4B assistant draft-spec(4관문) — spec==greedy 불변
+        if not args.assistant: sys.exit("[serve_api] --model gemma4-spec 은 --assistant(0.4B weights dir) 필수")
+        cmd = [os.path.join(REPO,"tools","serve_daemon_gemma4_spec_online"), args.weights, args.assistant,
+               str(uq), str(args.maxlen), str(args.bmax), str(args.spec_k)]
     elif args.model == "spec":                                     # 27b MTP spec(draft→verify→accept) — golden(rope+MTP) 필수
         if not args.golden: sys.exit("[serve_api] --model spec 은 --golden(rope+MTP dir) 필수")
         cmd = [os.path.join(REPO,"tools","serve_daemon_qwen_spec_online"), args.weights, args.golden, str(uq), str(args.bmax)]  # spec: <w> <golden> <uq> <Bmax>(maxlen=PMAX·K/W 기본)
@@ -272,7 +278,7 @@ def main():
     Handler.daemon = OnlineDaemon(cmd, env=daemon_env)
     Handler.model_id = model_id
     Handler.quant = {2:"w4a8", 1:"q4", 0:"fp32"}.get(uq, "w4a8")
-    Handler.spec = (args.model == "spec")                  # 모델 배지(/v1/models·웹UI)용
+    Handler.spec = (args.model in ("spec","gemma4-spec"))  # 모델 배지(/v1/models·웹UI)용 — spec 표시
 
     class _Server(ThreadingHTTPServer):
         request_queue_size = 128       # SYN backlog 상향(기본 5) — 동시 연결 폭주(초과구독)서 커널 리셋 방지

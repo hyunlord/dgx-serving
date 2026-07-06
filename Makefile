@@ -131,6 +131,10 @@ tools/serve_daemon_qwen_online: tools/serve_daemon_qwen_online.cu models/qwen35.
 tools/serve_daemon_qwen_spec_online: tools/serve_daemon_qwen_spec_online.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_qwen_spec_online.cu models/qwen35.cu models/qwen35_decode.cu models/qwen35_batch.cu runtime/weights_qwen.cu -o $@ -lpthread
 
+# draft-spec 온라인 daemon(4관문): 12B target + 0.4B assistant — 슬롯별 spec 사이클(spec==greedy 불변).
+tools/serve_daemon_gemma4_spec_online: tools/serve_daemon_gemma4_spec_online.cu models/gemma4_assistant.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/serve_daemon_gemma4_spec_online.cu models/gemma4_assistant.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@ -lpthread
+
 # M4 STEP B: Gemma4 성능 벤치(single/batch decode t/s + prefill, roofline 대조). 사용법: ./tools/bench_gemma4 <w> [uq] [ctx] [ngen] [B..]
 tools/bench_gemma4: tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu models/gemma4_moe.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/bench_gemma4.cu models/gemma4_decode.cu models/gemma4_batch.cu models/gemma4_moe.cu runtime/weights_gemma4.cu -o $@
