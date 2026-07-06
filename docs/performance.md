@@ -88,8 +88,11 @@
   (K-quant super-block vs 우리 blueprint q4 rel 0.1016)이 accept에 직결 = **수정 가능 축으로 승격**. 조건 차 명시:
   target Q4_K_M(6.9GB) vs w4a8(동급 4bit·다른 스킴)·drafter f16 vs W4A8(llama에 고정밀 유리 제공).
   accept 갭 규명(진단·measured): 활성화·rope·궤적 가설 전부 기각, code 갭=target 양자화 조건화 확정(fp32-target
-  1.74→2.56≈HF), chat/prose 잔여=미시 축(후보: bf16-반올림 정합). 남은 lever: **target 양자화 스킴(K-quant급)**·
-  verify concat 분할상환·spec 배칭 → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
+  1.74→2.56≈HF). ★K-quant 품질 주입 실험(구현 0): 가중치 32% 정확(rel 0.0695 vs 0.1016)해도 code accept는
+  소폭만 회복(1.91 — **code 벽=4bit 자체·스킴 아님**)·prose는 HF 동률 완전 회복 → K-quant 커널 구현 보류
+  (q2 패턴). 남은 lever: **적응적 draft 길이**(llama n-min~max 대응·호스트 로직)·verify concat 분할상환·
+  spec 배칭·(잔여 후보: K-quant bytes 10%↓=plain 소폭·bf16-반올림 정합)
+  → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
 
 ## 4. 대역폭 지형도 (측정 결론 — "이 장비에서 가능한 것")

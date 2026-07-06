@@ -158,6 +158,26 @@ warm·single-stream·client-observed 동일 회계·전층 GPU)으로 직접 벤
 - 조건 차 명시(정직): target Q4_K_M 6.9GB vs w4a8(동급 4bit·다른 스킴)·drafter f16 vs W4A8(llama에 유리)·
   prose는 우리만 EOS 조기종료(106tok — t/s 회계는 n/dt로 유효).
 
+## K-quant 품질 주입 실험 (구현 0 — 스킴 가설의 정량 판정)
+
+Q4_K_M GGUF를 fp32 dequant해 엔진 uq=0에 주입(`tools/probe_kquant_inject.py` — 정합 골든: 교체 330·
+fallback 0·worst cosine 0.996·norm-ratio 가드). **가중치 보존은 실측 32% 우수**(rel-err 0.0695 vs blueprint
+0.1016·혼합 정밀 Q6_K[v/embed] 포함). accept(전부 fp32-활성·가중치 값만 대조):
+
+| accept K4 | blueprint q4 | **K-quant 값** | bf16 값 | HF |
+|---|---|---|---|---|
+| code | 1.74 | **1.91 (+0.17 소폭)** | 2.56 | 2.66 |
+| chat | 1.46 | 1.67 | 1.56 | 2.66 |
+| prose | 0.71 | **1.13 (HF 동률 — 완전 회복)** | 0.83 | 1.13 |
+
+**판정(스킴 가설 부분 기각)**: 가중치 32% 정확해져도 **code accept는 소폭만 회복 — code의 벽은 스킴 품질이
+아니라 4bit 양자화 자체**(bf16값에서만 2.56). prose는 완전 회복(워크로드 선택적). 풀기 비용은 함정 아니었음
+(Q4_K 4.5 vs blueprint 5.0 bits/weight로 오히려 가볍고 니블 정렬·llama plain 25.6>22.0 실측 상한) —
+그러나 accept 열쇠가 아니므로 **K-quant 커널 구현 보류**(q2 패턴: 구현 전 성패 숫자가 차단). 잔여 이득
+후보로만 기록: bytes 10%↓=plain +8~10% 산술·prose accept. ★llama code 우위의 잔여 가설(신규):
+**적응적 draft 길이**(llama --spec-draft-n-min~max = 확신 낮으면 짧게 draft·낭비 사이클 절감 vs 우리 고정 K4)
+— 호스트 로직만으로 시험 가능(커널 0)·다음 분리 실험.
+
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
 - 메모리: 12B(24GB) + assistant(0.9GB) 동시 상주 — W4A8 시 ~7.5GB로 여유(128GB 가드 내).
