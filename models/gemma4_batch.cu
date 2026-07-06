@@ -286,3 +286,35 @@ void gemma4_prefill_batch_slot(const ModelConfig &c, const G4Weights &w, G4Batch
     // amort_mm=1(프리필 SB 커널로 weight amortize — 비-amortized plain gemv의 net-loss 해소, bit-id 유지)
     gemma4_decode(c,w,view,d_tokens,P,d_cos_f,d_sin_f,d_cos_s,d_sin_s,d_logits,0,use_q4,1,1);
 }
+
+// ---- spec chain verify (슬롯-b 뷰): 검증필 gemma4_decode(Sq=Nb, commit=0, 전 위치 로짓) 재사용 ----
+//   prefill_batch_slot과 동일한 뷰 트릭. amort=0 = plain 1토큰 decode와 동일 커널 선택(전 S 행-독립)
+//   → verify 로짓 == plain 로짓 bit-id가 구성적 목표(게이트 test_gemma4_verify가 Δ=0 실측).
+//   per-slot 순차 호출(정확성 canonical) — concat 분할상환은 후속 perf lever(27b 축1 패턴).
+void gemma4_verify_batch(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                         int B_act, const int *slot_ids, const int *Nb, const int *pos_b,
+                         const int *d_tokens_cat,
+                         const float *d_cos_f, const float *d_sin_f,
+                         const float *d_cos_s, const float *d_sin_s,
+                         float *d_logits_cat, int use_q4){
+    const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
+    const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
+    const int V=c.vocab_size;
+    long off=0;
+    for(int a=0;a<B_act;a++){
+        const int b=slot_ids[a], Sq=Nb[a];
+        if(pos_b[a]+Sq>st.max_len){ fprintf(stderr,"[gemma4_verify_batch] slot %d pos %d+%d > max_len %d — KV 예산 초과, 중단.\n",b,pos_b[a],Sq,st.max_len); exit(1); }
+        G4DecodeState view{}; view.n_past=pos_b[a]; view.max_len=st.max_len; view.L=st.L; view.kv_cap=st.kv_cap;
+        std::vector<float*> Kc(st.L), Vc(st.L);
+        for(int l=0;l<st.L;l++){
+            int full=c.layer_is_full?c.layer_is_full[l]:1;
+            int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
+            size_t stride=(size_t)st.max_len*nkv*hd;
+            Kc[l]=st.Kc[l]+(size_t)b*stride; Vc[l]=st.Vc[l]+(size_t)b*stride;   // 슬롯 b 서브영역
+        }
+        view.Kc=Kc.data(); view.Vc=Vc.data();
+        gemma4_decode(c,w,view,d_tokens_cat+off,Sq,d_cos_f,d_sin_f,d_cos_s,d_sin_s,
+                      d_logits_cat+off*V,0,use_q4,0,0);   // commit=0·last_only=0(전 위치)·amort=0(plain 동일 경로)
+        off+=Sq;
+    }
+}

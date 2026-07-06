@@ -63,4 +63,20 @@ void gemma4_prefill_batch_slot(const ModelConfig &c, const G4Weights &w, G4Batch
                                const float *d_cos_s, const float *d_sin_s,
                                float *d_logits, int use_q4);
 
+// spec chain verify (draft-spec 1관문, dense 전용 — 12B assistant 경로): 활성 슬롯 a의 청크
+//   [anchor, d1..dK_a](= Nb[a] 토큰, d_tokens_cat의 off[a]..)를 위치 pos_b[a]..pos_b[a]+Nb[a]-1 에서 한 forward로 검증.
+//   d_logits_cat: [ΣNb, V] 전 위치 로짓(softcap 후) — row off[a]+i = "토큰 i까지 본 뒤 다음 토큰" 분포.
+//   KV는 슬롯 서브영역 pos_b[a]..에 append. ★commit 없음 — 수락 길이만큼 위치 전진은 호출자(호스트) 산술이고,
+//   미수락 위치의 KV는 다음 청크 append가 덮어씀 = 롤백은 위치 관리뿐(GDN 없음 — 27b와 달리 state snapshot 불요).
+//   ★bit-id canonical: 슬롯별 gemma4_decode(Sq=Nb, commit=0, last_only=0, amort=0) 뷰 호출 = plain 1토큰 decode와
+//   문자 그대로 동일 커널 경로(mm/rope/attn/lm_head 전부 행-독립 — 청크 prefill Δ=0 게이트와 같은 성질).
+//   게이트: tests/test_gemma4_verify (spec==greedy bit-id·거부/롤백·결정성·batch==solo).
+//   concat 분할상환(27b qwen35_verify_batch 축1)은 후속 perf lever — 정확성 관문 먼저.
+void gemma4_verify_batch(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                         int B_act, const int *slot_ids, const int *Nb, const int *pos_b,
+                         const int *d_tokens_cat,
+                         const float *d_cos_f, const float *d_sin_f,
+                         const float *d_cos_s, const float *d_sin_s,
+                         float *d_logits_cat, int use_q4);
+
 #endif // DGX_DECODE_STATE_GEMMA4_H
