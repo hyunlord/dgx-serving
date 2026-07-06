@@ -8,8 +8,8 @@ Purpose-built for a single machine (GB10, ~273 GB/s unified LPDDR5X, 128 GB unif
 
 ## Features
 
-- **4 models served** out of the box: Qwen3.5-27B, Qwen3.5-35B-A3B (MoE), Gemma4-31B, 26B-A4B (MoE) — all W4A8.
-- **OpenAI-compatible API** (`/v1/completions`, `/v1/models`) with SSE streaming and online continuous batching.
+- **5 models served** out of the box: Qwen3.5-27B, Qwen3.5-35B-A3B (MoE), Gemma4-12B, Gemma4-31B, Gemma4-26B-A4B (MoE) — all W4A8.
+- **OpenAI-compatible API + built-in web chat UI** (`/v1/completions`, `/v1/chat/completions`, `/v1/models`) — SSE streaming, online continuous batching, EOS-aware stop (`finish_reason`), and a zero-dependency browser chat page with per-response tok/s + TTFT metrics.
 - **Built-in MTP speculative decoding** — the Multi-Token-Prediction head ships with the model; no separate draft model to host.
 - **Auto-tuning pipeline**: `probe → plan → tune (Bayesian, Optuna TPE) → recipe`, with a correctness (bit-identity) gate on every tuned config.
 - **One-file recipes**: a `recipe.yaml` captures a tuned serving policy (regime → config) plus verifiable claims; `verify` re-checks device fingerprint, memory budget, and reproduces the numbers on your machine.
@@ -19,30 +19,27 @@ Purpose-built for a single machine (GB10, ~273 GB/s unified LPDDR5X, 128 GB unif
 ## Quick Start
 
 ```bash
-# 1. Build (nvcc -arch=sm_120, GB10 sm_121-compatible)
 git clone https://github.com/hyunlord/dgx-serving && cd dgx-serving
-make                              # builds test binaries; ARCH=/NVCC= overridable
-
-# 2. Prepare weights (not distributed — downloaded from HuggingFace and converted).
-#    Model licenses (Qwen/Gemma) apply and are your responsibility.
-pip install transformers safetensors torch      # reference/tokenizer deps
-python tools/extract_weights_qwen35.py --model Qwen/Qwen3.5-27B --out artifacts/qwen35-27b/weights
-python tools/make_reference_qwen35.py  --model Qwen/Qwen3.5-27B --out artifacts/qwen35-27b/golden
-
-# 3. Build the serving daemon and start the API server
-make tools/serve_daemon_qwen_online
-python tools/serve_api.py --model qwen \
-    --weights artifacts/qwen35-27b/weights \
-    --golden  artifacts/qwen35-27b/golden \
-    --port 8000
-
-# 4. Query it (OpenAI-compatible)
-curl http://localhost:8000/v1/completions \
-    -H 'Content-Type: application/json' \
-    -d '{"model":"qwen","prompt":"The capital of France is","max_tokens":16}'
+make        # nvcc -arch=sm_120 (GB10 sm_121-compatible); builds kernels + test binaries, no model assets needed
 ```
 
-Optional — the auto-tuning pipeline (device fingerprint → tune → shareable recipe):
+**Serving requires a multi-step weight + RoPE setup** — weights are downloaded from HuggingFace and
+converted locally (never bundled; model licenses are your responsibility), and Qwen-family daemons
+additionally need generated RoPE tables. Follow [`docs/serving-setup.md`](./docs/serving-setup.md), then:
+
+```bash
+# after setup (example: Gemma4-12B)
+python tools/serve_api.py --model gemma4 --tokenizer google/gemma-4-12B-it \
+    --weights artifacts/gemma4-12b/weights --port 8000
+# → web chat UI: http://localhost:8000/
+curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"gemma4","messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
+```
+
+The correctness suite (`make test`) and the per-model HF golden gates need reference-model
+artifacts — also covered in [`docs/serving-setup.md`](./docs/serving-setup.md).
+
+Optional — the auto-tuning pipeline (device fingerprint → tune → shareable recipe), after serving setup:
 
 ```bash
 python tools/autotune/probe.py   --out tools/autotune/artifacts/gb10-auto.json
@@ -50,8 +47,9 @@ python tools/autotune/autotune.py --model tools/autotune/profiles/qwen35-27b.jso
 python tools/autotune/recipe.py  verify recipes/qwen35-27b-gb10.yaml   # reproduce claims locally
 ```
 
-> Serving with `--model gemma4` (dense) or `--model spec` (27B MTP speculative) follows the same shape;
-> see [`docs/recipe-schema.md`](./docs/recipe-schema.md). Weights are never bundled.
+> Serving with `--model qwen` (27B/35B plain) or `--model spec` (27B MTP speculative) follows the
+> same shape; see [`docs/serving-setup.md`](./docs/serving-setup.md) and
+> [`docs/recipe-schema.md`](./docs/recipe-schema.md). Weights are never bundled.
 
 ## Performance
 
@@ -59,20 +57,38 @@ Measured on GB10 (sm_121). Representative serving throughput (continuous batchin
 
 | Model | Op point | Throughput | tpot95 | Conditions |
 |---|---|---|---|---|
-| Qwen3.5-27B (spec) | B16 K7W2, λ4 | ~51.7 tok/s | ~0.34 s | nreq60, w4a8+mtp_q4 |
-| Gemma4-31B (dense) | B8 (knee) | 36–38 tok/s | ~0.14 s | nreq48, maxlen384 |
+| Qwen3.5-27B (MTP spec) | B16 K7W2, λ4 | ~51.7 tok/s | ~0.34 s | nreq60, w4a8+mtp_q4 |
 | Qwen3.5-35B-A3B (MoE) | B8 | ~62.7 tok/s | ~0.11 s | nreq40, maxlen256 |
+| Gemma4-12B (dense) | B8 (all regimes) | ~96 tok/s | ~0.05 s | nreq48, maxlen384 |
+| Gemma4-31B (dense) | B8 (knee) | 36–38 tok/s | ~0.14 s | nreq48, maxlen384 |
+| Gemma4-26B-A4B (MoE) | single-stream | 43–46 tok/s | — | HTTP, active-width decode |
 
-Roofline attainment (weight-movement upper bound): 27B dense single **62.5%**, Gemma4 53.3%, 35B MoE 29.8%.
+Roofline attainment (weight-movement upper bound, single decode): 27B **62.5%**, Gemma4-12B 57.6%, Gemma4-31B 53.3%, 35B MoE 29.8%.
 
-Honest comparison vs `llama.cpp` (same Gemma4-26B-A4B, ~q4, HTTP, warm):
+Honest comparison vs `llama.cpp` (same model, same prompts, HTTP, warm, ~q4-class):
+
+**Gemma4-26B-A4B (MoE):**
 
 | Concurrency | dgx-serving | llama.cpp | ratio |
 |---|---|---|---|
-| 1 | 14.7 tok/s | 52.6 | 0.28× |
-| 8 (=Bmax) | 80.6 tok/s | 168.3 | 0.48× |
+| 1 | 43–46 tok/s | 52.6 | **0.82–0.87×** |
+| 8 (=Bmax) | 80.6 tok/s | 168.3 | **0.48×** |
 
-We are slower here. The gap is **kernel maturity** (26B MoE is the newest, un-tuned path; llama.cpp's kernels are years-optimized), not an engine ceiling — continuous batching scales near-linearly (5.5× from N=1→8). This is **not** a general-purpose fastest-engine; it targets one machine and a fixed model set. Full coordinates, roofline breakdown, and the GB10 bandwidth landscape: [`docs/performance.md`](./docs/performance.md).
+Single-stream used to be 14.7 tok/s (0.28×): the online loop decoded single requests at full batch
+width — fixed by active-width decode (raw kernel speed recovered, 2.5×). The N=1 range spans
+full-accounting vs decode-only tok/s. The batch-8 row is unaffected by that fix and is **kernel
+maturity** (26B MoE is our newest, un-tuned path; llama.cpp's kernels are years-optimized), not an
+engine ceiling — continuous batching itself scales near-linearly.
+
+**Gemma4-12B (dense), plain vs plain, single decode:** 23.3 vs 26.8 tok/s = **0.87×** (near-parity;
+llama-bench tg64, speculative off on both sides). llama.cpp reaches 66.9 tok/s on this model with a
+separate draft model; we measured that path for Gemma and folded it — net gain ≈1.0×, the draft's
+own cost eats the acceptance savings ([`docs/gemma-draft-spec-verdict.md`](./docs/gemma-draft-spec-verdict.md)).
+
+We are still slower at these coordinates and say so. This is **not** a general-purpose
+fastest-engine; it targets one machine and a fixed model set. Full coordinates, accounting
+definitions (raw / decode-only / full), roofline breakdown, and the GB10 bandwidth landscape:
+[`docs/performance.md`](./docs/performance.md).
 
 ## Requirements
 
@@ -83,6 +99,7 @@ We are slower here. The gap is **kernel maturity** (26B MoE is the newest, un-tu
 
 ## Documentation
 
+- [`docs/serving-setup.md`](./docs/serving-setup.md) — per-model weight conversion, RoPE tables, starting the API server, web chat UI.
 - [`docs/performance.md`](./docs/performance.md) — measured coordinates, roofline attainment, honest benchmarks, bandwidth landscape, known limits.
 - [`docs/m6-backend-boundary.md`](./docs/m6-backend-boundary.md) — architecture, correctness contract, and how to add a new model family.
 - [`docs/recipe-schema.md`](./docs/recipe-schema.md) — recipe format and the `verify` / `run` workflow.
