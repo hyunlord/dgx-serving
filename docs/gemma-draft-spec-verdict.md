@@ -48,3 +48,8 @@
 draft-spec은 12B에서 measured로 순 곱 부족(~1.0×) → **접음**. 12B plain near-parity(llama plain 0.87×·실사용 가능)로
 충분. llama 66.9(spec)는 우리가 못 따라가는 좌표로 정직 유지(다른 draft 자산 필요 — 엔진 밖). 다음 lever = FP4(대기)·
 서빙 개선·push. ★q2 패턴 성공: 130줄 신규 개발 전 measured가 헛수고 차단(구현 0으로 판정).
+
+## ★재판정 부록 (후속 measured — 이 판정의 범위 정정)
+이 접음은 **E2B라는 draft의 판정**이었지 draft-spec 경로 자체의 판정이 아니었다. 공식 drafter
+**google/gemma-4-12B-it-assistant**(0.423B, target-결합 EAGLE류·c≈0.038=E2B의 1/7)로 같은 프롬프트 재측정:
+HF 좌표 순 곱 **2.1~4.0×**(E2B 0.95~1.22×) → **구현 정당화 GO**. → [gemma-assistant-spec-measured.md](./gemma-assistant-spec-measured.md)

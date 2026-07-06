@@ -82,8 +82,11 @@ engine ceiling — continuous batching itself scales near-linearly.
 
 **Gemma4-12B (dense), plain vs plain, single decode:** 23.3 vs 26.8 tok/s = **0.87×** (near-parity;
 llama-bench tg64, speculative off on both sides). llama.cpp reaches 66.9 tok/s on this model with a
-separate draft model; we measured that path for Gemma and folded it — net gain ≈1.0×, the draft's
-own cost eats the acceptance savings ([`docs/gemma-draft-spec-verdict.md`](./docs/gemma-draft-spec-verdict.md)).
+draft model. We first measured that path with a generic small draft (E2B) and folded it — net gain
+≈1.0×, the draft's own cost ate the acceptance savings ([`docs/gemma-draft-spec-verdict.md`](./docs/gemma-draft-spec-verdict.md)).
+Re-measured with Google's official 0.4B MTP assistant drafter: **2.1–4.0×** net (HF coordinates;
+outputs greedy-equivalent — divergences only at exact bf16 logit ties) — engine implementation is the active roadmap item
+([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)); serving today is still plain.
 
 We are still slower at these coordinates and say so. This is **not** a general-purpose
 fastest-engine; it targets one machine and a fixed model set. Full coordinates, accounting
