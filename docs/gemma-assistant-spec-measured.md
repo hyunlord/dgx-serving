@@ -69,6 +69,10 @@ T_verify(K+1≤9)=T_dec×1.0~1.2(27b spec 실측 패턴), T_ast=2.5~5.5ms(HF 실
 new-paradigm(26B MoE급) — **단계 게이트**: ① verify POC(spec==greedy **bit-id**) → ② assistant HF-골든(fp32/
 bf16 argmax) → ③ 사이클 e2e(accept·곱 실측 vs 위 전이 산술) → ④ 서빙/웹UI(spec 켠 12B 채팅). 예상 2~4 세션.
 
+> **① 통과(a81f686)**: `gemma4_verify_batch` + `test_gemma4_verify` — perfect-draft K∈{2,3,4,8} 전 위치 로짓
+> **bit-identical(diff 0)** vs plain greedy·오염 24사이클 거부/교정/롤백 정확·결정성 30회·batch==solo 전부 PASS.
+> gemma4 경로는 전 구간 행-독립이라 verify 로짓이 plain과 같은 비트 = **tie-flip 구조적 불가**(HF와 대조).
+
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
 - 메모리: 12B(24GB) + assistant(0.9GB) 동시 상주 — W4A8 시 ~7.5GB로 여유(128GB 가드 내).
