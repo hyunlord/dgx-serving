@@ -26,11 +26,14 @@ void reset_g4_decode_state(G4DecodeState &s);   // n_past=0 (KV 재사용)
 //     위치 p의 row = p (엔진 진입 전 전체 위치 테이블 준비 — golden은 HF 캡처본).
 //   d_logits: [Sq,V] (softcap 후). commit=1이면 n_past += Sq.
 //   d_hidden: nullable [Sq(또는 last), H] 진단용. last_only: 1=마지막 토큰만 logits.
+//   d_prenorm(nullable, [Sq,H]): final-norm 직전 residual(x = 마지막 층 출력, layer_scalar 후) 복사 —
+//     HF hidden_states[-1]과 동일(실측: final-norm 전). assistant draft의 h_prev 입력(EAGLE hook·3관문).
 void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const int *d_tokens, int Sq,
                    const float *d_cos_f, const float *d_sin_f,
                    const float *d_cos_s, const float *d_sin_s,
-                   float *d_logits, int commit, int use_q4, int last_only = 0, int amort_mm = 0);
+                   float *d_logits, int commit, int use_q4, int last_only = 0, int amort_mm = 0,
+                   float *d_prenorm = nullptr);
 
 // ---- Batch decode (A-3-2): B슬롯 동시. same-length(모든 슬롯 위치 base 공통) — ragged/chunked는 A-3 후속. ----
 //   KV: 층별 [B, max_len, NKV_l, hd_l] fp32 (kv_stride = max_len*NKV_l*hd_l). GDN 없어 KV만.

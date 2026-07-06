@@ -63,7 +63,8 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const int *d_tokens, int Sq,
                    const float *d_cos_f, const float *d_sin_f,
                    const float *d_cos_s, const float *d_sin_s,
-                   float *d_logits, int commit, int use_q4, int last_only, int amort_mm) {
+                   float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
+                   float *d_prenorm) {
     gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
@@ -119,6 +120,8 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
         if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, SH);
     }
 
+    // pre-norm residual 노출(3관문 assistant hook): HF hidden_states[-1] == 마지막 층 출력(final-norm 전, 실측 확정)
+    if(d_prenorm) DK(cudaMemcpy(d_prenorm, x, SH*4, cudaMemcpyDeviceToDevice));
     launch_rmsnorm(x, w.final_norm, norm, Sq, H, eps);
     const float *hn = last_only ? norm+(size_t)(Sq-1)*H : norm;
     int rows = last_only ? 1 : Sq;
