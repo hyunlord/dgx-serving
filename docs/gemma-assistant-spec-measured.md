@@ -84,6 +84,14 @@ bf16 argmax) → ③ 사이클 e2e(accept·곱 실측 vs 위 전이 산술) → 
 > `amort_mm=1`(SB==gemv bit-id 기게이트 성질·[A] 재검증) 후 **code K4 1.54×(34.1 t/s)·chat K4 1.34×(29.7)·
 > prose ~1.0×**. 남은 lever(측정 명명): assistant fp32 7.9ms/스텝(bf16/q4화 → 산술 ~1.7-1.9×)·**accept 갭**
 > (chat K4 1.46 vs HF 2.66 — W4A8 target 조건화 가설, 도달 시 ~2.5×=전이 산술 정합)·serving 통합(④).
+>
+> **④ 통과(서빙·실사용 — draft-spec 완성)**: `serve_daemon_gemma4_spec_online`(슬롯별 spec 사이클·프로토콜 동일·
+> 메모리 가드) + `serve_api --model gemma4-spec --assistant ...`(웹UI spec 배지/메트릭 그대로). 게이트
+> `test_gemma4_spec_serving.py` 전부 PASS: **spec daemon 출력 == plain daemon 출력 토큰-동일**(3워크로드 —
+> decode_batch vs verify-청크 조합까지 bit-id)·동시 3요청 격리·stop/length 종결·생존. ★캡처 재현(HTTP
+> client-observed, 128tok): **chat 34.6 t/s(plain 22.0의 1.57×)·code 30.6(1.40×)**, 응답 텍스트 plain==spec.
+> llama 12B spec 66.9 대비 **0.46~0.52×** = 같은 개념끼리의 정직 좌표. 후속(선택): drafter bf16/q4·accept 갭
+> 진단(uq 대조)·verify concat 분할상환·spec 배칭.
 
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.

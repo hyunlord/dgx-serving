@@ -10,6 +10,7 @@
 | Qwen3.5-27B | GDN+MTP(spec) | B16 K7W2 (λ4, long-heavy) | ~51.7 t/s | ~0.34s | nreq60·seed42·w4a8+mtp_q4 |
 | Gemma4-31B | dense | B8 (★knee) | 36~38 t/s | ~0.14s | nreq48·maxlen384·w4a8 |
 | Gemma4-12B | dense (31B same-family) | B8 (전 regime 지배) | ~96 t/s (aggr) | ~0.05s | nreq48·maxlen384·w4a8·c1tok |
+| Gemma4-12B **spec** | +0.4B assistant(EAGLE류) | K=4 single-stream | **30.6~34.6 t/s** | — | HTTP client-observed·출력==plain greedy·drafter fp32 |
 | Qwen3.5-35B-A3B | MoE(256e top8)+GDN | B8 (지배점) | ~62.7 t/s | ~0.11s | nreq40·maxlen256·fused-MoE |
 | 26B-A4B | 병렬 MoE | single-stream(HTTP) | **43~46 t/s** (W4A8) | — | active-width 수정 후 · raw 45.4 회복 |
 
@@ -70,7 +71,11 @@
 
 - **near-parity plain(measured)** — 26b MoE(0.28~0.48×)와 대조적으로 12B dense는 llama plain에 **1.15× 갭**까지 근접.
 - **원인(정직)**: 12B는 27b와 same-family dense W4A8 gemv 경로(성숙 자산) 재사용 → 남은 갭=작은 잔여 커널 성숙도(fused/tiled).
-  spec 곱(별도 lever)은 Gemma MTP 부재로 이번 미적용 — draft-spec 트랙에서 추가 가능(정직).
+- **★spec 서빙(구현 완료·measured)**: 공식 0.4B assistant(EAGLE류) draft-spec 서빙 — HTTP client-observed
+  **chat 34.6 t/s(plain 22.0의 1.57×)·code 30.6(1.40×)**, 출력==plain greedy 토큰-동일(불변식 게이트).
+  llama 12B spec 66.9 대비 **0.46~0.52×** — 이제 같은 개념(spec)끼리의 좌표(apples-to-apples). 남은 lever(측정
+  명명): drafter fp32(7.9ms/draft→bf16/q4 ~2×↓)·accept 갭(엔진 1.46 vs HF 2.66@K4 — W4A8 target 조건화 가설,
+  도달 시 ~2.5×) → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
 
 ## 4. 대역폭 지형도 (측정 결론 — "이 장비에서 가능한 것")
@@ -93,10 +98,10 @@ decode 속도 ≈ 대역폭 ÷ 토큰당 이동 bytes. 2×급 돌파 후보를 �
 
 - **26B 서빙 파레토 미측정**(roofline 상한만).
 - **spec 서빙 경계 미정**(plain backend 훅 밖 — 별도 추상화 필요).
-- **Gemma draft-spec: E2B로는 접음 → 공식 assistant로 재판정 GO(미구현)**: E2B draft는 순 곱 ~1.0×(동형 함정,
-  [`gemma-draft-spec-verdict.md`](./gemma-draft-spec-verdict.md)). 공식 0.4B assistant(EAGLE류·c≈0.038) 재측정
-  = HF 좌표 2.1~4.0×·엔진 전이 산술 ~2~3× → 구현 착수 근거 확보([`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md)).
-  현재 서빙은 여전히 plain(0.87×) — spec 곱은 구현 후 실측이 확정.
+- **Gemma draft-spec: 구현·서빙 완료(4관문)**: E2B는 접음(~1.0×, [`gemma-draft-spec-verdict.md`](./gemma-draft-spec-verdict.md))
+  → 공식 0.4B assistant로 재판정 GO → verify bit-id·assistant HF골든·사이클 e2e·서빙 게이트 전부 PASS
+  ([`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md)). 서빙 실측 1.40~1.57×(§3b). 남은 lever
+  = drafter 양자화(fp32→bf16/q4)·accept 갭(W4A8 조건화 가설)·verify concat 분할상환·spec 배칭.
 - **긴 context(>1024)**: gemma4 sliding KV 링버퍼 미구현.
 - **FP4**: toolkit-gated(CUDA 13.2+ 대기) — 최대 미사용 lever.
 - 벤치는 warm·측정 조건 명시분에 한함(cold 클럭 교란 제외). 3-way의 vLLM leg는 후속.

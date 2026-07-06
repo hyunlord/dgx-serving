@@ -10,7 +10,7 @@ Purpose-built for a single machine (GB10, ~273 GB/s unified LPDDR5X, 128 GB unif
 
 - **5 models served** out of the box: Qwen3.5-27B, Qwen3.5-35B-A3B (MoE), Gemma4-12B, Gemma4-31B, Gemma4-26B-A4B (MoE) — all W4A8.
 - **OpenAI-compatible API + built-in web chat UI** (`/v1/completions`, `/v1/chat/completions`, `/v1/models`) — SSE streaming, online continuous batching, EOS-aware stop (`finish_reason`), and a zero-dependency browser chat page with per-response tok/s + TTFT metrics.
-- **Built-in MTP speculative decoding** — the Multi-Token-Prediction head ships with the model; no separate draft model to host.
+- **Speculative decoding, output-identical to greedy** — Qwen3.5's built-in MTP head (no separate draft model) and Gemma4-12B's official 0.4B assistant drafter (`--model gemma4-spec`); drafts are accepted only when they match the target's own argmax.
 - **Auto-tuning pipeline**: `probe → plan → tune (Bayesian, Optuna TPE) → recipe`, with a correctness (bit-identity) gate on every tuned config.
 - **One-file recipes**: a `recipe.yaml` captures a tuned serving policy (regime → config) plus verifiable claims; `verify` re-checks device fingerprint, memory budget, and reproduces the numbers on your machine.
 - **Pure CUDA kernels, sm_121-native** — no external kernel dependency (no cuBLAS/CUTLASS in the serving path).
@@ -81,12 +81,15 @@ maturity** (26B MoE is our newest, un-tuned path; llama.cpp's kernels are years-
 engine ceiling — continuous batching itself scales near-linearly.
 
 **Gemma4-12B (dense), plain vs plain, single decode:** 23.3 vs 26.8 tok/s = **0.87×** (near-parity;
-llama-bench tg64, speculative off on both sides). llama.cpp reaches 66.9 tok/s on this model with a
-draft model. We first measured that path with a generic small draft (E2B) and folded it — net gain
-≈1.0×, the draft's own cost ate the acceptance savings ([`docs/gemma-draft-spec-verdict.md`](./docs/gemma-draft-spec-verdict.md)).
-Re-measured with Google's official 0.4B MTP assistant drafter: **2.1–4.0×** net (HF coordinates;
-outputs greedy-equivalent — divergences only at exact bf16 logit ties) — engine implementation is the active roadmap item
-([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)); serving today is still plain.
+llama-bench tg64, speculative off on both sides).
+
+**Gemma4-12B speculative (`--model gemma4-spec`, official 0.4B assistant drafter):** serving
+measures **34.6 tok/s chat / 30.6 code** vs 22.0 plain = **1.40–1.57×**, with output verified
+token-identical to plain greedy (drafts are only accepted when they match the target's own argmax).
+llama.cpp reaches 66.9 tok/s with its draft setup — we are at **~0.5×** of that coordinate, now
+apples-to-apples (same speculative concept). The remaining gap is measured and named — fp32 drafter
+(quantization pending) and a draft-acceptance gap against the bf16-trained drafter
+([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
 
 We are still slower at these coordinates and say so. This is **not** a general-purpose
 fastest-engine; it targets one machine and a fixed model set. Full coordinates, accounting

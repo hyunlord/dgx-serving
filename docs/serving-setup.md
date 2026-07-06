@@ -70,6 +70,21 @@ python tools/gen_rope_long.py artifacts/qwen35-27b 8192
 The spec daemon reads both the `mtp_*.bin` head weights and the RoPE tables from the same
 `--golden` directory.
 
+### Gemma4-12B speculative (`--model gemma4-spec`) — adds the official 0.4B assistant drafter
+
+```bash
+python tools/extract_weights_assistant.py --model google/gemma-4-12B-it-assistant \
+    --out artifacts/gemma4-12b-assistant/weights
+python tools/serve_api.py --model gemma4-spec --tokenizer google/gemma-4-12B-it \
+    --weights artifacts/gemma4-12b/weights \
+    --assistant artifacts/gemma4-12b-assistant/weights --port 8000
+```
+
+Speculative output is verified token-identical to plain greedy (the drafts are only accepted when
+they match the target's own argmax), and measures ~1.4–1.6× faster end-to-end today
+(client-observed; the drafter currently runs fp32 — drafter quantization and acceptance tuning are
+known remaining levers, see [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md)).
+
 ## 3. Start the API server
 
 ```bash
