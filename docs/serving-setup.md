@@ -132,13 +132,27 @@ For access from another machine on your LAN, add `--host 0.0.0.0`.
 **Security**: the server has no authentication — bind `0.0.0.0` only on a trusted network and never
 port-forward it to the internet (the server prints the same warning).
 
-Honest scope: **greedy decoding only** — `temperature` / `top_p` / `n>1` / `logprobs` are rejected
-or ignored. Generation stops at the model's `generation_config` EOS ids (`finish_reason` = `stop`)
-or at the token budget (`length`). A known consequence of pure greedy (no repetition penalty, no
-sampling): on some long expository answers the model can fall into a degenerate repetition loop
-(e.g. `1 1 1 …`). This is the decoding policy, not an engine defect — speculative and plain output
-the token-identical loop (verified on real 350+-token generations; the spec==greedy invariant holds
-through the degenerate region). If you hit it, rephrase the prompt or lower `max_tokens`.
+Decoding scope, honestly stated:
+
+- **Greedy (default)** — deterministic argmax; this is the path every correctness gate runs on.
+  A known consequence of pure greedy is that some long expository answers fall into a degenerate
+  repetition loop (e.g. `1 1 1 …`) — a decoding-policy property, not an engine defect: speculative
+  and plain emit the token-identical loop (verified on real 350+-token generations; spec==greedy
+  holds through the degenerate region).
+- **Sampling (plain daemons only)** — `temperature` (>0 turns it on), `top_p` (default 0.9),
+  `repetition_penalty` (default 1.1, HF convention over generated tokens; mitigates the loops
+  above), `seed` (set for reproducible output; omitted = random per request). Implemented as
+  host-side logic in the shared online loop (logits were already on the host; an implicit
+  top-64 preselect bounds host cost at ~0.3 ms/token). Sampling is a **serving option**: gates
+  keep running greedy, and a request without `temperature` takes the byte-identical greedy path.
+- **Speculative daemons are greedy-only** (`--model gemma4-spec` / `spec`): drafts are verified
+  against the target's argmax, so `temperature>0` returns an explicit 400. Pick per server:
+  speed (speculative, greedy) or variety (plain, sampling).
+- `n>1` / `logprobs` / `best_of` remain unsupported. Generation stops at `generation_config`
+  EOS ids (`finish_reason: stop`) or the token budget (`length`).
+
+Multi-user note: the concurrency win (verify/draft concat batching) is about **several people,
+each in their own browser** — one person opening many tabs just splits their own tokens.
 
 ## 5. Correctness gates (optional, recommended)
 

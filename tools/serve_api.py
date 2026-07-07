@@ -9,7 +9,7 @@
 Phase 스코프: gemma4 plain·greedy만(temperature/logprobs/n>1 미지원 — 명시 거부·무시). 동시 요청=온라인 배칭(직렬화 아님).
 사용법: python tools/serve_api.py --recipe recipes/gemma4-31b-gb10.yaml --weights artifacts/gemma4-31b/weights --port 8000
 """
-import argparse, json, os, queue, subprocess, sys, threading, time, uuid
+import argparse, json, os, queue, random, subprocess, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,14 +74,16 @@ class OnlineDaemon:
         with self.qlock:
             for q in self.queues.values(): q.put(("__END__", "length"))
 
-    def stream(self, ids, max_tokens, out=None):
+    def stream(self, ids, max_tokens, out=None, sampling=None):
         """token-ID 요청 → 태그드 비동기 주입 → 생성 token-ID를 큐에서 순서대로 yield(스트리밍).
-        out(dict, 선택): 종료 시 out['finish_reason']에 daemon 권위 사유(stop=EOS / length=max_tokens/maxlen) 기록."""
+        out(dict, 선택): 종료 시 out['finish_reason']에 daemon 권위 사유(stop=EOS / length=max_tokens/maxlen) 기록.
+        sampling(tuple, 선택): (temp, top_p, rep_penalty, seed) — plain daemon의 SMPL 프로토콜 필드(없으면 greedy)."""
         with self.idlock: rid = self._next; self._next += 1
         q = queue.Queue()
         with self.qlock: self.queues[rid] = q
+        smpl = f"SMPL {sampling[0]:g} {sampling[1]:g} {sampling[2]:g} {sampling[3]} " if sampling else ""
         with self.wlock:                                   # 라인 원자성만(짧은 임계구역 — 배칭 안 막음)
-            self.p.stdin.write(f"{rid} {max_tokens} " + " ".join(map(str, ids)) + "\n"); self.p.stdin.flush()
+            self.p.stdin.write(f"{rid} {max_tokens} " + smpl + " ".join(map(str, ids)) + "\n"); self.p.stdin.flush()
         try:
             while True:
                 tok = q.get()                              # reader 스레드가 넣을 때까지 블록(다른 요청은 병행)
@@ -113,6 +115,7 @@ def chat_ids(tok, messages):
 # ---- OpenAI 호환 HTTP 핸들러 ----
 class Handler(BaseHTTPRequestHandler):
     daemon = None; tok = None; model_id = "gemma4"; quant = "w4a8"; spec = False  # 클래스 변수(서버 起動 시 주입)
+    sampling = False; maxlen = 1024                        # 샘플링 capability(plain daemon만)·KV 예산(웹UI ctx 표시용)
     def log_message(self, *a): pass                       # 접근 로그 억제
 
     def _json(self, code, obj):
@@ -124,21 +127,33 @@ class Handler(BaseHTTPRequestHandler):
         p = self.path.rstrip("/")
         if p == "/v1/models":
             self._json(200, {"object":"list","data":[{"id":self.model_id,"object":"model","owned_by":"dgx-serving",
-                                                       "quant":self.quant,"spec":self.spec}]})
+                                                       "quant":self.quant,"spec":self.spec,
+                                                       "sampling":self.sampling,"maxlen":self.maxlen}]})
         elif p in ("", "/index.html"):                    # 웹 채팅 UI(정적 HTML 1장 — 의존성 0)
             b = WEBUI_HTML.encode()
             self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8")
             self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
         else: self._json(404, {"error":{"message":"not found","type":"invalid_request_error"}})
 
-    # 미지원 파라미터(greedy·bit-id 전제 깨는 것) 명시 거부 — 공통.
+    # 미지원 파라미터 명시 거부 — 공통. temperature는 plain daemon에서 지원(★샘플링 서빙 옵션 — do_POST에서 추출);
+    #   spec daemon은 greedy 전용(draft==argmax 전제)이라 temperature>0이면 명시 400(사용자 선택: 속도 greedy vs 다양성 샘플링).
     def _reject_unsupported(self, req):
         for k in ("logprobs","n","best_of","suffix"):
             if req.get(k) not in (None,1):
-                self._json(400, {"error":{"message":f"unsupported: {k} (greedy only)","type":"invalid_request_error"}}); return True
-        if req.get("temperature",0) not in (0,None,0.0):
-            print(f"  [경고] temperature={req.get('temperature')} 무시(greedy만)", file=sys.stderr)
+                self._json(400, {"error":{"message":f"unsupported: {k}","type":"invalid_request_error"}}); return True
         return False
+
+    # 샘플링 파라미터 추출(temp>0=샘플링·기본 greedy). 반환: None(greedy) | (temp, top_p, rep_pen, seed).
+    def _sampling(self, req):
+        t = req.get("temperature")
+        try: t = float(t) if t is not None else 0.0
+        except (TypeError, ValueError): t = 0.0
+        if t <= 0: return None
+        topp = float(req.get("top_p") or 0.9)
+        repp = float(req.get("repetition_penalty") or 1.1)   # 반복 완화 기본(greedy 반복 루프 대응 — HF 관례 값)
+        seed = req.get("seed")
+        seed = int(seed) if seed is not None else (random.getrandbits(31) | 1)   # 미지정=요청마다 랜덤(0 금지 — 0은 daemon 기본시드)
+        return (max(0.05, min(t, 4.0)), max(0.05, min(topp, 1.0)), max(1.0, min(repp, 2.0)), seed)
 
     def do_POST(self):
         p = self.path.rstrip("/")
@@ -149,6 +164,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(400, {"error":{"message":f"bad json: {e}","type":"invalid_request_error"}})
         if self._reject_unsupported(req): return
+        sampling = self._sampling(req)
+        if sampling and not self.sampling:
+            return self._json(400, {"error":{"message":"sampling unsupported on this server (speculative daemon is greedy-only "
+                                            "— run serve_api with --model gemma4/qwen for temperature/top_p/repetition_penalty)",
+                                            "type":"invalid_request_error"}})
         chat = (p == "/v1/chat/completions")
         max_tokens = int(req.get("max_completion_tokens", req.get("max_tokens",2048))); stream = bool(req.get("stream",False))  # 서버 maxlen이 실제 캡(budget=maxlen-P)
         # 입력 → token ids: chat=템플릿 적용(정확성 본체) / completions=원시 프롬프트 토큰화(기존 경로 불변)
@@ -164,10 +184,10 @@ class Handler(BaseHTTPRequestHandler):
                 ids = self.tok(prompt).input_ids           # HF 토큰화(BOS 포함 — Gemma 관례)
         except Exception as e:
             return self._json(400, {"error":{"message":str(e),"type":"invalid_request_error"}})
-        self._generate(ids, max_tokens, stream, chat)
+        self._generate(ids, max_tokens, stream, chat, sampling)
 
     # 생성 실행(스트림/논스트림 공통) — daemon.stream(불변) + incremental detok + 메트릭(front 계산·daemon 불변).
-    def _generate(self, ids, max_tokens, stream, chat):
+    def _generate(self, ids, max_tokens, stream, chat, sampling=None):
         cid = ("chatcmpl-" if chat else "cmpl-")+uuid.uuid4().hex[:24]; created = int(time.time())
         obj = "chat.completion.chunk" if (chat and stream) else ("chat.completion" if chat else "text_completion")
         t0 = time.time(); t_first = None; acc = []; prev_text = ""
@@ -178,7 +198,7 @@ class Handler(BaseHTTPRequestHandler):
             if chat:                                       # chat 관례: 첫 청크에 role
                 self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
                            "choices":[{"delta":{"role":"assistant"},"index":0,"finish_reason":None}]})
-            for tid in self.daemon.stream(ids, max_tokens, rinfo):
+            for tid in self.daemon.stream(ids, max_tokens, rinfo, sampling):
                 if t_first is None: t_first = time.time()
                 acc.append(tid)
                 cur = self.tok.decode(acc, skip_special_tokens=True)
@@ -194,7 +214,7 @@ class Handler(BaseHTTPRequestHandler):
                        "choices":[{**fin,"index":0,"finish_reason":fr}], "usage":tm["usage"], "timings":tm["timings"]})
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
         else:
-            for tid in self.daemon.stream(ids, max_tokens, rinfo):
+            for tid in self.daemon.stream(ids, max_tokens, rinfo, sampling):
                 if t_first is None: t_first = time.time()
                 acc.append(tid)
             text = self.tok.decode(acc, skip_special_tokens=True)
@@ -279,6 +299,8 @@ def main():
     Handler.model_id = model_id
     Handler.quant = {2:"w4a8", 1:"q4", 0:"fp32"}.get(uq, "w4a8")
     Handler.spec = (args.model in ("spec","gemma4-spec"))  # 모델 배지(/v1/models·웹UI)용 — spec 표시
+    Handler.sampling = (args.model in ("gemma4","qwen"))   # ★샘플링 = plain daemon만(serving_online 루프 SMPL — spec은 greedy 전용)
+    Handler.maxlen = args.maxlen                           # 웹UI 컨텍스트(ctx N/maxlen) 표시용
 
     class _Server(ThreadingHTTPServer):
         request_queue_size = 128       # SYN backlog 상향(기본 5) — 동시 연결 폭주(초과구독)서 커널 리셋 방지

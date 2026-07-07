@@ -7,19 +7,28 @@
 <style>
   /* zero-dependency, self-contained. dark, function over form. */
   :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --muted:#8b949e;
-          --user:#1f6feb; --assist:#21262d; --accent:#2ea043; }
+          --user:#1f6feb; --assist:#21262d; --accent:#2ea043; --code:#0a0d12; }
   * { box-sizing:border-box; }
   html,body { height:100%; margin:0; }
   body { background:var(--bg); color:var(--fg); font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;
          display:flex; flex-direction:column; }
-  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  header { padding:8px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   header h1 { font-size:15px; margin:0; font-weight:600; }
-  #badge { font-size:12px; color:var(--muted); background:var(--panel); border:1px solid var(--line);
-           border-radius:999px; padding:2px 10px; }
+  .pill { font-size:12px; color:var(--muted); background:var(--panel); border:1px solid var(--line);
+          border-radius:999px; padding:2px 10px; }
+  #ctx { margin-left:auto; }
+  button.small { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:8px;
+                 padding:4px 12px; font-size:13px; font-weight:500; }
+  #settings { padding:6px 16px; border-bottom:1px solid var(--line); display:flex; gap:14px; align-items:center;
+              flex-wrap:wrap; font-size:12.5px; color:var(--muted); background:var(--panel); }
+  #settings label { display:flex; align-items:center; gap:5px; }
+  #settings input, #settings select { background:var(--bg); color:var(--fg); border:1px solid var(--line);
+              border-radius:6px; padding:2px 6px; font:inherit; width:64px; }
+  #settings select { width:auto; }
+  #settings .off { opacity:.45; }
   #chat { flex:1; overflow-y:auto; padding:18px 16px; display:flex; flex-direction:column; gap:14px; }
-  .msg { max-width:760px; width:fit-content; padding:10px 14px; border-radius:10px; white-space:pre-wrap;
-         word-wrap:break-word; }
-  .user { align-self:flex-end; background:var(--user); color:#fff; }
+  .msg { max-width:820px; width:fit-content; padding:10px 14px; border-radius:10px; word-wrap:break-word; }
+  .user { align-self:flex-end; background:var(--user); color:#fff; white-space:pre-wrap; }
   .assistant { align-self:flex-start; background:var(--assist); border:1px solid var(--line); }
   .meta { align-self:flex-start; font-size:12px; color:var(--muted); margin-top:-8px; }
   footer { border-top:1px solid var(--line); padding:12px 16px; display:flex; gap:10px; align-items:flex-end; }
@@ -29,23 +38,55 @@
            cursor:pointer; font-weight:600; }
   button.stop { background:#da3633; }
   button:disabled { opacity:.5; cursor:default; }
-  .empty { color:var(--muted); align-self:center; margin:auto; text-align:center; }
+  .empty { color:var(--muted); align-self:center; margin:auto; text-align:center; line-height:2; }
+  .note { font-size:11.5px; color:var(--muted); padding:0 16px 8px; text-align:center; }
+  /* --- markdown --- */
+  .assistant p { margin:0 0 8px; } .assistant p:last-child { margin-bottom:0; }
+  .assistant .sp { height:2px; }
+  .assistant h3,.assistant h4,.assistant h5,.assistant h6 { margin:12px 0 6px; line-height:1.3; }
+  .assistant h3 { font-size:17px; } .assistant h4 { font-size:15.5px; } .assistant h5,.assistant h6 { font-size:14.5px; }
+  .assistant ul,.assistant ol { margin:4px 0 8px; padding-left:22px; }
+  .assistant li { margin:2px 0; }
+  .assistant hr { border:0; border-top:1px solid var(--line); margin:10px 0; }
+  .assistant code { background:var(--code); border:1px solid var(--line); border-radius:4px;
+                    padding:1px 5px; font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+  .assistant pre.code { background:var(--code); border:1px solid var(--line); border-radius:8px;
+                        margin:8px 0; overflow-x:auto; max-width:100%; }
+  .assistant pre.code .lang { font-size:11px; color:var(--muted); border-bottom:1px solid var(--line); padding:4px 10px; }
+  .assistant pre.code code { display:block; background:none; border:0; padding:10px 12px; white-space:pre; }
+  .assistant a { color:#58a6ff; }
+  .assistant blockquote { border-left:3px solid var(--line); margin:6px 0; padding:2px 12px; color:var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <h1>dgx-serving</h1>
-  <span id="badge">connecting…</span>
-  <label style="font-size:12px;color:var(--muted);margin-left:auto;">max tokens
-    <input id="maxtok" type="number" min="1" max="4096" value="2048" step="128"
-           style="width:72px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 6px;font:inherit;margin-left:4px;">
-  </label>
+  <span id="badge" class="pill">connecting…</span>
+  <button id="newchat" class="small" title="Clear conversation">New chat</button>
+  <button id="regen" class="small" title="Regenerate last answer" disabled>↻ Regenerate</button>
+  <span id="ctx" class="pill" title="context used / server KV budget (prompt + generation)">ctx —</span>
 </header>
-<div id="chat"><div class="empty">Ask something. Greedy decoding · online continuous batching.</div></div>
+<div id="settings">
+  <label>mode
+    <select id="mode">
+      <option value="sample">Sampling</option>
+      <option value="greedy">Greedy</option>
+    </select>
+  </label>
+  <label title="softmax temperature (higher = more random)">temp <input id="temp" type="number" min="0.05" max="4" step="0.05" value="0.7"></label>
+  <label title="nucleus sampling cutoff">top-p <input id="topp" type="number" min="0.05" max="1" step="0.05" value="0.9"></label>
+  <label title="penalize tokens already generated (1 = off) — mitigates greedy repetition loops">rep-pen <input id="repp" type="number" min="1" max="2" step="0.05" value="1.1"></label>
+  <label title="set for reproducible sampling; blank = random per request">seed <input id="seed" type="number" min="1" placeholder="rand"></label>
+  <label title="per-request generation cap (server maxlen is the hard budget)">max tokens <input id="maxtok" type="number" min="1" max="8192" step="128" value="1024"></label>
+  <span id="smplnote"></span>
+</div>
+<div id="chat"><div class="empty">Ask something.<br><span style="font-size:12px">Deterministic greedy or sampled decoding · online continuous batching.</span></div></div>
 <footer>
   <textarea id="input" rows="1" placeholder="Message…  (Enter to send, Shift+Enter for newline)"></textarea>
   <button id="send">Send</button>
 </footer>
+<div class="note">Multi-user by design: each person opens their own browser — concurrent requests are batched
+server-side (speculative/plain continuous batching). Multiple tabs from one person just split your own tokens.</div>
 
 <script>
 "use strict";
@@ -53,59 +94,140 @@ const chatEl = document.getElementById("chat");
 const inputEl = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const badgeEl = document.getElementById("badge");
+const ctxEl = document.getElementById("ctx");
+const modeEl = document.getElementById("mode");
+const tempEl = document.getElementById("temp");
+const toppEl = document.getElementById("topp");
+const reppEl = document.getElementById("repp");
+const seedEl = document.getElementById("seed");
 const maxtokEl = document.getElementById("maxtok");
-function maxTokens(){ const v = parseInt(maxtokEl.value, 10); return (v > 0 && v <= 4096) ? v : 2048; }  // 요청당 상한(서버 maxlen이 실제 캡)
-const history = [];            // [{role, content}] — multi-turn context
+const newBtn = document.getElementById("newchat");
+const regenBtn = document.getElementById("regen");
+const smplNote = document.getElementById("smplnote");
+
+const history = [];            // [{role, content}] — multi-turn context (server applies chat template)
 let controller = null;         // AbortController for stop
 let modelId = "model";
+let canSample = false, serverMaxlen = 0, lastCtx = 0;
+let lastAssistEls = [];        // last assistant bubble + meta (for regenerate)
 
-// model badge from /v1/models
+// ---- settings persistence ----
+const S_KEY = "dgx_chat_settings";
+try {
+  const s = JSON.parse(localStorage.getItem(S_KEY) || "{}");
+  if (s.mode) modeEl.value = s.mode;
+  for (const [el,k] of [[tempEl,"temp"],[toppEl,"topp"],[reppEl,"repp"],[maxtokEl,"maxtok"]])
+    if (s[k] !== undefined) el.value = s[k];
+} catch {}
+function saveSettings(){
+  try { localStorage.setItem(S_KEY, JSON.stringify({mode:modeEl.value, temp:tempEl.value,
+        topp:toppEl.value, repp:reppEl.value, maxtok:maxtokEl.value})); } catch {}
+}
+for (const el of [modeEl,tempEl,toppEl,reppEl,maxtokEl]) el.addEventListener("change", saveSettings);
+
+function samplerEnabled(){ return canSample && modeEl.value === "sample"; }
+function refreshSamplerUI(){
+  const on = samplerEnabled();
+  for (const el of [tempEl,toppEl,reppEl,seedEl]) { el.disabled = !on; el.parentElement.classList.toggle("off", !on); }
+  if (!canSample){
+    modeEl.value = "greedy"; modeEl.disabled = true;
+    smplNote.textContent = "greedy-only server (speculative) — run --model gemma4 for sampling";
+  }
+}
+modeEl.addEventListener("change", refreshSamplerUI);
+
+// model badge + capabilities from /v1/models
 fetch("/v1/models").then(r => r.json()).then(d => {
   const m = (d.data && d.data[0]) || {};
   modelId = m.id || "model";
-  const bits = [modelId, m.quant, m.spec ? "spec" : null].filter(Boolean);
+  canSample = !!m.sampling; serverMaxlen = m.maxlen || 0;
+  const bits = [modelId, m.quant, m.spec ? "spec" : null, canSample ? "sampling" : "greedy-only"].filter(Boolean);
   badgeEl.textContent = bits.join(" · ");
-}).catch(() => { badgeEl.textContent = "offline"; });
+  if (serverMaxlen) ctxEl.textContent = `ctx 0/${serverMaxlen}`;
+  refreshSamplerUI();
+}).catch(() => { badgeEl.textContent = "offline"; refreshSamplerUI(); });
+
+function maxTokens(){ const v = parseInt(maxtokEl.value, 10); return (v > 0 && v <= 8192) ? v : 1024; }
+
+// ---- minimal markdown renderer (safe: escape first; fenced code / inline / lists / headers / links) ----
+function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function mdInline(x){
+  x = esc(x);
+  x = x.replace(/`([^`]+)`/g, "<code>$1</code>");
+  x = x.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  x = x.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+  x = x.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return x;
+}
+function mdBlocks(s){
+  const lines = s.split("\n"); let html = "", inUl = false, inOl = false;
+  const closeLists = () => { if (inUl){ html += "</ul>"; inUl = false; } if (inOl){ html += "</ol>"; inOl = false; } };
+  for (const ln of lines){
+    let m;
+    if ((m = ln.match(/^(#{1,4})\s+(.*)$/))){ closeLists(); const h = m[1].length + 2; html += `<h${h}>${mdInline(m[2])}</h${h}>`; }
+    else if (/^\s*[-*]\s+/.test(ln)){ if (!inUl){ closeLists(); html += "<ul>"; inUl = true; } html += "<li>" + mdInline(ln.replace(/^\s*[-*]\s+/, "")) + "</li>"; }
+    else if (/^\s*\d+[.)]\s+/.test(ln)){ if (!inOl){ closeLists(); html += "<ol>"; inOl = true; } html += "<li>" + mdInline(ln.replace(/^\s*\d+[.)]\s+/, "")) + "</li>"; }
+    else if (/^\s*(---+|\*\*\*+)\s*$/.test(ln)){ closeLists(); html += "<hr>"; }
+    else if (/^\s*>\s?/.test(ln)){ closeLists(); html += "<blockquote>" + mdInline(ln.replace(/^\s*>\s?/, "")) + "</blockquote>"; }
+    else if (ln.trim() === ""){ closeLists(); html += "<div class='sp'></div>"; }
+    else { closeLists(); html += "<p>" + mdInline(ln) + "</p>"; }
+  }
+  closeLists(); return html;
+}
+function mdRender(src){
+  // fenced code blocks split; odd segments are code (tolerates unterminated fence while streaming)
+  const parts = src.split("```"); let out = "";
+  for (let i = 0; i < parts.length; i++){
+    if (i % 2 === 1){
+      let t = parts[i], nl = t.indexOf("\n"), lang = "", body = t;
+      if (nl >= 0){ lang = t.slice(0, nl).trim(); body = t.slice(nl + 1); } else { lang = t.trim(); body = ""; }
+      out += `<pre class="code"><div class="lang">${esc(lang || "code")}</div><code>${esc(body)}</code></pre>`;
+    } else out += mdBlocks(parts[i]);
+  }
+  return out;
+}
 
 function clearEmpty(){ const e = chatEl.querySelector(".empty"); if (e) e.remove(); }
 function addMsg(role, text){
   clearEmpty();
   const d = document.createElement("div");
-  d.className = "msg " + role; d.textContent = text || "";
+  d.className = "msg " + role;
+  if (role === "user") d.textContent = text || ""; else d.innerHTML = mdRender(text || "");
   chatEl.appendChild(d); chatEl.scrollTop = chatEl.scrollHeight; return d;
 }
 function addMeta(text){
   const d = document.createElement("div"); d.className = "meta"; d.textContent = text;
-  chatEl.appendChild(d); chatEl.scrollTop = chatEl.scrollHeight;
+  chatEl.appendChild(d); chatEl.scrollTop = chatEl.scrollHeight; return d;
 }
-
 function setBusy(busy){
   inputEl.disabled = busy;
   sendBtn.textContent = busy ? "Stop" : "Send";
   sendBtn.className = busy ? "stop" : "";
+  regenBtn.disabled = busy || !history.some(m => m.role === "assistant");
+  newBtn.disabled = busy;
 }
 
-async function send(){
-  if (controller){ controller.abort(); return; }   // button acts as Stop while streaming
-  const text = inputEl.value.trim();
-  if (!text) return;
-  inputEl.value = ""; inputEl.style.height = "auto";
-  history.push({role:"user", content:text});
-  addMsg("user", text);
+async function generate(){                              // last history entry must be a user turn
   const bubble = addMsg("assistant", "");
   setBusy(true);
   controller = new AbortController();
-  let acc = "";
+  let acc = "", metaEl = null;
+  const body = {model:modelId, messages:history, max_tokens:maxTokens(), stream:true};
+  if (samplerEnabled()){
+    body.temperature = parseFloat(tempEl.value) || 0.7;
+    body.top_p = parseFloat(toppEl.value) || 0.9;
+    body.repetition_penalty = parseFloat(reppEl.value) || 1.1;
+    const sd = parseInt(seedEl.value, 10); if (sd > 0) body.seed = sd;
+  }
   try {
     const resp = await fetch("/v1/chat/completions", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({model:modelId, messages:history, max_tokens:maxTokens(), stream:true}),
-      signal: controller.signal,
+      body: JSON.stringify(body), signal: controller.signal,
     });
     if (!resp.ok){ bubble.textContent = "[error] " + (await resp.text()); throw new Error("http"); }
     const reader = resp.body.getReader();
     const dec = new TextDecoder(); let buf = "";
-    let timings = null; let finish = null;
+    let timings = null, usage = null, finish = null;
     while (true){
       const {done, value} = await reader.read();
       if (done) break;
@@ -117,25 +239,59 @@ async function send(){
         if (line === "[DONE]") continue;
         let obj; try { obj = JSON.parse(line); } catch { continue; }
         const delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
-        if (delta && delta.content){ acc += delta.content; bubble.textContent = acc; chatEl.scrollTop = chatEl.scrollHeight; }
+        if (delta && delta.content){ acc += delta.content; bubble.innerHTML = mdRender(acc); chatEl.scrollTop = chatEl.scrollHeight; }
         if (obj.timings) timings = obj.timings;
+        if (obj.usage) usage = obj.usage;
         const fr = obj.choices && obj.choices[0] && obj.choices[0].finish_reason;
         if (fr) finish = fr;
       }
     }
     history.push({role:"assistant", content:acc});
     if (timings){
-      const trunc = finish === "length" ? "  ⚠ truncated (max tokens / context limit)" : "";
-      addMeta(`${timings.completion_tokens} tokens · ${timings.elapsed_s}s · ${timings.tokens_per_s} tok/s · TTFT ${timings.ttft_s}s${trunc}`);
+      const trunc = finish === "length" ? "  ⚠ truncated (max tokens / context budget)" : "";
+      const md = samplerEnabled() ? `  · sampled t=${body.temperature}${body.seed ? " seed=" + body.seed : ""}` : "  · greedy";
+      metaEl = addMeta(`${timings.completion_tokens} tokens · ${timings.elapsed_s}s · ${timings.tokens_per_s} tok/s · TTFT ${timings.ttft_s}s${md}${trunc}`);
     }
+    if (usage && serverMaxlen){ lastCtx = usage.total_tokens || 0; ctxEl.textContent = `ctx ${lastCtx}/${serverMaxlen}`; }
   } catch (e){
     if (e.name === "AbortError"){ bubble.textContent = acc + "  [stopped]"; if (acc) history.push({role:"assistant", content:acc}); }
   } finally {
+    lastAssistEls = metaEl ? [bubble, metaEl] : [bubble];
     controller = null; setBusy(false); inputEl.focus();
   }
 }
 
+async function send(){
+  if (controller){ controller.abort(); return; }   // button acts as Stop while streaming
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = ""; inputEl.style.height = "auto";
+  history.push({role:"user", content:text});
+  addMsg("user", text);
+  await generate();
+}
+
+async function regenerate(){
+  if (controller) return;
+  // drop last assistant turn (history + DOM) and re-run the last user turn
+  for (let i = history.length - 1; i >= 0; i--)
+    if (history[i].role === "assistant"){ history.splice(i, 1); break; }
+  for (const el of lastAssistEls) el.remove();
+  lastAssistEls = [];
+  await generate();
+}
+
+function newChat(){
+  if (controller) controller.abort();
+  history.length = 0; lastAssistEls = []; lastCtx = 0;
+  chatEl.innerHTML = '<div class="empty">Ask something.<br><span style="font-size:12px">Deterministic greedy or sampled decoding · online continuous batching.</span></div>';
+  if (serverMaxlen) ctxEl.textContent = `ctx 0/${serverMaxlen}`;
+  regenBtn.disabled = true; inputEl.focus();
+}
+
 sendBtn.addEventListener("click", send);
+regenBtn.addEventListener("click", regenerate);
+newBtn.addEventListener("click", newChat);
 inputEl.addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); send(); }
 });

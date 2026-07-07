@@ -5,9 +5,12 @@
 //   backend가 device 전송·rope·weight·상태·logit D2H 소유 → 루프는 host 토큰/argmax/스케줄만(gemma4·qwen 공유).
 //   신규(bench 대비): 실시간 비동기 주입(stdin reader 스레드+큐) + 실토큰 prefill + greedy 피드백(argmax) + 태그드 스트림 I/O.
 //   ★정확성 불변: 온라인 배칭이 각 요청 계산 안 바꿈 — 슬롯 격리(ragged decode 독립). 동시 N == 단독 bit-id(test_serve_online).
-//   프로토콜(태그드): stdin "<req_id> <max_tokens> <id0> ..." / "SHUTDOWN". stdout "<req_id> <tok>" / "<req_id> END"(single-writer).
+//   프로토콜(태그드): stdin "<req_id> <max_tokens> [SMPL <temp> <topp> <repp> <seed>] <id0> ..." / "SHUTDOWN".
+//     stdout "<req_id> <tok>" / "<req_id> END"(single-writer). SMPL 없음(기본) = greedy(기존 프로토콜·경로 그대로).
+//   ★샘플링은 서빙 옵션(호스트 로직·D2H는 원래 하던 것): 검증/게이트는 greedy 경로(SMPL 미주입)로 불변.
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -16,6 +19,8 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <algorithm>
+#include <random>
 #include <condition_variable>
 
 // 모델-중립 backend 훅(실서빙용 — bench ServingBackend는 dummy-prompt·logit 미노출이라 별도).
@@ -37,8 +42,12 @@ struct OnlineBackend {
 };
 
 namespace serving_online_detail {
-    struct Req { long id; int max_tokens; std::vector<int> ids; };
-    struct Slot { long req=-1; int pos=0; int gen=0; int max_tokens=0; int last=0; };  // req<0 = free
+    // 샘플링 파라미터(옵션 — temp<=0 = greedy·기존 경로 그대로). 프로토콜: "<id> <max_tokens> [SMPL t p r seed] <ids...>"
+    struct Req { long id; int max_tokens; std::vector<int> ids;
+                 float temp=0.f, topp=1.f, repp=1.f; unsigned long long seed=0; };
+    struct Slot { long req=-1; int pos=0; int gen=0; int max_tokens=0; int last=0;   // req<0 = free
+                  float temp=0.f, topp=1.f, repp=1.f;                                // 샘플러(요청별)
+                  std::mt19937_64 rng; std::vector<int> hist; };                     // seed-결정 RNG·생성 이력(반복 페널티)
 }
 
 // 모델-중립 온라인 daemon 루프. be=구성된 backend(weight 로드 완료), Bmax=동시 활성 슬롯 상한.
@@ -71,7 +80,12 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
             if(first=="SHUTDOWN"){ shutdown=true; cv.notify_all(); return; }
             Req r; r.id=atol(first.c_str());
             if(!(is>>r.max_tokens)) continue;
-            int id; while(is>>id) r.ids.push_back(id);
+            std::string nx;                                  // 옵션 SMPL 필드(없으면 기존 프로토콜 그대로 = greedy)
+            if(is>>nx){
+                if(nx=="SMPL"){ if(!(is>>r.temp>>r.topp>>r.repp>>r.seed)) continue; }
+                else r.ids.push_back(atoi(nx.c_str()));
+                int id; while(is>>id) r.ids.push_back(id);
+            }
             if(r.ids.empty()) continue;
             { std::lock_guard<std::mutex> lk(mtx); queue.push_back(std::move(r)); }
             cv.notify_all();
@@ -79,8 +93,34 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
         shutdown=true; cv.notify_all();                   // stdin EOF
     });
 
-    auto argmax_row = [&](int b)->int{ float*p=&hlog[(size_t)b*V]; int bi=0; float bv=p[0];
-        for(int j=1;j<V;j++) if(p[j]>bv){bv=p[j];bi=j;} return bi; };
+    // 토큰 선택(호스트·슬롯별): temp<=0 → argmax(기존 greedy 경로 바이트 동일 — 게이트 불변).
+    //   temp>0 → ★샘플링(서빙 옵션·검증과 분리): 반복 페널티(HF 관례: 생성 이력 토큰 로짓 양수/repp·음수×repp)
+    //   → top-64 preselect(호스트 262k 전체 정렬 회피 — 암묵 top-k 64, 문서 명시) → temperature softmax →
+    //   top-p 누적 컷 → seed-결정 RNG 추첨. 순수 호스트(D2H는 루프가 원래 하던 것 — 추가 비용 ~0.3ms/tok).
+    enum { SK = 64 };
+    int   s_idx[SK]; float s_val[SK]; double s_prob[SK]; int s_ord[SK];
+    auto pick_row = [&](int b, Slot& s)->int{
+        float* p=&hlog[(size_t)b*V];
+        if(s.temp<=0.f){ int bi=0; float bv=p[0]; for(int j=1;j<V;j++) if(p[j]>bv){bv=p[j];bi=j;} return bi; }
+        if(s.repp!=1.f) for(int t : s.hist){ float v=p[t]; p[t] = v>0.f ? v/s.repp : v*s.repp; }
+        const int K = V<SK ? V : SK;
+        for(int j=0;j<K;j++){ s_idx[j]=j; s_val[j]=p[j]; }
+        int mn=0; for(int j=1;j<K;j++) if(s_val[j]<s_val[mn]) mn=j;
+        for(int j=K;j<V;j++) if(p[j]>s_val[mn]){
+            s_val[mn]=p[j]; s_idx[mn]=j;
+            mn=0; for(int q=1;q<K;q++) if(s_val[q]<s_val[mn]) mn=q;
+        }
+        float mx=s_val[0]; for(int j=1;j<K;j++) if(s_val[j]>mx) mx=s_val[j];
+        double sum=0; for(int j=0;j<K;j++){ s_prob[j]=std::exp(((double)s_val[j]-mx)/s.temp); sum+=s_prob[j]; }
+        for(int j=0;j<K;j++) s_ord[j]=j;
+        std::sort(s_ord, s_ord+K, [&](int a,int c){ return s_prob[a]>s_prob[c]; });
+        double cut=sum*(double)s.topp, cum=0; int keep=0;
+        for(;keep<K;){ cum+=s_prob[s_ord[keep]]; keep++; if(cum>=cut) break; }
+        std::uniform_real_distribution<double> U(0.0, cum);
+        double u=U(s.rng), acc=0; int pick=s_ord[0];
+        for(int j=0;j<keep;j++){ acc+=s_prob[s_ord[j]]; if(u<=acc){ pick=s_ord[j]; break; } }
+        return s_idx[pick];
+    };
     auto n_active = [&](){ int a=0; for(int b=0;b<Bmax;b++) if(slot[b].req>=0)a++; return a; };
     auto is_stop = [&](int t){ for(int s:stop_ids) if(t==s) return true; return false; };  // EOS 집합(config 주도)
 
@@ -102,8 +142,13 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
                 be.reset_slot(st, b);                              // 슬롯 재사용 잔재 clear(qwen GDN state; gemma4 no-op)
                 be.prefill_ids(st, b, r.ids.data(), P);            // 슬롯 b KV[0..P-1] + logits[0:V]=마지막
                 be.logits_to_host(hlog.data(), 1);
-                int first=0; { float*p=hlog.data(); float bv=p[0]; for(int j=1;j<V;j++) if(p[j]>bv){bv=p[j];first=j;} }
-                slot[b] = Slot{r.id, P, 0, r.max_tokens, first};
+                slot[b] = Slot{}; Slot& sl=slot[b];
+                sl.req=r.id; sl.pos=P; sl.max_tokens=r.max_tokens;
+                sl.temp=r.temp; sl.topp=r.topp; sl.repp=r.repp;
+                sl.rng.seed(r.seed ? r.seed : 0x9E3779B97F4A7C15ull);   // seed-결정(재현 가능 — serve_api가 기본 랜덤 주입)
+                int first = pick_row(0, sl);                       // prefill 로짓 = row 0(greedy면 기존 argmax 그대로)
+                sl.last=first;
+                if(sl.temp>0.f) sl.hist.push_back(first);
                 if(r.max_tokens>0 && is_stop(first)){        // 첫 토큰이 EOS = 빈 응답(즉시 종료·토큰 미출력)
                     printf("%ld END stop\n", r.id); fflush(stdout); slot[b]=Slot();
                 } else {
@@ -127,12 +172,13 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
         be.decode_step(st, toks.data(), pos.data(), W);
         be.logits_to_host(hlog.data(), W);
 
-        // 3) 슬롯별 argmax → 스트림 → greedy 피드백 → 완료(슬롯 격리: 각 슬롯 자기 logit row만). active는 0..W-1.
+        // 3) 슬롯별 토큰 선택(greedy=argmax 그대로·샘플링=옵션) → 스트림 → 피드백 → 완료(슬롯 격리). active는 0..W-1.
         for(int b=0;b<W;b++){ Slot&s=slot[b]; if(s.req<0) continue;
-            int next=argmax_row(b);
+            int next=pick_row(b, s);
             if(is_stop(next)){ printf("%ld END stop\n", s.req); fflush(stdout); s=Slot(); continue; }  // ★EOS: 토큰 미출력·종료(계산 불변 — 값 그대로 판정)
             printf("%ld %d\n", s.req, next); fflush(stdout);
             s.last=next; s.pos++; s.gen++;
+            if(s.temp>0.f) s.hist.push_back(next);           // 반복 페널티 이력(샘플링 시에만 — greedy 무비용)
             if(s.gen>=s.max_tokens || s.pos>=maxlen-1){ printf("%ld END length\n", s.req); fflush(stdout); s=Slot(); }
         }
     }
