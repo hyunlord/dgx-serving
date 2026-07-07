@@ -249,9 +249,37 @@ KV 불침범 Δ=0, 결정성 Δ=0. 서빙 게이트(test_gemma4_spec_serving) �
   llama-server 다중 슬롯+spec 동시 벤치는 인프라 확인 필요(후속) — 단일 스트림 좌표(chat 0.90×/code
   0.67×)는 불변.
 
+## draft concat (assistant 배칭 — verify concat의 대칭·사이클 완전 배칭)
+
+verify concat 후 남은 반쪽: draft 페이즈가 슬롯별 순차(N4 라운드의 ~20%)여서 N=4 < N=2였음 →
+**`gemma4_assistant_step_batch`**: 활성 슬롯 B개의 draft 스텝을 한 번에 — 큰 matmul(pre_proj·trunk·
+post_proj·**tied lm_head=지배항**)만 B행 SB ≤16행 1적재(B==1은 기존 gemv 그대로=단일 경로 불변),
+cross-attn은 슬롯별 기존 커널(각자 target KV 포인터·base=len−1 — KV 매핑 명시적·drafter는 자체 KV가
+없어 append 위험 0), rope는 행별 위치(rope_partial_pos). 재귀(h)·argmax는 호출자(슬롯별 독립). **신규 커널 0**.
+
+게이트(test_gemma4_draft_concat) 전부 PASS: **배치==순차 bit-id Δ=0** — B∈{2,3,4} × K=6 재귀 전 스텝의
+로짓·h_out·draft 토큰(함정 3종: 재귀 연쇄·ragged 위치·KV 매핑 전부 통과). draft 페이즈 단위(K4):
+순차 4슬롯 30.2ms → **배치4 13.1ms(−57%)**·배치2 9.3ms. daemon은 A==1 기존 경로/A≥2 배치(3페이즈:
+draft concat→verify concat→accept). 서빙 게이트 재PASS(spec==plain·동시==솔로·생존).
+
+서빙 A/B(verify-only concat 대비, daemon-직결·warm·96tok):
+
+| aggregate t/s | N=1 | N=2 | N=3 | N=4 |
+|---|---|---|---|---|
+| code | 44.8→44.7 | 63.1→67.2 (+6.5%) | 65.2→67.4 | 60.1→**66.0 (+9.8%)** |
+| chat | 53.5→54.0 | 75.4→75.6 | 78.0→**80.4** | 72.1→**79.3 (+10.0%)** |
+| prose | 31.2→31.3 | 44.3→44.6 | 45.8→47.6 | 42.4→**47.0 (+10.8%)** |
+
+- **N=4가 N=2를 따라잡음**(chat/prose는 추월·code 동률권) — draft 병목 제거가 정확히 N4에서 최대.
+  N-스케일 곡선 평탄화(N2~4 어디든 근사 최적). 피크 chat N3 80.4 t/s.
+- **누적(per-slot 순차 기점): N4 code 44.6→66.0=+48%·chat 54.1→79.3=+47%·prose 31.2→47.0=+51%**
+  — 다중 슬롯 spec 서빙 1.5×(사이클 완전 배칭: draft+verify 둘 다 weight 1적재).
+- 단일 스트림 불변(±1% 잡음권)·TTFT 불변(0.12~0.55s). 남은 잔여: verify N4의 SB 16+4 2회 적재
+  (K4 기준 N3=M15 단일 적재가 산술 최적 — Bmax=3 운용 선택지)·assistant cross-attn 슬롯 루프(작음).
+
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
 - 메모리: 12B(24GB) + assistant(0.9GB) 동시 상주 — W4A8 시 ~7.5GB로 여유(128GB 가드 내).
 - 다음 세션 = ① verify POC부터(정확성 먼저·bit-id 게이트).
-- 적응 K 접힘 + verify concat 실현(위) 후 남은 lever 서열: **draft 페이즈 concat**(assistant 배칭 —
-  다중 슬롯 라운드의 ~20%) > 잔여 후보(K-quant bytes 10%↓=plain 소폭·bf16-반올림 정합=chat accept).
+- 적응 K 접힘 + verify concat + draft concat 실현(위) = **다중 슬롯 사이클 완전 배칭 완결**. 남은 잔여
+  후보: K-quant bytes 10%↓(plain 소폭)·bf16-반올림 정합(chat accept)·verify N4 그룹 2회 적재 미세축.

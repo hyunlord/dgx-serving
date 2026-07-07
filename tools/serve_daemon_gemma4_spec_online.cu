@@ -82,6 +82,13 @@ int main(int argc,char**argv){
     float *d_alg;  CK(cudaMalloc(&d_alg,(size_t)V*4));
     float *d_ho;   CK(cudaMalloc(&d_ho,(size_t)H*4));
     int   *d_am;   CK(cudaMalloc(&d_am,(size_t)MCAT*4));
+    // ★draft concat(배치) 버퍼 — A>=2일 때만 사용(단일은 기존 경로)
+    float *d_inA;  CK(cudaMalloc(&d_inA,(size_t)Bmax*2*H*4));
+    float *d_algA; CK(cudaMalloc(&d_algA,(size_t)Bmax*V*4));
+    float *d_hoA;  CK(cudaMalloc(&d_hoA,(size_t)Bmax*H*4));
+    float *d_embA; CK(cudaMalloc(&d_embA,(size_t)Bmax*H*4));
+    int   *d_tokA; CK(cudaMalloc(&d_tokA,(size_t)Bmax*4));
+    int   *d_posA; CK(cudaMalloc(&d_posA,(size_t)Bmax*4));
 
     // 슬롯-b 뷰(gemma4_verify_batch/prefill_batch_slot과 동일 트릭)
     std::vector<std::vector<float*>> vK(Bmax), vV(Bmax);
@@ -173,10 +180,10 @@ int main(int argc,char**argv){
         }
         const int A=(int)act.size();
         if(A==0) continue;
-        // --- draft phase: 슬롯별 K (assistant: 고정 rope행 s.pos·target KV[0..s.pos) 직독·재귀 h) ---
-        for(int a=0;a<A;a++){
-            const int b=act[a]; SpecSlot &s=slot[b];
-            const int off=a*(K+1);
+        // --- draft phase: A==1 기존 슬롯별 경로(단일 불변) / A>=2 ★draft concat(배치 스텝 ×K —
+        //     tied lm_head 등 weight 1적재 = verify concat 대칭·게이트 test_gemma4_draft_concat Δ=0) ---
+        if(A==1){
+            const int b=act[0]; SpecSlot &s=slot[b];
             int dt=s.cur;
             for(int j=0;j<K;j++){
                 CK(cudaMemcpy(d_tok,&dt,4,cudaMemcpyHostToDevice));
@@ -187,9 +194,30 @@ int main(int argc,char**argv){
                                       d_cf+(size_t)s.pos*hd_f, d_sf+(size_t)s.pos*hd_f,
                                       d_cs+(size_t)s.pos*hd_s, d_ss+(size_t)s.pos*hd_s, d_alg, d_ho, ast_uq);
                 launch_argmax(d_alg,V,d_am); CK(cudaMemcpy(&dt,d_am,4,cudaMemcpyDeviceToHost));
-                h_cat[off+j+1]=dt;
+                h_cat[j+1]=dt;
             }
-            h_cat[off]=s.cur;
+            h_cat[0]=s.cur;
+        } else {
+            std::vector<const float*> kfA(A),vfA(A),ksA(A),vsA(A); std::vector<int> lenA(A),dtA(A),amA(A);
+            for(int a=0;a<A;a++){ const int b=act[a]; SpecSlot &s=slot[b];
+                kfA[a]=vK[b][lf]; vfA[a]=vV[b][lf]; ksA[a]=vK[b][ls]; vsA[a]=vV[b][ls];
+                lenA[a]=s.pos; dtA[a]=s.cur; h_cat[a*(K+1)]=s.cur; }
+            CK(cudaMemcpy(d_posA,lenA.data(),(size_t)A*4,cudaMemcpyHostToDevice));
+            for(int j=0;j<K;j++){
+                CK(cudaMemcpy(d_tokA,dtA.data(),(size_t)A*4,cudaMemcpyHostToDevice));
+                launch_embedding(d_tokA, w.embed, d_embA, A, H);
+                if(c.embed_scale>0.f) launch_scale(d_embA,d_embA,c.embed_scale,(size_t)A*H);
+                for(int a=0;a<A;a++){                              // 행 a = [emb | h_prev(슬롯 독립 재귀)]
+                    CK(cudaMemcpy(d_inA+(size_t)a*2*H, d_embA+(size_t)a*H, (size_t)H*4, cudaMemcpyDeviceToDevice));
+                    CK(cudaMemcpy(d_inA+(size_t)a*2*H+H, j==0? d_h+(size_t)act[a]*H : d_hoA+(size_t)a*H,
+                                  (size_t)H*4, cudaMemcpyDeviceToDevice));
+                }
+                gemma4_assistant_step_batch(ca,wa,A,d_inA,kfA.data(),vfA.data(),ksA.data(),vsA.data(),
+                                            lenA.data(),d_cf,d_sf,d_cs,d_ss,d_posA,d_algA,d_hoA,ast_uq);
+                for(int a=0;a<A;a++) launch_argmax(d_algA+(size_t)a*V,V,d_am+a);
+                CK(cudaMemcpy(amA.data(),d_am,(size_t)A*4,cudaMemcpyDeviceToHost));
+                for(int a=0;a<A;a++){ dtA[a]=amA[a]; h_cat[a*(K+1)+j+1]=amA[a]; }
+            }
         }
         // --- verify phase: concat 1호출(A=1이어도 동일 분해=기존 amort 경로와 같은 커널·게이트 확증) ---
         for(int a=0;a<A;a++){ Nb[a]=K+1; pos_a[a]=slot[act[a]].pos; }

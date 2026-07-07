@@ -200,6 +200,10 @@ tests/test_gemma4_verify: tests/test_gemma4_verify.cu models/gemma4_batch.cu mod
 tests/test_gemma4_verify_concat: tests/test_gemma4_verify_concat.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_verify_concat.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
+# draft concat(assistant 배칭) 게이트: 배치==순차 bit-id(재귀·ragged·KV 매핑)·타이밍. 12B+assistant artifacts 필요 → 수동.
+tests/test_gemma4_draft_concat: tests/test_gemma4_draft_concat.cu models/gemma4_assistant.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_draft_concat.cu models/gemma4_assistant.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+
 # draft-spec 2관문: assistant graph HF 골든 게이트(스텝별+재귀+결정성). assistant artifacts+골든 필요 → 수동.
 tests/test_gemma4_assistant: tests/test_gemma4_assistant.cu models/gemma4_assistant.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_assistant.cu models/gemma4_assistant.cu -o $@

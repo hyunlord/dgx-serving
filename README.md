@@ -97,10 +97,12 @@ length was then measured and closed too: three host-side policies (confidence ea
 extension-only, HF-style dynamic K) all lose or tie against fixed K=4 — our drafts are so cheap
 (2.2 ms vs ~18 ms per accepted token) that cutting them never pays; llama's adaptive gain assumes
 a costlier draft. Its byproduct arithmetic (verify cost is nearly flat in rows) did pay: **verify
-concat amortization** — all active slots' verify chunks run as one weight-load-amortized call,
-gated bit-identical against the per-slot path — lifts multi-user speculative serving throughput
-**+33–41%** (e.g. code 44.9 → 62.5 tok/s aggregate at 2 concurrent requests; single-stream
-unchanged) ([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
+concat + draft concat amortization** — all active slots' verify chunks, and then all their drafter
+steps, each run as one weight-load-amortized call, both gated bit-identical against the per-slot
+path — lifts multi-user speculative serving throughput **+47–51%** at 4 concurrent requests
+(code 44.6 → 66.0, chat 54.1 → 79.3, prose 31.2 → 47.0 tok/s aggregate; peak chat 80.4 at N=3;
+single-stream unchanged)
+([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
 
 We are still slower at these coordinates and say so. This is **not** a general-purpose
 fastest-engine; it targets one machine and a fixed model set. Full coordinates, accounting

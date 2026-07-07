@@ -65,4 +65,22 @@ void gemma4_assistant_step(const AstConfig &c, const AstWeights &w,
                            const float *d_cos_s1, const float *d_sin_s1,
                            float *d_logits, float *d_hout, int use_q4 = 0);
 
+// ★draft concat(배치) 스텝 — verify concat(15dbd3c)의 대칭: 활성 슬롯 B개의 draft 스텝 j를 한 번에.
+//   큰 matmul(pre_proj·trunk·post_proj·tied lm_head)만 B행으로 묶어 weight 1적재(gemv_w4a8_sb ≤16행 —
+//   SB per-row == plain gemv per-row bit-id 기게이트·B==1은 기존 gemv 그대로=단일 경로 불변),
+//   cross-attn은 슬롯별 기존 커널(각자 target KV 포인터·base=len[b]-1 — KV 매핑 명시적·자체 KV 없음),
+//   rope는 행별 위치(rope_partial_pos·전체 테이블 + d_pos[b]=len[b]). 신규 커널 0.
+//   d_in_B: [B,7680] 행별 [emb|h_prev](호출자 준비 — 재귀·argmax도 호출자=슬롯별 독립 재귀).
+//   kf/vf/ks/vs: host 배열[B] = 슬롯별 target full/sliding KV 포인터. len_b: host [B](full==sliding 동일 규약).
+//   출력 d_logits_B [B,V]·d_hout_B [B,3840]. 게이트: tests/test_gemma4_draft_concat(배치==순차 bit-id).
+void gemma4_assistant_step_batch(const AstConfig &c, const AstWeights &w, int B,
+                                 const float *d_in_B,
+                                 const float* const* kf, const float* const* vf,
+                                 const float* const* ks, const float* const* vs,
+                                 const int *len_b,
+                                 const float *d_cos_f, const float *d_sin_f,
+                                 const float *d_cos_s, const float *d_sin_s,
+                                 const int *d_pos,
+                                 float *d_logits_B, float *d_hout_B, int use_q4 = 0);
+
 #endif // DGX_GEMMA4_ASSISTANT_H

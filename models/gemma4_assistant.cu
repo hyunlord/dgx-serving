@@ -192,3 +192,71 @@ void gemma4_assistant_step(const AstConfig &c, const AstWeights &w,
     amm(w.post_proj, norm, d_hout, H, c.backbone, use_q4);          // 재귀 hidden(다음 스텝 h_prev)
     AK(cudaDeviceSynchronize());
 }
+
+// ---- draft concat(배치) — 헤더 주석 참조. amm의 B행 판: B==1은 기존 gemv(경로 불변), B 2~16은 SB 1적재. ----
+static inline void ammB(const QMat &m, const float *X, float *Y, int IN, int OUT, int B, int use_q4){
+    if(use_q4==2){
+        size_t n=(size_t)B*IN;
+        if(g_axcap<n){ if(g_axq)cudaFree(g_axq); if(g_axs)cudaFree(g_axs); if(g_axsum)cudaFree(g_axsum);
+            AK(cudaMalloc(&g_axq,n)); AK(cudaMalloc(&g_axs,(n/QBLK)*4)); AK(cudaMalloc(&g_axsum,(n/QBLK)*4)); g_axcap=n; }
+        launch_quantize_x_q8(X,g_axq,g_axs,g_axsum,IN,B);
+        if(B==1) launch_gemv_w4a8(g_axq,g_axs,g_axsum,m.wq,m.sc,Y,IN,OUT,1,0);
+        else     launch_gemv_w4a8_sb(g_axq,g_axs,m.wq,m.sc,Y,IN,OUT,B,0);   // ≤16행 1적재(SB==gemv per-row 기게이트)
+    } else {
+        launch_gemv_f32(X,m.wf,Y,IN,OUT,B);
+    }
+}
+
+void gemma4_assistant_step_batch(const AstConfig &c, const AstWeights &w, int B,
+                                 const float *d_in_B,
+                                 const float* const* kf, const float* const* vf,
+                                 const float* const* ks, const float* const* vs,
+                                 const int *len_b,
+                                 const float *d_cos_f, const float *d_sin_f,
+                                 const float *d_cos_s, const float *d_sin_s,
+                                 const int *d_pos,
+                                 float *d_logits_B, float *d_hout_B, int use_q4){
+    if(B<1 || B>16){ fprintf(stderr,"[ast_batch] B=%d 미지원(1~16 — SB 단일그룹·Bmax 규약)\n",B); exit(1); }
+    const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
+    const float eps=c.rms_norm_eps;
+    const int hd_max = c.global_head_dim>c.head_dim ? c.global_head_dim : c.head_dim;
+    float *x=ab(0,(size_t)B*H), *norm=ab(1,(size_t)B*H), *tmp=ab(2,(size_t)B*H), *after=ab(3,(size_t)B*H);
+    float *qb=ab(4,(size_t)B*NQ*hd_max), *qn=ab(5,(size_t)B*NQ*hd_max), *attn=ab(6,(size_t)B*NQ*hd_max);
+    float *g=ab(7,(size_t)B*FFN), *u=ab(8,(size_t)B*FFN), *act=ab(9,(size_t)B*FFN);
+
+    ammB(w.pre_proj, d_in_B, x, 2*c.backbone, H, B, use_q4);
+    for(int l=0;l<c.num_layers;l++){
+        const AstLayer &L=w.layers[l];
+        const int hd   = L.is_full ? c.global_head_dim      : c.head_dim;
+        const int NKV  = L.is_full ? c.num_global_kv_heads  : c.num_kv_heads;
+        const float *cosT = L.is_full ? d_cos_f : d_cos_s, *sinT = L.is_full ? d_sin_f : d_sin_s;
+        const int window = L.is_full ? 0 : c.sliding_window;
+        const int qdim = NQ*hd;
+
+        launch_rmsnorm(x, L.input_ln, norm, B, H, eps);
+        ammB(L.q, norm, qb, H, qdim, B, use_q4);
+        launch_rmsnorm(qb, L.q_norm, qn, B*NQ, hd, eps);
+        launch_rope_partial_pos(qn, cosT, sinT, d_pos, B, NQ, hd, hd);     // 행별 위치(=len[b])
+        for(int b=0;b<B;b++){                                              // ★cross-attn: 슬롯별 target KV 직독
+            const float *K = L.is_full ? kf[b] : ks[b], *Vv = L.is_full ? vf[b] : vs[b];
+            launch_attn_decode(qn+(size_t)b*qdim, K, Vv, attn+(size_t)b*qdim,
+                               1, NQ, NKV, hd, len_b[b]-1, 0, c.attn_scaling, window);
+        }
+        ammB(L.o, attn, tmp, qdim, H, B, use_q4);
+        launch_rmsnorm(tmp, L.post_attn_ln, norm, B, H, eps);
+        launch_add(after, x, norm, B*H);
+
+        launch_rmsnorm(after, L.pre_ffn_ln, norm, B, H, eps);
+        ammB(L.gate, norm, g, H, FFN, B, use_q4);
+        ammB(L.up,   norm, u, H, FFN, B, use_q4);
+        launch_geglu(g, u, act, (size_t)B*FFN);
+        ammB(L.down, act, tmp, FFN, H, B, use_q4);
+        launch_rmsnorm(tmp, L.post_ffn_ln, norm, B, H, eps);
+        launch_add(x, after, norm, B*H);
+        if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, (size_t)B*H);
+    }
+    launch_rmsnorm(x, w.final_norm, norm, B, H, eps);
+    ammB(w.embed, norm, d_logits_B, H, V, B, use_q4);                      // tied lm_head — B행 1적재(지배항 분할상환)
+    ammB(w.post_proj, norm, d_hout_B, H, c.backbone, B, use_q4);           // 재귀 hidden(행별 — 슬롯 독립)
+    AK(cudaDeviceSynchronize());
+}

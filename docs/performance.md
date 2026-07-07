@@ -93,12 +93,14 @@
   (q2 패턴). ★적응적 draft 길이 접힘(measured — 호스트 정책 3종 삼중 판정): margin 조기중단 code −9%·연장
   전용 +1.4%(잡음권)·HF 동적 K −13% — 원인은 비용 구조(draft 2.2ms ≪ 수락 토큰 가치 18ms → 절단 손익분기
   P(acc)<13%인데 실측 최저-확신 구간도 20~38% accept = 어떤 문턱도 손해·llama의 적응 이득은 비싼-draft 전제의
-  동형 함정). ★그 부산물(verify Sq 둔감 46.5/49/63ms)은 **verify concat 분할상환으로 실현**(gemma4_verify_concat
-  — 활성 슬롯들의 verify를 한 SB 호출로·신규 커널 0·스킴 경계 구성적 회피[전 M을 ≤16행 SB 그룹으로만]·
-  concat==per-slot 로짓 Δ=0 M 경계 전수 게이트): spec 서빙 다중 슬롯 aggregate **N2 +39~41%·N4 +33~36%**
-  (code 44.9→62.5·chat 53.9→74.8·prose 31.4→44.2, daemon-직결 warm), 구 per-slot은 N에 완전 평평(verify
-  직렬화 measured)·단일 스트림 불변(±2% 잡음권)·spec==greedy 재PASS. 남은 lever: **draft 페이즈 concat**
-  (assistant 배칭 — 다중 슬롯 라운드 ~20%)·(잔여 후보: K-quant bytes 10%↓=plain 소폭·bf16-반올림 정합)
+  동형 함정). ★그 부산물(verify Sq 둔감 46.5/49/63ms)은 **verify concat + draft concat으로 실현 = 다중 슬롯
+  사이클 완전 배칭**(gemma4_verify_concat + gemma4_assistant_step_batch — 활성 슬롯들의 verify/draft를 각각 한
+  호출로·신규 커널 0·스킴 경계 구성적 회피[전 M을 ≤16행 SB 그룹으로만]·concat==per-slot 로짓 Δ=0 게이트 양쪽):
+  spec 서빙 다중 슬롯 aggregate **누적 N4 +47~51%**(per-slot 순차 기점: code 44.6→66.0·chat 54.1→79.3·prose
+  31.2→47.0, daemon-직결 warm — verify concat 몫 +33~36%p·draft concat 몫 +10%p로 N4가 N2 따라잡음/추월,
+  피크 chat N3 80.4), 구 per-slot은 N에 완전 평평(verify 직렬화 measured)·단일 스트림 불변(±1~2% 잡음권)·
+  spec==greedy 재PASS(bit-id 게이트 3종: verify M 경계 전수·draft 재귀/ragged/KV 매핑·서빙 동시==솔로).
+  남은 잔여 후보: K-quant bytes 10%↓(plain 소폭)·bf16-반올림 정합(chat accept)
   → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
 
