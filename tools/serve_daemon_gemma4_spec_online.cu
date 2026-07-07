@@ -25,6 +25,7 @@
 #include "../runtime/weights_gemma4.h"
 #include "../runtime/decode_state_gemma4.h"
 #include "../runtime/serving_online.h"     // parse_stop_ids_env(프로토콜/stop 의미 동일 유지)
+#include "../runtime/rope_gemma4.h"        // ★rope 테이블 host 생성(manifest 권위·partial proportional)
 #include "../models/gemma4_assistant.h"
 #include "../kernels/rope.cuh"
 #include "../kernels/embedding.cuh"
@@ -67,12 +68,11 @@ int main(int argc,char**argv){
     float *d_cf,*d_sf,*d_cs,*d_ss;
     CK(cudaMalloc(&d_cf,(size_t)maxlen*hd_f*4)); CK(cudaMalloc(&d_sf,(size_t)maxlen*hd_f*4));
     CK(cudaMalloc(&d_cs,(size_t)maxlen*hd_s*4)); CK(cudaMalloc(&d_ss,(size_t)maxlen*hd_s*4));
-    // ★rope theta = manifest 권위(full 1e6·sliding 1e4 — plain daemon과 동일 수정: full 1e4 하드코딩이
-    //   긴 생성 붕괴 원인. target·assistant 공용 테이블이라 draft rope도 함께 정정).
-    float th_f=1e6f, th_s=1e4f;
-    { char* mf=mf_read_file((TW+"/manifest.json").c_str());
-      th_f=mf_num_opt(mf,"rope_theta_full",1e6); th_s=mf_num_opt(mf,"rope_theta_sliding",1e4); free(mf); }
-    launch_gen_rope(d_cf,d_sf,maxlen,hd_f,th_f); launch_gen_rope(d_cs,d_ss,maxlen,hd_s,th_s); CK(cudaDeviceSynchronize());
+    // ★rope 테이블 = manifest 권위 + partial proportional(full 0.25 — plain daemon과 동일 수정,
+    //   runtime/rope_gemma4.h·절대 게이트 test_gemma4_rope_table.py). target·assistant 공용 = draft rope도 정정.
+    if(gemma4_gen_rope_tables((TW+"/manifest.json").c_str(), maxlen, hd_f,d_cf,d_sf, hd_s,d_cs,d_ss)!=0){
+        fprintf(stderr,"[spec-online] manifest 없음: %s\n",(TW+"/manifest.json").c_str()); return 1; }
+    CK(cudaDeviceSynchronize());
 
     G4Weights  w  = load_weights_gemma4(TW.c_str(), c, uq!=0?1:0, uq==0?1:0);
     AstWeights wa = load_weights_assistant(AW.c_str(), ca, ast_uq);

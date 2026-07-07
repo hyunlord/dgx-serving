@@ -135,10 +135,13 @@ port-forward it to the internet (the server prints the same warning).
 Decoding scope, honestly stated:
 
 - **Greedy (default)** — deterministic argmax; this is the path every correctness gate runs on.
-  A known consequence of pure greedy is that some long expository answers fall into a degenerate
-  repetition loop (e.g. `1 1 1 …`) — a decoding-policy property, not an engine defect: speculative
-  and plain emit the token-identical loop (verified on real 350+-token generations; spec==greedy
-  holds through the degenerate region).
+  Historical note (honesty): long-generation degeneration (e.g. a `1 1 1 …` loop after ~350
+  tokens) was **misdiagnosed twice as a greedy-policy property** — the root cause was the serving
+  daemons generating their RoPE tables with the wrong full-attention convention (theta, then the
+  missing `partial_rotary_factor 0.25`). Both are fixed and locked by an absolute gate against
+  HF-captured tables (`tests/test_gemma4_rope_table.py`); with correct RoPE the same prompts
+  generate 800 coherent tokens under plain greedy. Greedy repetition loops remain possible in
+  principle (no repetition penalty on the greedy path), but are no longer the expected behavior.
 - **Sampling (plain daemons only)** — `temperature` (>0 turns it on), `top_p` (default 0.9),
   `repetition_penalty` (default 1.1, HF convention over generated tokens; mitigates the loops
   above), `seed` (set for reproducible output; omitted = random per request). Implemented as

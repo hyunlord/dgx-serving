@@ -8,6 +8,7 @@
 #include "../runtime/weights_gemma4.h"
 #include "../runtime/decode_state_gemma4.h"
 #include "../runtime/serving_online.h"
+#include "../runtime/rope_gemma4.h"    // ★rope 테이블 host 생성(manifest 권위·partial proportional — 절대 게이트 참조)
 #include "../models/gemma4_moe.h"      // 26B-A4B MoE 분기(gemma4_moe_decode_batch·prefill_batch_slot)
 #include "../kernels/rope.cuh"
 
@@ -51,13 +52,12 @@ int main(int argc,char**argv){
     const int hd_s=be.c.head_dim, hd_f=be.c.global_head_dim?be.c.global_head_dim:be.c.head_dim;
     CK(cudaMalloc(&be.d_cf,(size_t)maxlen*hd_f*4)); CK(cudaMalloc(&be.d_sf,(size_t)maxlen*hd_f*4));
     CK(cudaMalloc(&be.d_cs,(size_t)maxlen*hd_s*4)); CK(cudaMalloc(&be.d_ss,(size_t)maxlen*hd_s*4));
-    // ★rope theta = manifest 권위(full 1e6·sliding 1e4). 기존 full 1e4 하드코딩("dummy rope")은 긴 생성
-    //   (~300tok+) coherence 붕괴의 근본 원인이었음(HF 골든 테이블 역산으로 full=표준 theta 1e6 판정 —
-    //   짧은 위치는 오차 미미해 짧은 게이트가 못 잡던 축).
-    float th_f=1e6f, th_s=1e4f;
-    { char* mf=mf_read_file((WD+"/manifest.json").c_str());
-      th_f=mf_num_opt(mf,"rope_theta_full",1e6); th_s=mf_num_opt(mf,"rope_theta_sliding",1e4); free(mf); }
-    launch_gen_rope(be.d_cf,be.d_sf,maxlen,hd_f,th_f); launch_gen_rope(be.d_cs,be.d_ss,maxlen,hd_s,th_s); CK(cudaDeviceSynchronize());
+    // ★rope 테이블 = manifest 권위 + partial proportional(full 0.25 = 64쌍만 회전 — runtime/rope_gemma4.h,
+    //   절대 게이트 tests/test_gemma4_rope_table.py). 하드코딩 전례 2건(theta 1e4·partial 누락)이 긴 생성
+    //   붕괴 원인이었음 — spec==plain 상대 게이트는 공유 오류를 못 잡음.
+    if(gemma4_gen_rope_tables((WD+"/manifest.json").c_str(), maxlen, hd_f,be.d_cf,be.d_sf, hd_s,be.d_cs,be.d_ss)!=0){
+        fprintf(stderr,"[online] manifest 없음: %s\n",(WD+"/manifest.json").c_str()); return 1; }
+    CK(cudaDeviceSynchronize());
     be.w = load_weights_gemma4(WD.c_str(), be.c, uq!=0?1:0, uq==0?1:0);
     CK(cudaMalloc(&be.d_tok,Bmax*4)); CK(cudaMalloc(&be.d_pos,Bmax*4)); CK(cudaMalloc(&be.d_pf,(size_t)maxlen*4));
     CK(cudaMalloc(&be.d_logit,(size_t)Bmax*be.V*4));
