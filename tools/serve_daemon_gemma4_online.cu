@@ -51,7 +51,13 @@ int main(int argc,char**argv){
     const int hd_s=be.c.head_dim, hd_f=be.c.global_head_dim?be.c.global_head_dim:be.c.head_dim;
     CK(cudaMalloc(&be.d_cf,(size_t)maxlen*hd_f*4)); CK(cudaMalloc(&be.d_sf,(size_t)maxlen*hd_f*4));
     CK(cudaMalloc(&be.d_cs,(size_t)maxlen*hd_s*4)); CK(cudaMalloc(&be.d_ss,(size_t)maxlen*hd_s*4));
-    launch_gen_rope(be.d_cf,be.d_sf,maxlen,hd_f,1e4f); launch_gen_rope(be.d_cs,be.d_ss,maxlen,hd_s,1e4f); CK(cudaDeviceSynchronize());
+    // ★rope theta = manifest 권위(full 1e6·sliding 1e4). 기존 full 1e4 하드코딩("dummy rope")은 긴 생성
+    //   (~300tok+) coherence 붕괴의 근본 원인이었음(HF 골든 테이블 역산으로 full=표준 theta 1e6 판정 —
+    //   짧은 위치는 오차 미미해 짧은 게이트가 못 잡던 축).
+    float th_f=1e6f, th_s=1e4f;
+    { char* mf=mf_read_file((WD+"/manifest.json").c_str());
+      th_f=mf_num_opt(mf,"rope_theta_full",1e6); th_s=mf_num_opt(mf,"rope_theta_sliding",1e4); free(mf); }
+    launch_gen_rope(be.d_cf,be.d_sf,maxlen,hd_f,th_f); launch_gen_rope(be.d_cs,be.d_ss,maxlen,hd_s,th_s); CK(cudaDeviceSynchronize());
     be.w = load_weights_gemma4(WD.c_str(), be.c, uq!=0?1:0, uq==0?1:0);
     CK(cudaMalloc(&be.d_tok,Bmax*4)); CK(cudaMalloc(&be.d_pos,Bmax*4)); CK(cudaMalloc(&be.d_pf,(size_t)maxlen*4));
     CK(cudaMalloc(&be.d_logit,(size_t)Bmax*be.V*4));

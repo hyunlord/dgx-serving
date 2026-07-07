@@ -67,7 +67,12 @@ int main(int argc,char**argv){
     float *d_cf,*d_sf,*d_cs,*d_ss;
     CK(cudaMalloc(&d_cf,(size_t)maxlen*hd_f*4)); CK(cudaMalloc(&d_sf,(size_t)maxlen*hd_f*4));
     CK(cudaMalloc(&d_cs,(size_t)maxlen*hd_s*4)); CK(cudaMalloc(&d_ss,(size_t)maxlen*hd_s*4));
-    launch_gen_rope(d_cf,d_sf,maxlen,hd_f,1e4f); launch_gen_rope(d_cs,d_ss,maxlen,hd_s,1e4f); CK(cudaDeviceSynchronize());
+    // ★rope theta = manifest 권위(full 1e6·sliding 1e4 — plain daemon과 동일 수정: full 1e4 하드코딩이
+    //   긴 생성 붕괴 원인. target·assistant 공용 테이블이라 draft rope도 함께 정정).
+    float th_f=1e6f, th_s=1e4f;
+    { char* mf=mf_read_file((TW+"/manifest.json").c_str());
+      th_f=mf_num_opt(mf,"rope_theta_full",1e6); th_s=mf_num_opt(mf,"rope_theta_sliding",1e4); free(mf); }
+    launch_gen_rope(d_cf,d_sf,maxlen,hd_f,th_f); launch_gen_rope(d_cs,d_ss,maxlen,hd_s,th_s); CK(cudaDeviceSynchronize());
 
     G4Weights  w  = load_weights_gemma4(TW.c_str(), c, uq!=0?1:0, uq==0?1:0);
     AstWeights wa = load_weights_assistant(AW.c_str(), ca, ast_uq);
