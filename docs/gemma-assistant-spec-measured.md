@@ -178,7 +178,43 @@ fallback 0·worst cosine 0.996·norm-ratio 가드). **가중치 보존은 실측
 **적응적 draft 길이**(llama --spec-draft-n-min~max = 확신 낮으면 짧게 draft·낭비 사이클 절감 vs 우리 고정 K4)
 — 호스트 로직만으로 시험 가능(커널 0)·다음 분리 실험.
 
+## 적응적 draft 길이 실험 (커널 0 — 세 정책 삼중 판정 · 접힘)
+
+llama code 우위의 잔여 가설이었던 "적응 draft 길이"를 **호스트 정책 3종으로 전부 measured**(e2e·uq=2·
+ast_uq=2·N=96·warm 2번째·전 행 [A] spec==greedy PASS·ref 재현 변동 ±2%). 구현: e2e에 env 게이트
+(`ADAPT/TAUS/KMIN/KMAX`=margin 정책·`ADAPT=2`=HF heuristic·`CONF_LOG`=진단 CSV, `tools/probe_adaptive_k.py`
+분석), 기본 경로 무변경.
+
+**STEP 0 — 확신 신호는 진짜다**(draft별 top1-top2 로짓 margin, D2H 1MB+호스트 스캔 ~0.6ms/draft):
+margin→accept AUC **chat 0.87 / code 0.90 / prose 0.72**, 고정 K4 낭비(뽑고 버림) chat 65%/code 55%/
+prose 77%, m=0 사이클(전부 버림) 34~55%. 신호도 낭비도 커서 정책 여지가 충분해 보였다 — 그러나:
+
+| 곱(spec/plain) | 고정 K4(ref) | ①margin 조기중단 a1-7 최적 | ②연장 전용 a4-7 최적 | ③HF 동적 K hfdyn4..7 |
+|---|---|---|---|---|
+| chat | 1.82~1.83× | 1.89× (τ2, **+3.3%**) | 1.76× (−3%) | 1.74× (−3%) |
+| code | 2.15~2.19× | 1.99× (τ3, **−9%**) | 2.21× (τ6, +1.4%=잡음권) | 1.87× (**−13%**) |
+| prose | 1.51~1.53× | 1.43× (−7%) | 1.46× (−4%) | 1.43× (−5%) |
+
+**판정(접힘) — 실패 원인은 정책이 아니라 비용 구조(산술·measured)**:
+- **절단 손익분기**: draft 1개 = 2.2ms(+판정 0.6ms), 수락 토큰 1개의 시간 가치 ≈ 사이클 49ms/acc 2.7 ≈
+  **18ms** → 절단이 이득이려면 P(accept)<~13% 필요. 실측은 최저-margin 구간(<0.5)조차 **accept 20~38%** —
+  어떤 문턱에서도 자르면 손해. ①이 acc를 깎는 이유(code 1.74→1.53)·③도 동일(신호가 verify 실측 m이어도
+  같은 산술 — code −13%).
+- **연장의 상쇄**: ②는 acc를 진짜 올림(code 1.74→**2.10**, +21%) — 그러나 margin은 drafter 자기확신이지
+  "접두사 전체 생존(m=4)" 예측이 아니라(AUC 0.90은 per-draft), m<4 사이클의 연장 draft가 그림자 낭비 →
+  draft+판정 추가(+91ms)가 verify 절약(−75ms)과 상쇄, 순 +1.4%=잡음권.
+- **llama 적응 이득은 동형 함정**: 그쪽은 draft가 상대적으로 비싼 비용 구조라 절단이 pay — 우리 draft는
+  2.2ms(사이클의 14%)라 낭비 자체가 싸다. llama code 69.6 우위의 설명은 적응이 아니라 4bit accept 벽(위
+  K-quant 판정)+plain 상속으로 이미 완결.
+- chat ①의 +3.3%는 유일 양수지만 ref 재현 변동(±2%)에 근접 — 워크로드-조건부 정책 복잡도 대비 미채택.
+- **부산물(다음 lever의 산술 근거)**: verify ms/cyc 실측 **Sq3 46.5 / Sq5 49 / Sq9 63** — 행 수 3배에
+  +35%뿐(SB 분할상환 확인·Sq9 점프는 버킷 패딩 의심). → **verify concat 분할상환**(여러 슬롯의 verify를
+  한 SB 호출로): 2슬롯 Sq5×2=Sq10 ≈ ~63ms vs 각각 98ms = **verify −36% 산술 여지**(spec 배칭의 실질
+  형태·스킴 경계[verify M 변경=bit flip 가능] 주의) = 다음 후보 승격.
+
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
 - 메모리: 12B(24GB) + assistant(0.9GB) 동시 상주 — W4A8 시 ~7.5GB로 여유(128GB 가드 내).
 - 다음 세션 = ① verify POC부터(정확성 먼저·bit-id 게이트).
+- 적응 K 접힘(위) 후 남은 lever 서열: **verify concat 분할상환**(−36% 산술 여지) > spec 배칭(=concat의
+  일반형) > 잔여 후보(K-quant bytes 10%↓=plain 소폭·bf16-반올림 정합=chat accept).

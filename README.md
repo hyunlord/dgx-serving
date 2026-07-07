@@ -92,8 +92,11 @@ llama measures 56.2 / 69.6 / 45.6 tok/s — we are at **0.90× on chat** (the sp
 itself is ours to win there, 2.30× vs 2.20×), **0.67× on code**, 0.70× on prose. The acceptance gap
 is fully diagnosed, including a zero-implementation K-quant-quality injection experiment: even with
 32%-more-accurate weights (Q4_K_M values), code acceptance barely moves — **the code wall is 4-bit
-quantization itself, not scheme quality** (prose, interestingly, recovers fully). The next named
-levers are adaptive draft length (llama drafts adaptively; we use fixed K) and verify amortization
+quantization itself, not scheme quality** (prose, interestingly, recovers fully). Adaptive draft
+length was then measured and closed too: three host-side policies (confidence early-stop,
+extension-only, HF-style dynamic K) all lose or tie against fixed K=4 — our drafts are so cheap
+(2.2 ms vs ~18 ms per accepted token) that cutting them never pays; llama's adaptive gain assumes
+a costlier draft. The next named lever is verify concat amortization
 ([`docs/gemma-assistant-spec-measured.md`](./docs/gemma-assistant-spec-measured.md)).
 
 We are still slower at these coordinates and say so. This is **not** a general-purpose

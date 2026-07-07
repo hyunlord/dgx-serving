@@ -90,8 +90,11 @@
   accept 갭 규명(진단·measured): 활성화·rope·궤적 가설 전부 기각, code 갭=target 양자화 조건화 확정(fp32-target
   1.74→2.56≈HF). ★K-quant 품질 주입 실험(구현 0): 가중치 32% 정확(rel 0.0695 vs 0.1016)해도 code accept는
   소폭만 회복(1.91 — **code 벽=4bit 자체·스킴 아님**)·prose는 HF 동률 완전 회복 → K-quant 커널 구현 보류
-  (q2 패턴). 남은 lever: **적응적 draft 길이**(llama n-min~max 대응·호스트 로직)·verify concat 분할상환·
-  spec 배칭·(잔여 후보: K-quant bytes 10%↓=plain 소폭·bf16-반올림 정합)
+  (q2 패턴). ★적응적 draft 길이 접힘(measured — 호스트 정책 3종 삼중 판정): margin 조기중단 code −9%·연장
+  전용 +1.4%(잡음권)·HF 동적 K −13% — 원인은 비용 구조(draft 2.2ms ≪ 수락 토큰 가치 18ms → 절단 손익분기
+  P(acc)<13%인데 실측 최저-확신 구간도 20~38% accept = 어떤 문턱도 손해·llama의 적응 이득은 비싼-draft 전제의
+  동형 함정). 남은 lever: **verify concat 분할상환**(부산물 산술: verify Sq3/5/9=46.5/49/63ms → 2슬롯 concat
+  −36% 여지)·spec 배칭(=concat 일반형)·(잔여 후보: K-quant bytes 10%↓=plain 소폭·bf16-반올림 정합)
   → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
 
