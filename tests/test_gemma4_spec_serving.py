@@ -15,7 +15,11 @@ AW   = os.path.join(REPO, "artifacts/gemma4-12b-assistant/weights")
 WLD  = os.path.join(REPO, "artifacts/gemma4-12b-assistant/golden")
 PLAIN= os.path.join(REPO, "tools", "serve_daemon_gemma4_online")
 SPEC = os.path.join(REPO, "tools", "serve_daemon_gemma4_spec_online")
-UQ, MAXLEN, BMAX, K, MAXTOK = "2", "256", "3", "4", 48
+UQ, BMAX, K = "2", "3", "4"
+# ★긴 생성 게이트(반복-버그 진단의 갭 메움): 기본 48tok은 짧은 시퀀스만 검증 — MAXLEN=1024 MAXTOK=400으로
+#   수백 토큰 실생성에서 spec==plain 재검증(greedy 반복 붕괴 구간 포함 — 붕괴도 양쪽 토큰-동일해야 불변식).
+MAXLEN  = os.environ.get("MAXLEN", "256")
+MAXTOK  = int(os.environ.get("MAXTOK", "48"))
 STOP_IDS = os.environ.get("STOP_IDS", "1,106,50")     # gemma generation_config(serve_api와 동일 주입)
 
 def wl_ids(name):

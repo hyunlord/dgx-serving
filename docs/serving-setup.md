@@ -105,7 +105,9 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   from it (the default is a Gemma tokenizer; Qwen serving without the flag will tokenize wrongly).
 - Wait for `[online] ready` on stderr: big models spend minutes in weight loading on a cold start —
   don't kill the process early.
-- `--maxlen` (default 384) sizes the per-request KV budget (prompt + generation);
+- `--maxlen` (default 1024) sizes the per-request KV budget (prompt + generation): `max_tokens` is
+  silently clamped to `maxlen − prompt − small margin`, so a too-small maxlen shows up as answers
+  cut at `finish_reason: length` (the old 384 default truncated at ~350 tokens in practice).
   `--bmax` (default 8) is the continuous-batching width. Long-context serving is a known limit
   (see [`performance.md`](./performance.md) §5).
 - Default quantization is W4A8 (`--uq 2`); `--uq 1` = q4. All measured serving coordinates are W4A8.
@@ -132,7 +134,11 @@ port-forward it to the internet (the server prints the same warning).
 
 Honest scope: **greedy decoding only** — `temperature` / `top_p` / `n>1` / `logprobs` are rejected
 or ignored. Generation stops at the model's `generation_config` EOS ids (`finish_reason` = `stop`)
-or at the token budget (`length`).
+or at the token budget (`length`). A known consequence of pure greedy (no repetition penalty, no
+sampling): on some long expository answers the model can fall into a degenerate repetition loop
+(e.g. `1 1 1 …`). This is the decoding policy, not an engine defect — speculative and plain output
+the token-identical loop (verified on real 350+-token generations; the spec==greedy invariant holds
+through the degenerate region). If you hit it, rephrase the prompt or lower `max_tokens`.
 
 ## 5. Correctness gates (optional, recommended)
 

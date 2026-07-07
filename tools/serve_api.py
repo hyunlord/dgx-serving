@@ -223,7 +223,7 @@ def main():
     ap.add_argument("--tokenizer", default="google/gemma-4-E4B")   # vocab 262144 == 엔진 V(de-risked)
     ap.add_argument("--device", default=os.path.join(HERE,"autotune","profiles","gb10.json"))
     ap.add_argument("--model-profile", default=os.path.join(HERE,"autotune","profiles","gemma4-31b.json"))  # recipe verify용 프로파일 json(--model과 별개)
-    ap.add_argument("--maxlen", type=int, default=384)
+    ap.add_argument("--maxlen", type=int, default=1024)            # KV/rope 예산=프롬프트+생성 상한(384는 ~350tok서 조용한 length-잘림 — 실사 이슈)
     ap.add_argument("--bmax", type=int, default=8)                 # 동시 활성 슬롯 상한(온라인 배칭 폭)
     ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen","spec","gemma4-spec"])  # daemon 종류(arg 레이아웃 상이; spec=27b MTP·gemma4-spec=12B+0.4B assistant)
     ap.add_argument("--golden", default="")                        # qwen/spec rope+MTP golden dir(필수 — gemma4는 dummy rope)
