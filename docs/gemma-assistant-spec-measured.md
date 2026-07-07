@@ -212,9 +212,46 @@ prose 77%, m=0 사이클(전부 버림) 34~55%. 신호도 낭비도 커서 정�
   한 SB 호출로): 2슬롯 Sq5×2=Sq10 ≈ ~63ms vs 각각 98ms = **verify −36% 산술 여지**(spec 배칭의 실질
   형태·스킴 경계[verify M 변경=bit flip 가능] 주의) = 다음 후보 승격.
 
+## verify concat 분할상환 (다중 슬롯 실 WIN — 적응 K 부산물 산술의 실현)
+
+적응 K 접힘의 부산물(verify Sq 둔감 46.5/49/63ms)을 구현으로 전환: **활성 슬롯들의 verify를 한 호출로
+concat** — 큰 matmul만 M=Σ(K+1)행으로 묶고(`gemma4_verify_concat`, gemma4_batch.cu), rope는 행별 위치
+(rope_partial_pos)·attention/KV append는 슬롯별 기존 커널. **신규 커널 0**.
+
+**스킴 경계 flip 원천 회피(구성적)**: matmul은 어떤 M이든 `gemv_w4a8_sb` ≤16행 그룹으로만 분해
+(gemma4_decode amort_mm과 동일 — SB per-row == plain gemv per-row bit-id 기게이트). mmB의 B16
+gemm_batch 전환(진짜 커널 패밀리 경계)을 아예 타지 않음. uq=1(tiled)은 M-종속 타일=스킴 위험이라 loud
+abort(per-slot 경로 사용).
+
+게이트(test_gemma4_verify_concat) 전부 PASS: **concat==per-slot canonical==amort-slot 3중 로짓 Δ=0**
+(M 경계 전수: 5·8·9·10·15·16·17·20·36 — SMAX 8→9·그룹 16→17 경계·ragged 혼합 포함), prenorm Δ=0,
+KV 불침범 Δ=0, 결정성 Δ=0. 서빙 게이트(test_gemma4_spec_serving) 재PASS: spec==plain 토큰 동일·동시
+3요청==솔로(=concat 경로 실사용 격리)·생존 → **spec==greedy 유지**.
+
+속도(단위, warm·K4 청크): per-slot vs concat = B2 90.9→58.4ms(**−36%** — 예측 −36% 적중)·B3 −38%·B4 −35%.
+서빙 A/B(daemon-직결·같은 wl N개 동시·client-observed aggregate·warm·96tok):
+
+| aggregate t/s | N=1 | N=2 | N=4 |
+|---|---|---|---|
+| code: per-slot→concat | 45.2→44.3(잡음권) | 44.9→**62.5 (+39%)** | 44.6→**59.9 (+34%)** |
+| chat: per-slot→concat | 54.0→53.7 | 53.9→**74.8 (+39%)** | 54.1→**72.1 (+33%)** |
+| prose: per-slot→concat | 31.3→31.2 | 31.4→**44.2 (+41%)** | 31.2→**42.5 (+36%)** |
+
+- **per-slot(구)는 N에 완전 평평** = verify 직렬화가 동시성을 전부 먹고 있었음(measured) — concat이
+  spec 서빙에서 다중 슬롯을 처음으로 유효하게 만듦. TTFT 0.12~0.49s 건강(admission 즉시).
+- **단일 스트림 불변(정직)**: N=1 차이 −0.3~2% = 잡음권(bit-id는 게이트가 보증 — A=1도 concat 함수
+  단일 경로이나 기존 amort와 동일 분해).
+- N=4(M=20)가 N=2(M=10)보다 소폭 낮음 = SB 16행 그룹 2회 적재 산술 그대로(K4 기준 N=3(M=15)이
+  단일 적재 스윗스팟). 다중 슬롯의 다음 병목 = **draft 페이즈**(N4 라운드의 ~20% — assistant concat이
+  다음 lever 후보).
+- 좌표 맥락(정직): 12B plain 서빙은 B8 ~96 t/s(배칭 자체가 강함) — spec의 다중 슬롯 강점은 raw
+  aggregate가 아니라 **낮은 동시성(N2~4)에서 per-user t/s(요청별 15~42)와 aggregate의 균형**.
+  llama-server 다중 슬롯+spec 동시 벤치는 인프라 확인 필요(후속) — 단일 스트림 좌표(chat 0.90×/code
+  0.67×)는 불변.
+
 ## 하지 않은 것 / 다음
 - **구현 0(이번)** — 곱의 확정은 구현 후 엔진 실측. num_assistant_tokens>8·tree-draft·batch+spec 결합은 후속.
 - 메모리: 12B(24GB) + assistant(0.9GB) 동시 상주 — W4A8 시 ~7.5GB로 여유(128GB 가드 내).
 - 다음 세션 = ① verify POC부터(정확성 먼저·bit-id 게이트).
-- 적응 K 접힘(위) 후 남은 lever 서열: **verify concat 분할상환**(−36% 산술 여지) > spec 배칭(=concat의
-  일반형) > 잔여 후보(K-quant bytes 10%↓=plain 소폭·bf16-반올림 정합=chat accept).
+- 적응 K 접힘 + verify concat 실현(위) 후 남은 lever 서열: **draft 페이즈 concat**(assistant 배칭 —
+  다중 슬롯 라운드의 ~20%) > 잔여 후보(K-quant bytes 10%↓=plain 소폭·bf16-반올림 정합=chat accept).

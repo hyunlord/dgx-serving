@@ -82,4 +82,19 @@ void gemma4_verify_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
                          const float *d_cos_s, const float *d_sin_s,
                          float *d_logits_cat, int use_q4);
 
+// spec verify concat 분할상환(27b 축1 패턴): 위 verify_batch와 입출력 규약 동일하되 **B_act 슬롯의 큰 matmul을
+//   M=ΣNb 행으로 concat해 weight 적재를 분할상환**(per-slot 순차는 슬롯마다 12B 재적재 = B_act× 비용).
+//   ★스킴 경계 원천 회피: matmul은 전부 gemv_w4a8_sb ≤16행 그룹(gemma4_decode amort_mm과 동일 분해 —
+//   SB per-row == plain gemv per-row bit-id 기게이트)·mmB의 B16 gemm_batch 전환을 타지 않음. rope=행별 위치
+//   (rope_partial_pos, ragged 기게이트)·attention/KV append=슬롯별 기존 커널(단독 경로와 문자 그대로 동일 수학).
+//   d_prenorm_cat: [ΣNb, H] 층 출력(final-norm 전) — EAGLE h 재귀용(호출자가 off[a]+m 행 인덱스).
+//   uq∈{0,2}만(1=tiled는 M-종속 타일 = 스킴 위험 → per-slot 경로 사용, 호출 시 loud abort).
+//   게이트: tests/test_gemma4_verify_concat (concat==per-slot canonical bit-id·M 경계 스윕·결정성·KV 불침범).
+void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                          int B_act, const int *slot_ids, const int *Nb, const int *pos_b,
+                          const int *d_tokens_cat,
+                          const float *d_cos_f, const float *d_sin_f,
+                          const float *d_cos_s, const float *d_sin_s,
+                          float *d_logits_cat, int use_q4, float *d_prenorm_cat = nullptr);
+
 #endif // DGX_DECODE_STATE_GEMMA4_H

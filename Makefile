@@ -196,6 +196,10 @@ tests/test_gemma4_prefill_slot: tests/test_gemma4_prefill_slot.cu models/gemma4_
 tests/test_gemma4_verify: tests/test_gemma4_verify.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_verify.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
 
+# verify concat 분할상환 게이트: concat==per-slot bit-id·M 경계 스윕·KV 불침범·결정성·타이밍. 12B artifacts 필요 → 수동.
+tests/test_gemma4_verify_concat: tests/test_gemma4_verify_concat.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_verify_concat.cu models/gemma4_batch.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+
 # draft-spec 2관문: assistant graph HF 골든 게이트(스텝별+재귀+결정성). assistant artifacts+골든 필요 → 수동.
 tests/test_gemma4_assistant: tests/test_gemma4_assistant.cu models/gemma4_assistant.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_assistant.cu models/gemma4_assistant.cu -o $@

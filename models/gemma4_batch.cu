@@ -318,3 +318,107 @@ void gemma4_verify_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
         off+=Sq;
     }
 }
+
+// ---- spec verify concat 분할상환 (27b 축1 패턴 — 헤더 주석 참조) ----
+//   큰 matmul만 M=ΣNb 행 concat(SB ≤16행 그룹 = gemma4_decode amort_mm 동일 분해·스킴 경계 회피),
+//   rope=행별 위치(rope_partial_pos)·attention/KV append=슬롯별 기존 커널(단독 경로와 동일 수학).
+static inline void mmM(const QMat &m, const float *X, float *Y, int IN, int OUT, int M){
+    if(gb_use_q4==2){
+        size_t n=(size_t)M*IN;
+        if(gb_xcap<n){ if(gb_xq)cudaFree(gb_xq); if(gb_xs)cudaFree(gb_xs); if(gb_xsum)cudaFree(gb_xsum);
+            BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; }
+        launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,M);
+        for(int s0=0;s0<M;s0+=16){ int sq=(M-s0<16)?(M-s0):16;   // ★항상 SB family(≤16행 그룹) — mmB의 B16 gemm_batch 전환 안 탐
+            launch_gemv_w4a8_sb(gb_xq+(size_t)s0*IN, gb_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gb_sdtype); }
+    } else if(gb_use_q4){
+        fprintf(stderr,"[gemma4_verify_concat] uq=1(tiled)은 M-종속 타일=스킴 위험 — per-slot verify_batch 사용. 중단.\n"); exit(1);
+    } else launch_gemv_f32(X,m.wf,Y,IN,OUT,M);
+}
+
+void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState &st,
+                          int B_act, const int *slot_ids, const int *Nb, const int *pos_b,
+                          const int *d_tokens_cat,
+                          const float *d_cos_f, const float *d_sin_f,
+                          const float *d_cos_s, const float *d_sin_s,
+                          float *d_logits_cat, int use_q4, float *d_prenorm_cat){
+    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
+    const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
+    const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
+    const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
+    const float eps=c.rms_norm_eps, ascale=c.attn_scaling;
+
+    int M=0; for(int a=0;a<B_act;a++) M+=Nb[a];
+    std::vector<int> off(B_act); std::vector<int> pos_row(M);
+    for(int a=0,o=0;a<B_act;a++){ off[a]=o;
+        if(pos_b[a]+Nb[a]>st.max_len){ fprintf(stderr,"[gemma4_verify_concat] slot %d pos %d+%d > max_len %d — KV 예산 초과, 중단.\n",slot_ids[a],pos_b[a],Nb[a],st.max_len); exit(1); }
+        for(int j=0;j<Nb[a];j++) pos_row[o+j]=pos_b[a]+j;
+        o+=Nb[a]; }
+    int *d_pos_row; BK(cudaMalloc(&d_pos_row,(size_t)M*4));
+    BK(cudaMemcpy(d_pos_row,pos_row.data(),(size_t)M*4,cudaMemcpyHostToDevice));
+
+    const size_t MH=(size_t)M*H;
+    const int hd_max=hd_f>hd_s?hd_f:hd_s;
+    const size_t qmax=(size_t)M*NQ*hd_max;
+    const size_t kvmax=(size_t)M*(nkv_s*hd_s>nkv_f*hd_f?nkv_s*hd_s:nkv_f*hd_f);
+    float *x=bdm(MH),*norm=bdm(MH),*tmp=bdm(MH),*after=bdm(MH);
+    float *qb=bdm(qmax),*qn=bdm(qmax);
+    float *kb=bdm(kvmax),*kn=bdm(kvmax),*vb=bdm(kvmax),*vn=bdm(kvmax);
+    float *attn=bdm(qmax),*ob=bdm(MH);
+    float *g=bdm((size_t)M*FFN),*u=bdm((size_t)M*FFN),*act=bdm((size_t)M*FFN),*dn=bdm(MH);
+
+    launch_embedding(d_tokens_cat, w.embed, x, M, H);
+    if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,MH);
+
+    for(int l=0;l<c.num_layers;l++){
+        const G4Layer &L=w.layers[l];
+        const int full=L.is_full;
+        const int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
+        const int qdim=NQ*hd, kvdim=nkv*hd;
+        const float *cosT=full?d_cos_f:d_cos_s, *sinT=full?d_sin_f:d_sin_s;
+        const int window=full?0:c.sliding_window;
+        const long kv_stride=(long)st.max_len*kvdim;
+
+        launch_rmsnorm(x, L.input_ln, norm, M, H, eps);
+        mmM(L.q, norm, qb, H, qdim, M);
+        launch_rmsnorm(qb, L.q_norm, qn, M*NQ, hd, eps);
+        launch_rope_partial_pos(qn, cosT, sinT, d_pos_row, M, NQ, hd, hd);   // 행별 절대 위치(ragged 기게이트)
+        mmM(L.k, norm, kb, H, kvdim, M);
+        if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn, M*nkv, hd, eps);   // V=v_norm(k_proj), rope 전
+        else { mmM(L.v, norm, vb, H, kvdim, M); launch_rmsnorm_noscale(vb, vn, M*nkv, hd, eps); }
+        launch_rmsnorm(kb, L.k_norm, kn, M*nkv, hd, eps);
+        launch_rope_partial_pos(kn, cosT, sinT, d_pos_row, M, nkv, hd, hd);
+        // KV append + attention: 슬롯별(각자 KV 서브영역·위치) — 단독 verify와 문자 그대로 동일 커널/수학
+        for(int a=0;a<B_act;a++){
+            const int b=slot_ids[a];
+            BK(cudaMemcpy(st.Kc[l]+(size_t)b*kv_stride+(size_t)pos_b[a]*kvdim, kn+(size_t)off[a]*kvdim, (size_t)Nb[a]*kvdim*4, cudaMemcpyDeviceToDevice));
+            BK(cudaMemcpy(st.Vc[l]+(size_t)b*kv_stride+(size_t)pos_b[a]*kvdim, vn+(size_t)off[a]*kvdim, (size_t)Nb[a]*kvdim*4, cudaMemcpyDeviceToDevice));
+        }
+        for(int a=0;a<B_act;a++){
+            const int b=slot_ids[a];
+            launch_attn_decode(qn+(size_t)off[a]*qdim, st.Kc[l]+(size_t)b*kv_stride, st.Vc[l]+(size_t)b*kv_stride,
+                               attn+(size_t)off[a]*qdim, Nb[a], NQ, nkv, hd, pos_b[a], 0, ascale, window);
+        }
+        mmM(L.o, attn, ob, qdim, H, M);
+        launch_rmsnorm(ob, L.post_attn_ln, tmp, M, H, eps);
+        launch_add(after, x, tmp, (int)MH);
+
+        launch_rmsnorm(after, L.pre_ffn_ln, norm, M, H, eps);
+        mmM(L.gate, norm, g, H, FFN, M);
+        mmM(L.up,   norm, u, H, FFN, M);
+        launch_geglu(g, u, act, (size_t)M*FFN);
+        mmM(L.down, act, dn, FFN, H, M);
+        launch_rmsnorm(dn, L.post_ffn_ln, tmp, M, H, eps);
+        launch_add(x, after, tmp, (int)MH);
+        if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, MH);
+    }
+
+    if(d_prenorm_cat) BK(cudaMemcpy(d_prenorm_cat, x, MH*4, cudaMemcpyDeviceToDevice));   // EAGLE h 재귀용(행 off[a]+m)
+    launch_rmsnorm(x, w.final_norm, norm, M, H, eps);
+    mmM(w.lm_head, norm, d_logits_cat, H, V, M);
+    if(c.final_logit_softcapping>0.f) launch_softcap(d_logits_cat, d_logits_cat, c.final_logit_softcapping, (size_t)M*V);
+    BK(cudaDeviceSynchronize());
+
+    cudaFree(d_pos_row);
+    float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn};
+    for(float *p:all) cudaFree(p);
+}

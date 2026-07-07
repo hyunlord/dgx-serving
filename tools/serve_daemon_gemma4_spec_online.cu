@@ -73,14 +73,15 @@ int main(int argc,char**argv){
     AstWeights wa = load_weights_assistant(AW.c_str(), ca, ast_uq);
     G4BatchState bs = alloc_g4_batch_state(c, Bmax, maxlen);
 
-    int   *d_tok;  CK(cudaMalloc(&d_tok,(size_t)(maxlen>K+1?maxlen:K+1)*4));
-    float *d_lg;   CK(cudaMalloc(&d_lg,(size_t)(K+1)*V*4));
-    float *d_pn;   CK(cudaMalloc(&d_pn,(size_t)maxlen*H*4));           // prefill/verify prenorm rows
+    const int MCAT=Bmax*(K+1);                                          // verify concat 최대 행수(전 슬롯 활성)
+    int   *d_tok;  CK(cudaMalloc(&d_tok,(size_t)(maxlen>MCAT?maxlen:MCAT)*4));
+    float *d_lg;   CK(cudaMalloc(&d_lg,(size_t)MCAT*V*4));
+    float *d_pn;   CK(cudaMalloc(&d_pn,(size_t)maxlen*H*4));           // prefill/verify prenorm rows(maxlen≥MCAT)
     float *d_h;    CK(cudaMalloc(&d_h,(size_t)Bmax*H*4));              // 슬롯별 h_prev(EAGLE 재귀)
     float *d_in;   CK(cudaMalloc(&d_in,(size_t)2*H*4));
     float *d_alg;  CK(cudaMalloc(&d_alg,(size_t)V*4));
     float *d_ho;   CK(cudaMalloc(&d_ho,(size_t)H*4));
-    int   *d_am;   CK(cudaMalloc(&d_am,(size_t)(K+1)*4));
+    int   *d_am;   CK(cudaMalloc(&d_am,(size_t)MCAT*4));
 
     // 슬롯-b 뷰(gemma4_verify_batch/prefill_batch_slot과 동일 트릭)
     std::vector<std::vector<float*>> vK(Bmax), vV(Bmax);
@@ -123,7 +124,8 @@ int main(int argc,char**argv){
     });
 
     std::vector<SpecSlot> slot(Bmax);
-    std::vector<int> chunk(K+1), am(K+1);
+    std::vector<int> h_cat((size_t)Bmax*(K+1)), am_cat((size_t)Bmax*(K+1));  // 활성 a → 행 off=a*(K+1)
+    std::vector<int> Nb(Bmax), pos_a(Bmax);
     auto n_active=[&](){ int a=0; for(int b=0;b<Bmax;b++) if(slot[b].req>=0)a++; return a; };
     auto end_slot=[&](int b, const char* why){ printf("%ld END %s\n", slot[b].req, why); fflush(stdout); slot[b]=SpecSlot(); };
 
@@ -159,11 +161,22 @@ int main(int argc,char**argv){
         }
         if(n_active()==0){ if(shutdown){ std::lock_guard<std::mutex> lk(mtx); if(queue.empty()) break; } continue; }
 
-        // 2) 활성 슬롯별 spec 사이클 1회(라운드로빈 — per-slot 순차 = 단독과 동일 계산 = 격리 구성적)
+        // 2) 활성 슬롯 spec 사이클 1회 — draft(슬롯별) → ★verify concat(활성 전 슬롯 한 SB 호출 = weight 적재
+        //    분할상환, 다중 슬롯 −36% measured) → accept/방출(슬롯별). 계산 의미는 per-slot 순차와 동일:
+        //    draft는 자기 슬롯 KV[0..pos)만 읽고(이전 사이클 verify가 쓴 접두사), concat==per-slot bit-id는
+        //    test_gemma4_verify_concat 게이트(M 경계 스윕·Δ=0)가 잠금 → spec==greedy 유지.
+        std::vector<int> act; act.reserve(Bmax);
         for(int b=0;b<Bmax;b++){
-            SpecSlot &s=slot[b]; if(s.req<0) continue;
-            if(s.pos+K+1>=maxlen){ end_slot(b,"length"); continue; }     // KV 예산 가드
-            // --- draft K (assistant: 고정 rope행 s.pos·target KV[0..s.pos) 직독·재귀 h) ---
+            if(slot[b].req<0) continue;
+            if(slot[b].pos+K+1>=maxlen){ end_slot(b,"length"); continue; }   // KV 예산 가드
+            act.push_back(b);
+        }
+        const int A=(int)act.size();
+        if(A==0) continue;
+        // --- draft phase: 슬롯별 K (assistant: 고정 rope행 s.pos·target KV[0..s.pos) 직독·재귀 h) ---
+        for(int a=0;a<A;a++){
+            const int b=act[a]; SpecSlot &s=slot[b];
+            const int off=a*(K+1);
             int dt=s.cur;
             for(int j=0;j<K;j++){
                 CK(cudaMemcpy(d_tok,&dt,4,cudaMemcpyHostToDevice));
@@ -174,27 +187,32 @@ int main(int argc,char**argv){
                                       d_cf+(size_t)s.pos*hd_f, d_sf+(size_t)s.pos*hd_f,
                                       d_cs+(size_t)s.pos*hd_s, d_ss+(size_t)s.pos*hd_s, d_alg, d_ho, ast_uq);
                 launch_argmax(d_alg,V,d_am); CK(cudaMemcpy(&dt,d_am,4,cudaMemcpyDeviceToHost));
-                chunk[j+1]=dt;
+                h_cat[off+j+1]=dt;
             }
-            // --- verify(슬롯-뷰·Sq=K+1·commit=0·amort=1[SB==gemv bit-id 기게이트]·prenorm) ---
-            chunk[0]=s.cur;
-            CK(cudaMemcpy(d_tok,chunk.data(),(size_t)(K+1)*4,cudaMemcpyHostToDevice));
-            G4DecodeState vv=view_of(b,s.pos);
-            gemma4_decode(c,w,vv,d_tok,K+1,d_cf,d_sf,d_cs,d_ss,d_lg,0,uq,0,1,d_pn);
-            for(int i=0;i<=K;i++) launch_argmax(d_lg+(size_t)i*V,V,d_am+i);
-            CK(cudaMemcpy(am.data(),d_am,(size_t)(K+1)*4,cudaMemcpyDeviceToHost));
-            int m=0; for(int i=1;i<=K;i++){ if(am[i-1]==chunk[i]) m++; else break; }
-            // --- 방출(accept d_1..d_m + bonus/교정 am[m]) — stop/max_tokens 스캔(plain daemon 의미 동일) ---
+            h_cat[off]=s.cur;
+        }
+        // --- verify phase: concat 1호출(A=1이어도 동일 분해=기존 amort 경로와 같은 커널·게이트 확증) ---
+        for(int a=0;a<A;a++){ Nb[a]=K+1; pos_a[a]=slot[act[a]].pos; }
+        CK(cudaMemcpy(d_tok,h_cat.data(),(size_t)A*(K+1)*4,cudaMemcpyHostToDevice));
+        gemma4_verify_concat(c,w,bs,A,act.data(),Nb.data(),pos_a.data(),d_tok,
+                             d_cf,d_sf,d_cs,d_ss,d_lg,uq,d_pn);
+        for(int i=0;i<A*(K+1);i++) launch_argmax(d_lg+(size_t)i*V,V,d_am+i);
+        CK(cudaMemcpy(am_cat.data(),d_am,(size_t)A*(K+1)*4,cudaMemcpyDeviceToHost));
+        // --- accept/방출 phase: 슬롯별(accept d_1..d_m + bonus/교정 — stop/max_tokens 의미 기존 동일) ---
+        for(int a=0;a<A;a++){
+            const int b=act[a]; SpecSlot &s=slot[b]; if(s.req<0) continue;
+            const int off=a*(K+1);
+            int m=0; for(int i=1;i<=K;i++){ if(am_cat[off+i-1]==h_cat[off+i]) m++; else break; }
             for(int i=1;i<=m+1 && s.req>=0;i++){
-                int tok = (i<=m)? chunk[i] : am[m];
+                int tok = (i<=m)? h_cat[off+i] : am_cat[off+m];
                 if(is_stop(tok)){ end_slot(b,"stop"); break; }            // EOS 토큰 미출력·종료
                 printf("%ld %d\n", s.req, tok); fflush(stdout);
                 s.gen++;
                 if(s.gen>=s.max_tokens){ end_slot(b,"length"); break; }
             }
             if(s.req>=0){                                                 // 사이클 북키핑(h·cur·pos)
-                CK(cudaMemcpy(d_h+(size_t)b*H, d_pn+(size_t)m*H, (size_t)H*4, cudaMemcpyDeviceToDevice));
-                s.cur=am[m]; s.pos+=m+1;
+                CK(cudaMemcpy(d_h+(size_t)b*H, d_pn+(size_t)(off+m)*H, (size_t)H*4, cudaMemcpyDeviceToDevice));
+                s.cur=am_cat[off+m]; s.pos+=m+1;
             }
         }
     }
