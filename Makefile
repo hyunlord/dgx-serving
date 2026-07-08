@@ -168,8 +168,12 @@ tests/%: tests/%.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@
 
 # 빌드 + 모든 테스트 실행
+#   ★긴 생성 rope 붕괴(theta·partial_rotary_factor 2연속 오진)의 절대 봉인 = test_gemma4_rope_table.py.
+#     spec==plain 상대 게이트가 두 번 놓친 축이라 상시 회귀에 편입(골든 자산 없으면 우아하게 skip — 신선 클론 안전).
 test: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== run $$t ==="; $$t || exit 1; done
+	@echo "=== run tests/test_gemma4_rope_table.py (절대 골든 — 긴 생성 rope 봉인) ==="
+	@python3 tests/test_gemma4_rope_table.py || exit 1
 
 clean:
 	rm -f $(TEST_BINS)
