@@ -37,8 +37,13 @@ __global__ void lut2_gemv(const uint8_t* indices, const __half* scales,
                           const __half* codebook, const __half* x, float* y,
                           int K, int N, int index_stride, int scale_stride) {
     __shared__ __align__(8) uint16_t table[1024];
+    extern __shared__ __half shared_x[];
     for (int i = threadIdx.x; i < 1024; i += blockDim.x)
         table[i] = __half_as_ushort(codebook[i]);
+    if constexpr (Packed) {
+        // Coalesce activation global loads without changing lane ownership or accumulation order.
+        for (int i = threadIdx.x; i < K; i += blockDim.x) shared_x[i] = x[i];
+    }
     __syncthreads();
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int lane = threadIdx.x & 31;
@@ -75,7 +80,10 @@ __global__ void lut2_gemv(const uint8_t* indices, const __half* scales,
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int k = base + group * 4 + j;
-                if (k < K) sum = fmaf(w[j], __half2float(x[k]) * scale, sum);
+                if (k < K) {
+                    if constexpr (Packed) sum = fmaf(w[j], __half2float(shared_x[k]) * scale, sum);
+                    else sum = fmaf(w[j], __half2float(x[k]) * scale, sum);
+                }
             }
         }
     }
@@ -225,7 +233,7 @@ struct Dataset {
             const int grid=(shape.N+THREADS/32-1)/(THREADS/32);
             if(variant==Variant::Scalar)lut2_gemv<false><<<grid,THREADS>>>(d_indices.ptr+copy*lut_index_bytes,
                 d_scales.ptr+copy*lut_scale_count,d_codebook.ptr,d_x.ptr,d_y.ptr,shape.K,shape.N,index_stride,scale_stride);
-            else lut2_gemv<true><<<grid,THREADS>>>(d_indices.ptr+copy*lut_index_bytes,
+            else lut2_gemv<true><<<grid,THREADS,shape.K*sizeof(__half)>>>(d_indices.ptr+copy*lut_index_bytes,
                 d_scales.ptr+copy*lut_scale_count,d_codebook.ptr,d_x.ptr,d_y.ptr,shape.K,shape.N,index_stride,scale_stride);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -363,6 +371,7 @@ static void usage() {
     std::puts("probe_gemv_lut2 <check|check-exact|check-round|warm|bench|profile> [up|down|edge|all] [scalar|packed|q4|all] [fp32|fp16]\n"
               "check: exact then original random; check-exact: bit equality; check-round: abs_error/sum_abs_products <1e-5. Fixed seed20261024;30 bitwise repeats.\n"
               "warm/bench default: up/down, all variants; check MUST pass first. profile requires one shape/variant.\n"
+              "bench packed: packed,q4 alternating 5 pairs; packed stages unchanged fp16 activations in shared memory.\n"
               "bench all: scalar,q4 alternating 5 pairs, then packed,q4 alternating 5 pairs; every trial warms >=10s, then repeats 100-launch batches until summed CUDA event time >=1000ms.\n"
               "TRIAL epoch bounds are host envelopes. External telemetry median is N/A if no sample lies inside.\n"
               "q4 defaults to fp32 weight scales (5 bits/weight); fp16 = 4.5 bits. LUT2 = 2.5 bits + 2048-byte codebook.\n"
@@ -407,6 +416,7 @@ int main(int argc,char** argv) {
                 paired_benchmark(data,Variant::Scalar);
                 paired_benchmark(data,Variant::Packed);
             }
+            else if(mode=="bench" && variant_arg=="packed")paired_benchmark(data,Variant::Packed);
             else for(Variant variant:variants) {
                 if(mode=="bench")benchmark(data,variant);
                 else if(mode=="warm")warm(data,variant);
