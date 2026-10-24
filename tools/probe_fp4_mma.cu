@@ -99,10 +99,20 @@ template<bool Int8>
 __global__ void throughput(float* output) {
   float fp[kAccumulators][4] = {};
   int si[kAccumulators][4] = {};
+  // Distinct initial values prevent ptxas from merging identical MMA chains.
+  #pragma unroll
+  for (int i = 0; i < kAccumulators; ++i) {
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      fp[i][j] = float(4 * i + j + 1);
+      si[i][j] = 4 * i + j + 1;
+    }
+  }
   const uint32_t word = repeated_code(2);
   const uint32_t a[4] = {word, word, word, word};
   const uint32_t b[2] = {word, word};
   // No memory operations inside this loop. Inspect SASS for register spills.
+  #pragma unroll 1
   for (int iteration = 0; iteration < kIterations; ++iteration) {
     #pragma unroll
     for (int i = 0; i < kAccumulators; ++i) {
