@@ -7,7 +7,7 @@
 """Serialize one caller-owned GPU measurement with memory and resident-process evidence.
 
 Exit 86: resident memory increased; 87: unexpected GPU process; 88: memory
-budget rejected; 89: monitor/evidence failure. Otherwise preserve command status.
+budget rejected; 89: monitor/evidence failure; 90: clock gate rejected.
 The caller owns retry policy and must not run two instances concurrently.
 """
 from __future__ import annotations
@@ -20,12 +20,19 @@ import re
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
+from statistics import median
 from typing import Final, TextIO
 
 GPU_QUERY: Final = "--query-gpu=timestamp,utilization.gpu,memory.used,clocks.sm"
 APP_QUERY: Final = "--query-compute-apps=pid,process_name,used_memory"
+CLOCK_QUERY: Final = ("--query-gpu=timestamp,clocks.sm,clocks.max.sm,power.draw,"
+                      "temperature.gpu,clocks_throttle_reasons.active")
+# NVIDIA nvml.h: https://github.com/NVIDIA/go-nvml/blob/main/pkg/nvml/nvml.h
+HW_CLOCK_MASK: Final = 0x8 | 0x40 | 0x80  # HW slowdown, thermal slowdown, power brake.
 CONDITION: Final = "ComfyUI 상주(유휴, 3.2GB)"
 
 
@@ -113,11 +120,29 @@ def stop_monitor(process: subprocess.Popen[str]) -> None:
             process.wait(timeout=5)
 
 
+def clock_samples(path: Path) -> list[tuple[float, int, int, int]]:
+    samples: list[tuple[float, int, int, int]] = []
+    for row in csv.reader(path.read_text().splitlines()):
+        if not row or row[0].strip() == "timestamp":
+            continue
+        if len(row) != 6:
+            raise ValueError(f"Invalid clock monitor row: {row!r}")
+        stamp = datetime.strptime(row[0].strip(), "%Y/%m/%d %H:%M:%S.%f").timestamp()
+        clock = int(row[1].strip().removesuffix(" MHz"))
+        max_clock = int(row[2].strip().removesuffix(" MHz"))
+        mask = int(row[5].strip(), 0)
+        samples.append((stamp, clock, mask, max_clock))
+    if not samples:
+        raise ValueError("Clock monitor contains no valid samples")
+    return samples
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", required=True)
     parser.add_argument("--log-dir", required=True, type=Path)
     parser.add_argument("--expected-bytes", required=True, type=int)
+    parser.add_argument("--clock-gate", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command: list[str] = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -131,6 +156,7 @@ def main() -> int:
         json.dump({"status": "starting", "command": command}, initial)
     gpu_path = args.log_dir / f"gpumon_{args.name}.csv"
     apps_path = args.log_dir / f"apps_{args.name}.csv"
+    clock_path = args.log_dir / f"clockmon_{args.name}.csv"
     monitors: list[subprocess.Popen[str]] = []
     handles: list[TextIO] = []
     child: subprocess.Popen[str] | None = None
@@ -153,28 +179,42 @@ def main() -> int:
             result["status"] = "memory_budget_rejected"
             status = 88
             return status
-        for path, query, interval in ((gpu_path, GPU_QUERY, "1"), (apps_path, APP_QUERY, "5")):
+        for path, query, flag, interval in ((gpu_path, GPU_QUERY, "-l", "1"),
+                (apps_path, APP_QUERY, "-l", "5"), (clock_path, CLOCK_QUERY, "-lms", "100")):
             handle = path.open("x")
             handles.append(handle)
-            monitors.append(subprocess.Popen(["nvidia-smi", query, "--format=csv", "-l", interval],
+            monitors.append(subprocess.Popen(["nvidia-smi", query, "--format=csv", flag, interval],
                                              stdout=handle, stderr=subprocess.STDOUT, text=True))
         deadline = time.monotonic() + 10
-        while not (gpu_path.stat().st_size and apps_path.stat().st_size):
+        while not all(p.stat().st_size for p in (gpu_path, apps_path, clock_path)):
             if any(p.poll() is not None for p in monitors) or time.monotonic() >= deadline:
                 raise ValueError("Monitor startup failed or produced no data within 10 seconds")
             time.sleep(0.05)
         validate_gpu_log(gpu_path)
+        clock_samples(clock_path)
         if not app_samples(apps_path):
             raise ValueError("Application monitor did not capture resident baseline")
+        if args.clock_gate:
+            (args.log_dir / f"clock_before_{args.name}.txt").write_text(capture("nvidia-smi", "-q", "-d", "CLOCK,PERFORMANCE"))
+        during = False
         with (args.log_dir / f"command_{args.name}.log").open("x") as output:
+            command_start = time.time()
+            monotonic_start = time.monotonic()
             child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, text=True)
             owned = {child.pid}
             while True:
                 descendants(owned)
                 if child.poll() is not None:
                     break
+                if args.clock_gate and not during and time.monotonic() - monotonic_start >= 10:
+                    (args.log_dir / f"clock_during_{args.name}.txt").write_text(capture("nvidia-smi", "-q", "-d", "CLOCK,PERFORMANCE"))
+                    during = True
                 time.sleep(0.2)
             command_status = child.wait()
+            command_end = time.time()
+        result.update(command_start_unix=command_start, command_end_unix=command_end)
+        if args.clock_gate:
+            (args.log_dir / f"clock_after_{args.name}.txt").write_text(capture("nvidia-smi", "-q", "-d", "CLOCK,PERFORMANCE"))
         monitor_failed = any(p.poll() is not None for p in monitors)
         for monitor in monitors:
             stop_monitor(monitor)
@@ -184,6 +224,26 @@ def main() -> int:
             output.write(capture("nvidia-smi", APP_QUERY, "--format=csv"))
         final = gpu_processes()
         validate_gpu_log(gpu_path)
+        interval_start, interval_end = command_start, command_end
+        if args.clock_gate:
+            log = (args.log_dir / f"command_{args.name}.log").read_text()
+            markers = dict(re.findall(r"interval=load edge=(start|end)[^\n]*epoch_seconds=([0-9.eE+-]+)", log))
+            if set(markers) != {"start", "end"}:
+                raise ValueError("Clock gate requires load start/end timestamp markers")
+            interval_start, interval_end = float(markers["start"]), float(markers["end"])
+            if not command_start <= interval_start < interval_end <= command_end or interval_end - interval_start < 30:
+                raise ValueError("Clock gate requires an actual load interval of at least 30 seconds")
+        result.update(clock_interval_start_unix=interval_start, clock_interval_end_unix=interval_end)
+        clock_rows = [r for r in clock_samples(clock_path) if interval_start <= r[0] <= interval_end]
+        if not clock_rows or (args.clock_gate and not during):
+            raise ValueError("Missing in-command clock samples or during-load CLOCK,PERFORMANCE snapshot")
+        clocks = [r[1] for r in clock_rows]
+        blocked_clock = median(clocks) < 1800 or any(r[2] & HW_CLOCK_MASK for r in clock_rows)
+        result.update(clock_samples=len(clocks), clock_min_mhz=min(clocks), clock_max_mhz=max(clocks),
+                      clock_median_mhz=median(clocks), clock_distribution=dict(Counter(clocks)),
+                      clock_mask_distribution=dict(Counter(hex(r[2]) for r in clock_rows)),
+                      clock_reported_max_mhz=max(r[3] for r in clock_rows),
+                      clock_gate_enabled=args.clock_gate, clock_gate_failed=args.clock_gate and blocked_clock)
         samples = app_samples(apps_path) + final
         baseline_by_pid = {p.pid: p for p in baseline}
         unexpected = [asdict(p) for p in samples if p.pid not in owned and
@@ -195,13 +255,16 @@ def main() -> int:
                       monitors_failed=monitor_failed, sample_count=len(samples) - len(final))
         if any(p.pid in owned for p in final):
             raise ValueError("Measurement descendants still have GPU allocations after command exit")
-        status = 89 if monitor_failed else 87 if unexpected else 86 if increased else command_status
+        status = (89 if monitor_failed else 87 if unexpected else 86 if increased
+                  else 90 if args.clock_gate and blocked_clock else command_status)
         result["status"] = ("monitor_failed" if monitor_failed else "unexpected_process" if unexpected
-                            else "contaminated" if increased else "clean" if status == 0 else "command_failed")
+                            else "contaminated" if increased else "clock_gate_failed" if status == 90
+                            else "clean" if status == 0 else "command_failed")
         return status
     except (OSError, ValueError, ET.ParseError, subprocess.SubprocessError) as error:
         result["error"] = str(error)
-        return 89
+        status = 89
+        return status
     finally:
         if child is not None and child.poll() is None:
             # Never strand a GPU workload if evidence collection itself fails.

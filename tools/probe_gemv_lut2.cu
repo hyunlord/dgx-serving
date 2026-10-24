@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -259,31 +260,68 @@ static void check(Dataset& data) {
                     data.shape.name,variant_name(variant),data.shape.N,max_relative,max_absolute,worst_row);
     }
 }
-static void benchmark(Dataset& data, Variant variant) {
+static long long epoch_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+static void warm(Dataset& data, Variant variant) {
+    const auto start=std::chrono::steady_clock::now();
+    const long long begin=epoch_ns();
+    int launches=0;
+    do {
+        for(int i=0;i<REPEATS;++i)data.launch(variant,launches++);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } while(std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<10.0);
+    std::printf("WARM shape=%s variant=%s launches=%d begin_epoch_ns=%lld end_epoch_ns=%lld elapsed_s=%.17g\n",
+                data.shape.name,variant_name(variant),launches,begin,epoch_ns(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
+    std::fflush(stdout);
+}
+static double timed_trial(Dataset& data, Variant variant, int trial, const char* comparison) {
+    warm(data,variant);
     cudaEvent_t start,stop;
     CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
-    double best=std::numeric_limits<double>::infinity();
-    // Logical unique read footprint per call, NOT hardware DRAM traffic; ncu supplies actual traffic.
+    // These host timestamps bracket the CUDA event interval; they are not GPU timestamps.
+    const long long begin=epoch_ns();
+    CUDA_CHECK(cudaEventRecord(start));
+    for(int iteration=0;iteration<REPEATS;++iteration)data.launch(variant,trial*REPEATS+iteration);
+    CUDA_CHECK(cudaEventRecord(stop)); CUDA_CHECK(cudaEventSynchronize(stop));
+    const long long end=epoch_ns();
+    float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));
+    const double us=static_cast<double>(ms)*1000.0/REPEATS;
+    // Logical unique bytes, not actual DRAM traffic; ncu supplies actual traffic.
     const size_t read_bytes=variant==Variant::Q4 ? data.q4_matrix_bytes+data.shape.K+data.scale_stride*sizeof(float)
         : data.lut_matrix_bytes+2048+data.shape.K*sizeof(__half);
-    for(int trial=0;trial<TRIALS;++trial) {
-        CUDA_CHECK(cudaEventRecord(start));
-        for(int iteration=0;iteration<REPEATS;++iteration)data.launch(variant,trial*REPEATS+iteration);
-        CUDA_CHECK(cudaEventRecord(stop)); CUDA_CHECK(cudaEventSynchronize(stop));
-        float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));
-        const double us=static_cast<double>(ms)*1000.0/REPEATS;
-        best=std::min(best,us);
-        std::printf("TRIAL shape=%s variant=%s trial=%d iterations=%d event_ms=%.9g mean_us=%.17g read_bytes=%zu effective_GBps=%.17g\n",
-                    data.shape.name,variant_name(variant),trial+1,REPEATS,ms,us,read_bytes,read_bytes/(us*1000.0));
-    }
-    std::printf("BEST shape=%s variant=%s trials=5 iterations=100 mean_us=%.17g read_bytes=%zu effective_GBps=%.17g\n",
-                data.shape.name,variant_name(variant),best,read_bytes,read_bytes/(best*1000.0));
+    std::printf("TRIAL shape=%s comparison=%s variant=%s trial=%d iterations=%d event_ms=%.9g mean_us=%.17g read_bytes=%zu effective_GBps=%.17g begin_epoch_ns=%lld end_epoch_ns=%lld\n",
+                data.shape.name,comparison,variant_name(variant),trial+1,REPEATS,ms,us,read_bytes,read_bytes/(us*1000.0),begin,end);
+    std::fflush(stdout);
     CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(stop));
+    return us;
+}
+static void benchmark(Dataset& data, Variant variant) {
+    double best=std::numeric_limits<double>::infinity();
+    for(int trial=0;trial<TRIALS;++trial)best=std::min(best,timed_trial(data,variant,trial,"standalone"));
+    std::printf("BEST shape=%s variant=%s trials=5 iterations=100 mean_us=%.17g\n",data.shape.name,variant_name(variant),best);
+}
+static void paired_benchmark(Dataset& data, Variant variant) {
+    double best_lut=std::numeric_limits<double>::infinity(),best_q4=best_lut;
+    for(int pair=0;pair<TRIALS;++pair) {
+        const double lut=timed_trial(data,variant,pair,variant_name(variant));
+        const double q4=timed_trial(data,Variant::Q4,pair,variant_name(variant));
+        best_lut=std::min(best_lut,lut);best_q4=std::min(best_q4,q4);
+        std::printf("PAIR shape=%s variant=%s pair=%d lut_mean_us=%.17g q4_mean_us=%.17g q4_over_lut=%.17g\n",
+                    data.shape.name,variant_name(variant),pair+1,lut,q4,q4/lut);
+        std::fflush(stdout);
+    }
+    std::printf("PAIRED_BEST shape=%s variant=%s pairs=5 iterations=100 lut_mean_us=%.17g q4_mean_us=%.17g\n",
+                data.shape.name,variant_name(variant),best_lut,best_q4);
 }
 static void usage() {
     std::puts("probe_gemv_lut2 <check|warm|bench|profile> [up|down|edge|all] [scalar|packed|q4|all] [fp32|fp16]\n"
               "check default: all shapes, both LUT2 variants; fixed seed 20261024, strict relative <1e-3, 30 bitwise repeats.\n"
               "warm/bench default: up/down, all variants; check MUST pass first. profile requires one shape/variant.\n"
+              "bench all: scalar,q4 alternating 5 pairs, then packed,q4 alternating 5 pairs; every trial warms >=10s.\n"
+              "TRIAL epoch bounds are host envelopes. External telemetry median is N/A if no sample lies inside.\n"
               "q4 defaults to fp32 weight scales (5 bits/weight); fp16 = 4.5 bits. LUT2 = 2.5 bits + 2048-byte codebook.\n"
               "Timing excludes allocation, transfers and q4 activation quantization. No model-quality equivalence is claimed.\n"
               "Before each run caller must check free -h, resident GPU apps, and start gpumon/apps logs.\n"
@@ -311,8 +349,13 @@ int main(int argc,char** argv) {
             if(shape.K%32 && mode!="check")throw std::runtime_error("edge shape is correctness-only");
             Dataset data(shape,mode!="check",scale_arg=="fp16",properties.l2CacheSize);
             if(mode=="check")check(data);
+            else if(mode=="bench" && variant_arg=="all") {
+                paired_benchmark(data,Variant::Scalar);
+                paired_benchmark(data,Variant::Packed);
+            }
             else for(Variant variant:variants) {
                 if(mode=="bench")benchmark(data,variant);
+                else if(mode=="warm")warm(data,variant);
                 else {
                     const int count=mode=="profile"?1:REPEATS;
                     for(int i=0;i<count;++i)data.launch(variant,i);

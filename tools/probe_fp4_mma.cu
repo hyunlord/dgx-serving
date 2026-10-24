@@ -6,6 +6,8 @@
 // Mapping is independently expressed below; the three exact checks test it.
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -164,45 +166,79 @@ static bool correctness(float* device) {
   return passed;
 }
 
+static double epoch_seconds() {
+  return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static void marker(const char* phase, const char* edge, const char* instruction, int pair) {
+  std::printf("interval=%s edge=%s instruction=%s pair=%d epoch_seconds=%.17g\n",
+              phase, edge, instruction, pair, epoch_seconds());
+  std::fflush(stdout);
+}
+
 template<bool Int8>
-static double benchmark(float* device, int blocks, bool warm_only) {
-  throughput<Int8><<<blocks, kThreads>>>(device);
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaDeviceSynchronize());
-  if (warm_only) {
-    for (int i = 0; i < 200; ++i) throughput<Int8><<<blocks, kThreads>>>(device);
+static void sustained_load(float* device, int blocks, double seconds, int pair, const char* phase) {
+  const char* name = Int8 ? "INT8" : kVariant;
+  marker(phase, "start", name, pair);
+  const auto start = std::chrono::steady_clock::now();
+  size_t launches = 0;
+  double elapsed;
+  do {
+    for (int i = 0; i < 100; ++i) throughput<Int8><<<blocks, kThreads>>>(device);
+    launches += 100;
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    return 0;
-  }
+    elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  } while (elapsed < seconds);
+  marker(phase, "end", name, pair);
+  std::printf("interval=%s instruction=%s pair=%d elapsed_seconds=%.17g launches=%zu\n",
+              phase, name, pair, elapsed, launches);
+  std::fflush(stdout);
+}
+
+template<bool Int8>
+static double benchmark(float* device, int blocks, int pair) {
+  sustained_load<Int8>(device, blocks, 10.0, pair, "warm");
   cudaEvent_t start, end;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&end));
-  double best = 0;
   const double operations = double(blocks) * (kThreads / 32) * kIterations *
                             kAccumulators * 2 * 16 * 8 * (Int8 ? 32 : kDepth);
-  for (int sample = 0; sample < 5; ++sample) {
-    CUDA_CHECK(cudaEventRecord(start));
-    throughput<Int8><<<blocks, kThreads>>>(device);
+  const char* name = Int8 ? "INT8" : kVariant;
+  size_t launches = 0;
+  float milliseconds = 0;
+  marker("measure", "start", name, pair);
+  CUDA_CHECK(cudaEventRecord(start));
+  // Fixed 100-launch chunks for both instructions; total interval >=1 second.
+  // CUDA event time includes any stream-idle host gaps between these chunks.
+  do {
+    for (int i = 0; i < 100; ++i) throughput<Int8><<<blocks, kThreads>>>(device);
+    launches += 100;
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(end));
     CUDA_CHECK(cudaEventSynchronize(end));
-    float milliseconds;
     CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, end));
-    const double tops = operations / (double(milliseconds) * 1e9);
-    best = std::max(best, tops);
-    std::printf("instruction=%s sample=%d milliseconds=%.9g operations=%.17g teraops_per_second=%.17g\n",
-                Int8 ? "INT8" : kVariant, sample + 1, double(milliseconds), operations, tops);
-  }
+  } while (milliseconds < 1000.f);
+  marker("measure", "end", name, pair);
+  const double total_operations = operations * double(launches);
+  const double tops = total_operations / (double(milliseconds) * 1e9);
+  std::printf("instruction=%s pair=%d milliseconds=%.9g launches=%zu operations=%.17g teraops_per_second=%.17g\n",
+              name, pair, double(milliseconds), launches, total_operations, tops);
+  std::fflush(stdout);
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(end));
-  return best;
+  return tops;
 }
 
 int main(int argc, char** argv) {
-  if (argc != 2 || (std::strcmp(argv[1], "--check") &&
-                   std::strcmp(argv[1], "--warm") && std::strcmp(argv[1], "--bench"))) {
-    std::fprintf(stderr, "usage: %s --check|--warm|--bench\n", argv[0]);
+  const bool load = argc == 3 && !std::strcmp(argv[1], "--load");
+  const bool ordinary = argc == 2 && (!std::strcmp(argv[1], "--check") ||
+                        !std::strcmp(argv[1], "--warm") || !std::strcmp(argv[1], "--bench"));
+  char* duration_end = nullptr;
+  const double load_seconds = load ? std::strtod(argv[2], &duration_end) : 0;
+  if ((!load && !ordinary) || (load && (duration_end == argv[2] || *duration_end ||
+      !std::isfinite(load_seconds) || load_seconds <= 0 || load_seconds > 3600))) {
+    std::fprintf(stderr, "usage: %s --check|--warm|--bench|--load <seconds in (0,3600]>\n", argv[0]);
     return 2;
   }
   cudaDeviceProp properties;
@@ -222,15 +258,20 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(device));
     return 1;
   }
-  if (!std::strcmp(argv[1], "--warm")) {
-    benchmark<false>(device, blocks, true);
-    benchmark<true>(device, blocks, true);
+  if (load) {
+    sustained_load<false>(device, blocks, load_seconds, 0, "load");
+  } else if (!std::strcmp(argv[1], "--warm")) {
+    sustained_load<false>(device, blocks, 10.0, 0, "warm");
+    sustained_load<true>(device, blocks, 10.0, 0, "warm");
     std::puts("warm_complete=1");
   } else if (!std::strcmp(argv[1], "--bench")) {
-    const double fp4 = benchmark<false>(device, blocks, false);
-    const double int8 = benchmark<true>(device, blocks, false);
-    std::printf("best_FP4_teraops=%.17g best_INT8_teraops=%.17g FP4_INT8_ratio=%.17g scope=instruction_only_not_GEMM\n",
-                fp4, int8, fp4 / int8);
+    for (int pair = 1; pair <= 5; ++pair) {
+      const double fp4 = benchmark<false>(device, blocks, pair);
+      const double int8 = benchmark<true>(device, blocks, pair);
+      std::printf("pair=%d FP4_teraops=%.17g INT8_teraops=%.17g FP4_INT8_ratio=%.17g scope=instruction_only_not_GEMM\n",
+                  pair, fp4, int8, fp4 / int8);
+      std::fflush(stdout);
+    }
   }
   CUDA_CHECK(cudaFree(device));
   return 0;
