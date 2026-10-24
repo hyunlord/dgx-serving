@@ -2,12 +2,12 @@
 """축퇴(degeneration) 마커 스캐너 — 긴 생성 품질 측정(눈이 아닌 수치).
 
 측정 축(모두 측정 가능·주관 배제):
-  rep_ngram  : 반복 축퇴. 최다 반복 word 4-gram 횟수 + 후반 25% 4-gram 고유율(uniqueness).
+  rep_ngram  : 반복 축퇴. 최다 반복 word 4-gram 횟수 + 후반 40% 4-gram 고유율(uniqueness).
   lang_drift : 언어 드리프트. (한국어 요청 기준) 앞 25% vs 뒤 25% 한글 비율 급락.
   broken_sym : 깨진 기호/LaTeX 나열. 알파넘·공백·상용문장부호 아닌 문자 긴 run + junk 토큰.
   uni_frag   : 유니코드 파편(U+FFFD �) 개수.
 
-degenerate=True 판정: 아래 임계 중 하나라도 초과(측정 기준·조정 가능).
+degenerate=True 판정: 아래 조건 중 하나라도 만족(측정 기준·조정 가능).
 """
 import re, sys, json, collections
 
