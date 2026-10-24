@@ -143,7 +143,7 @@ struct Dataset {
     DeviceBuffer<int8_t> d_xq;
     DeviceBuffer<float> d_xs, d_q4_scales_float, d_y;
 
-    Dataset(Shape s, bool ring, int scale_type, int l2_bytes) : shape(s), q4_scale_type(scale_type) {
+    Dataset(Shape s, bool ring, int scale_type, int l2_bytes, bool exact=false) : shape(s), q4_scale_type(scale_type) {
         index_stride = ((s.K + 15) / 16) * 4;
         scale_stride = (s.K + 31) / 32;
         lut_index_bytes = static_cast<size_t>(s.N) * index_stride;
@@ -158,7 +158,7 @@ struct Dataset {
         const size_t common = 2048 + s.K * sizeof(__half) + (q4_matrix_bytes ? s.K + scale_stride * sizeof(float) : 0);
         gpu_bytes = lut_copies * lut_matrix_bytes + q4_copies * q4_matrix_bytes + common + s.N * sizeof(float);
         // Includes CPU reference/output scratch and one host matrix per format; no full-ring host replicas.
-        host_bytes = lut_matrix_bytes + q4_matrix_bytes + common + s.N * (3 * sizeof(float) + sizeof(double));
+        host_bytes = lut_matrix_bytes + q4_matrix_bytes + common + s.N * (3 * sizeof(float) + 3 * sizeof(double));
         const size_t available = mem_available();
         std::printf("MEMORY shape=%s gpu_buffer_bytes=%zu host_buffer_bytes_upper=%zu total_buffer_bytes_upper=%zu mem_available_bytes=%zu cap_bytes=%zu\n",
                     s.name, gpu_bytes, host_bytes, gpu_bytes + host_bytes, available, BUFFER_CAP);
@@ -176,6 +176,14 @@ struct Dataset {
         for (auto& value : x) value = __float2half(signed_value());
         for (auto& value : indices) value = static_cast<uint8_t>(random() & 255);
         for (auto& value : scales) value = __float2half(scale_value());
+        if(exact) {
+            constexpr float weights[]={-2,-1,-0.5f,0,0.5f,1,2};
+            constexpr float activations[]={-1,0,1,2};
+            std::mt19937 exact_random(SEED);
+            for(auto& value:codebook)value=__float2half(weights[exact_random()%7]);
+            for(auto& value:x)value=__float2half(activations[exact_random()%4]);
+            for(auto& value:scales)value=__float2half(1.0f);
+        }
         d_indices.allocate(lut_copies * lut_index_bytes); d_scales.allocate(lut_copies * lut_scale_count);
         d_codebook.allocate(codebook.size()); d_x.allocate(x.size()); d_y.allocate(s.N);
         d_codebook.copy(codebook.data(),codebook.size()); d_x.copy(x.data(),x.size());
@@ -229,35 +237,62 @@ struct Dataset {
     }
 };
 
-static void check(Dataset& data) {
-    std::vector<double> reference(data.shape.N,0.0);
-    for(int row=0;row<data.shape.N;++row) for(int k=0;k<data.shape.K;++k) {
-        const int entry=data.indices[static_cast<size_t>(row)*data.index_stride+k/4];
-        reference[row]+=static_cast<double>(__half2float(data.codebook[entry*4+k%4]))*
-            __half2float(data.scales[static_cast<size_t>(row)*data.scale_stride+k/32])*__half2float(data.x[k]);
-    }
-    for(Variant variant:{Variant::Scalar,Variant::Packed}) {
-        data.launch(variant,0); const auto expected_bits=data.output();
-        double max_relative=0,max_absolute=0; int worst_row=0;
-        for(int row=0;row<data.shape.N;++row) {
-            const double absolute=std::fabs(static_cast<double>(expected_bits[row])-reference[row]);
-            const double relative=reference[row]==0 ? (absolute==0 ? 0 : std::numeric_limits<double>::infinity())
-                                                    : absolute/std::fabs(reference[row]);
-            if(relative>max_relative) {max_relative=relative;worst_row=row;}
-            max_absolute=std::max(max_absolute,absolute);
-            if(!std::isfinite(expected_bits[row]) || !(relative<1e-3)) {
-                std::printf("CHECK FAIL shape=%s variant=%s row=%d reference=%.17g actual=%.9g absolute=%.17g relative=%.17g threshold=0.001\n",
-                            data.shape.name,variant_name(variant),row,reference[row],expected_bits[row],absolute,relative);
-                throw std::runtime_error("B-3 relative error gate failed; do not time kernels");
-            }
+static long long epoch_ns();
+static uint32_t float_bits(float value) {
+    uint32_t bits;std::memcpy(&bits,&value,sizeof(bits));return bits;
+}
+static void check(Dataset& data, bool exact) {
+    std::vector<double> reference(data.shape.N,0.0),sum_absolute(data.shape.N,0.0);
+    double sum_squares=0;
+    for(int row=0;row<data.shape.N;++row) {
+        for(int k=0;k<data.shape.K;++k) {
+            const int entry=data.indices[static_cast<size_t>(row)*data.index_stride+k/4];
+            const double product=static_cast<double>(__half2float(data.codebook[entry*4+k%4]))*
+                __half2float(data.scales[static_cast<size_t>(row)*data.scale_stride+k/32])*__half2float(data.x[k]);
+            reference[row]+=product;sum_absolute[row]+=std::fabs(product);
         }
+        sum_squares+=reference[row]*reference[row];
+    }
+    const double rms=std::sqrt(sum_squares/data.shape.N);
+    for(Variant variant:{Variant::Scalar,Variant::Packed}) {
+        const long long begin=epoch_ns();
+        data.launch(variant,0);const auto expected_bits=data.output();
         for(int repeat=0;repeat<30;++repeat) {
-            data.launch(variant,repeat); const auto observed=data.output();
+            data.launch(variant,repeat);const auto observed=data.output();
             if(std::memcmp(expected_bits.data(),observed.data(),observed.size()*sizeof(float))!=0)
                 throw std::runtime_error("B-3 bitwise determinism gate failed");
         }
-        std::printf("CHECK PASS shape=%s variant=%s outputs=%d max_relative=%.17g max_absolute=%.17g worst_row=%d deterministic_repeats=30\n",
-                    data.shape.name,variant_name(variant),data.shape.N,max_relative,max_absolute,worst_row);
+        const long long end=epoch_ns();
+        std::vector<double> normalized(data.shape.N);
+        double max_absolute=0;int first_failure=-1;int expected_zero=0,actual_negative_zero=0;
+        for(int row=0;row<data.shape.N;++row) {
+            const float expected=static_cast<float>(reference[row]);
+            const double absolute=std::fabs(static_cast<double>(expected_bits[row])-reference[row]);
+            normalized[row]=sum_absolute[row]==0 ? (absolute==0 ? 0 : std::numeric_limits<double>::infinity())
+                : absolute/sum_absolute[row];
+            max_absolute=std::max(max_absolute,absolute);
+            if(expected==0)++expected_zero;
+            if(expected_bits[row]==0 && std::signbit(expected_bits[row]))++actual_negative_zero;
+            const bool pass=std::isfinite(expected_bits[row]) && (exact ? float_bits(expected)==float_bits(expected_bits[row])
+                                                                         : normalized[row]<1e-5);
+            if(!pass && first_failure<0)first_failure=row;
+        }
+        std::sort(normalized.begin(),normalized.end());
+        // Median averages the middle two for even N; p99 is nearest-rank sorted[ceil(0.99*N)-1].
+        const size_t middle=normalized.size()/2;
+        const double median=normalized.size()%2 ? normalized[middle] : (normalized[middle-1]+normalized[middle])/2.0;
+        const double p99=normalized[static_cast<size_t>(std::ceil(0.99*data.shape.N))-1];
+        const double max_over_rms=rms==0 ? (max_absolute==0?0:std::numeric_limits<double>::infinity()) : max_absolute/rms;
+        std::printf("CHECK_%s %s shape=%s variant=%s outputs=%d normalized_max=%.17g normalized_median=%.17g normalized_p99=%.17g median_method=middle_mean p99_method=nearest_rank max_absolute=%.17g reference_rms=%.17g max_absolute_over_rms=%.17g deterministic_repeats=30 expected_zero_count=%d actual_negative_zero_count=%d signzero=literal_bits begin_epoch_ns=%lld end_epoch_ns=%lld\n",
+                    exact?"EXACT":"ROUND",first_failure<0?"PASS":"FAIL",data.shape.name,variant_name(variant),data.shape.N,
+                    normalized.back(),median,p99,max_absolute,rms,max_over_rms,expected_zero,actual_negative_zero,begin,end);
+        if(first_failure>=0) {
+            const int row=first_failure;
+            std::printf("FIRST_MISMATCH row=%d reference_double=%.17g expected_float=%.9g actual=%.9g expected_bits=0x%08x actual_bits=0x%08x sum_absolute=%.17g\n",
+                        row,reference[row],static_cast<float>(reference[row]),expected_bits[row],
+                        float_bits(static_cast<float>(reference[row])),float_bits(expected_bits[row]),sum_absolute[row]);
+            throw std::runtime_error(exact ? "B-3a exact bit gate failed" : "B-3b normalized max error gate failed");
+        }
     }
 }
 static long long epoch_ns() {
@@ -317,8 +352,8 @@ static void paired_benchmark(Dataset& data, Variant variant) {
                 data.shape.name,variant_name(variant),best_lut,best_q4);
 }
 static void usage() {
-    std::puts("probe_gemv_lut2 <check|warm|bench|profile> [up|down|edge|all] [scalar|packed|q4|all] [fp32|fp16]\n"
-              "check default: all shapes, both LUT2 variants; fixed seed 20261024, strict relative <1e-3, 30 bitwise repeats.\n"
+    std::puts("probe_gemv_lut2 <check|check-exact|check-round|warm|bench|profile> [up|down|edge|all] [scalar|packed|q4|all] [fp32|fp16]\n"
+              "check: exact then original random; check-exact: bit equality; check-round: abs_error/sum_abs_products <1e-5. Fixed seed20261024;30 bitwise repeats.\n"
               "warm/bench default: up/down, all variants; check MUST pass first. profile requires one shape/variant.\n"
               "bench all: scalar,q4 alternating 5 pairs, then packed,q4 alternating 5 pairs; every trial warms >=10s.\n"
               "TRIAL epoch bounds are host envelopes. External telemetry median is N/A if no sample lies inside.\n"
@@ -332,13 +367,14 @@ int main(int argc,char** argv) {
         if(argc<2 || std::string(argv[1])=="--help") {usage();return argc<2?2:0;}
         const std::string mode=argv[1], shape_arg=argc>2?argv[2]:"all", variant_arg=argc>3?argv[3]:"all";
         const std::string scale_arg=argc>4?argv[4]:"fp32";
-        if(argc>5 || (mode!="check" && mode!="warm" && mode!="bench" && mode!="profile"))throw std::runtime_error("invalid arguments");
+        const bool checking=mode=="check" || mode=="check-exact" || mode=="check-round";
+        if(argc>5 || (!checking && mode!="warm" && mode!="bench" && mode!="profile"))throw std::runtime_error("invalid arguments");
         if(scale_arg!="fp32" && scale_arg!="fp16")throw std::runtime_error("scale must be fp32 or fp16");
         const char* mlp_u=std::getenv("MLP_U");
         if(mlp_u && std::string(mlp_u)!="2")throw std::runtime_error("MLP_U must be unset or 2; refusing altered comparison");
         if(mode=="profile" && (shape_arg=="all" || variant_arg=="all"))throw std::runtime_error("profile requires one shape and one variant");
         std::vector<Shape> shapes;
-        if(shape_arg=="all") {shapes={shape_from("up"),shape_from("down")};if(mode=="check")shapes.push_back(shape_from("edge"));}
+        if(shape_arg=="all") {shapes={shape_from("up"),shape_from("down")};if(checking)shapes.push_back(shape_from("edge"));}
         else shapes.push_back(shape_from(shape_arg));
         std::vector<Variant> variants=variant_arg=="all" ? std::vector<Variant>{Variant::Scalar,Variant::Packed,Variant::Q4}
                                                        : std::vector<Variant>{variant_from(variant_arg)};
@@ -346,10 +382,20 @@ int main(int argc,char** argv) {
         std::printf("DEVICE name=%s cc=%d.%d l2_bytes=%d mode=%s q4_scale=%s MLP_U=2 seed=%u\n",
                     properties.name,properties.major,properties.minor,properties.l2CacheSize,mode.c_str(),scale_arg.c_str(),SEED);
         for(const Shape shape:shapes) {
-            if(shape.K%32 && mode!="check")throw std::runtime_error("edge shape is correctness-only");
-            Dataset data(shape,mode!="check",scale_arg=="fp16",properties.l2CacheSize);
-            if(mode=="check")check(data);
-            else if(mode=="bench" && variant_arg=="all") {
+            if(shape.K%32 && !checking)throw std::runtime_error("edge shape is correctness-only");
+            if(checking) {
+                if(mode!="check-round") {
+                    Dataset exact_data(shape,false,scale_arg=="fp16",properties.l2CacheSize,true);
+                    check(exact_data,true);
+                }
+                if(mode!="check-exact") {
+                    Dataset random_data(shape,false,scale_arg=="fp16",properties.l2CacheSize);
+                    check(random_data,false);
+                }
+                continue;
+            }
+            Dataset data(shape,true,scale_arg=="fp16",properties.l2CacheSize);
+            if(mode=="bench" && variant_arg=="all") {
                 paired_benchmark(data,Variant::Scalar);
                 paired_benchmark(data,Variant::Packed);
             }

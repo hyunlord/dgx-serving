@@ -68,6 +68,8 @@ def approved(process: GPUProcess) -> bool:
         return process.name.endswith("/gnome-shell")
     if process.pid == 2278032:
         return "/ComfyUI/" in process.name and Path(process.name).name.startswith("python")
+    if process.pid == 3557110:
+        return "/research/make-meme-b/" in process.name and Path(process.name).name.startswith("python")
     return False
 
 
