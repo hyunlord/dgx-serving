@@ -299,7 +299,7 @@ static long long epoch_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
-static void warm(Dataset& data, Variant variant) {
+static int warm(Dataset& data, Variant variant) {
     const auto start=std::chrono::steady_clock::now();
     const long long begin=epoch_ns();
     int launches=0;
@@ -311,24 +311,32 @@ static void warm(Dataset& data, Variant variant) {
                 data.shape.name,variant_name(variant),launches,begin,epoch_ns(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
     std::fflush(stdout);
+    return launches;
 }
 static double timed_trial(Dataset& data, Variant variant, int trial, const char* comparison) {
-    warm(data,variant);
+    const int warm_launches=warm(data,variant);
     cudaEvent_t start,stop;
     CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
-    // These host timestamps bracket the CUDA event interval; they are not GPU timestamps.
+    // Host bounds include inter-batch synchronization; event sums exclude those gaps.
     const long long begin=epoch_ns();
-    CUDA_CHECK(cudaEventRecord(start));
-    for(int iteration=0;iteration<REPEATS;++iteration)data.launch(variant,trial*REPEATS+iteration);
-    CUDA_CHECK(cudaEventRecord(stop)); CUDA_CHECK(cudaEventSynchronize(stop));
+    int launches=0,batches=0;
+    double total_ms=0;
+    do {
+        CUDA_CHECK(cudaEventRecord(start));
+        for(int iteration=0;iteration<REPEATS;++iteration)
+            data.launch(variant,warm_launches+launches++);
+        CUDA_CHECK(cudaEventRecord(stop)); CUDA_CHECK(cudaEventSynchronize(stop));
+        float batch_ms=0; CUDA_CHECK(cudaEventElapsedTime(&batch_ms,start,stop));
+        total_ms+=static_cast<double>(batch_ms);
+        ++batches;
+    } while(total_ms<1000.0);
     const long long end=epoch_ns();
-    float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));
-    const double us=static_cast<double>(ms)*1000.0/REPEATS;
+    const double us=total_ms*1000.0/launches;
     // Logical unique bytes, not actual DRAM traffic; ncu supplies actual traffic.
     const size_t read_bytes=variant==Variant::Q4 ? data.q4_matrix_bytes+data.shape.K+data.scale_stride*sizeof(float)
         : data.lut_matrix_bytes+2048+data.shape.K*sizeof(__half);
-    std::printf("TRIAL shape=%s comparison=%s variant=%s trial=%d iterations=%d event_ms=%.9g mean_us=%.17g read_bytes=%zu effective_GBps=%.17g begin_epoch_ns=%lld end_epoch_ns=%lld\n",
-                data.shape.name,comparison,variant_name(variant),trial+1,REPEATS,ms,us,read_bytes,read_bytes/(us*1000.0),begin,end);
+    std::printf("TRIAL shape=%s comparison=%s variant=%s trial=%d iterations=%d total_launches=%d batches=%d batch_launches=100 event_ms=%.17g mean_us=%.17g read_bytes=%zu effective_GBps=%.17g begin_epoch_ns=%lld end_epoch_ns=%lld\n",
+                data.shape.name,comparison,variant_name(variant),trial+1,launches,launches,batches,total_ms,us,read_bytes,read_bytes/(us*1000.0),begin,end);
     std::fflush(stdout);
     CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(stop));
     return us;
@@ -336,7 +344,7 @@ static double timed_trial(Dataset& data, Variant variant, int trial, const char*
 static void benchmark(Dataset& data, Variant variant) {
     double best=std::numeric_limits<double>::infinity();
     for(int trial=0;trial<TRIALS;++trial)best=std::min(best,timed_trial(data,variant,trial,"standalone"));
-    std::printf("BEST shape=%s variant=%s trials=5 iterations=100 mean_us=%.17g\n",data.shape.name,variant_name(variant),best);
+    std::printf("BEST shape=%s variant=%s trials=5 batch_launches=100 minimum_event_ms=1000 mean_us=%.17g\n",data.shape.name,variant_name(variant),best);
 }
 static void paired_benchmark(Dataset& data, Variant variant) {
     double best_lut=std::numeric_limits<double>::infinity(),best_q4=best_lut;
@@ -348,14 +356,14 @@ static void paired_benchmark(Dataset& data, Variant variant) {
                     data.shape.name,variant_name(variant),pair+1,lut,q4,q4/lut);
         std::fflush(stdout);
     }
-    std::printf("PAIRED_BEST shape=%s variant=%s pairs=5 iterations=100 lut_mean_us=%.17g q4_mean_us=%.17g\n",
+    std::printf("PAIRED_BEST shape=%s variant=%s pairs=5 batch_launches=100 minimum_event_ms=1000 lut_mean_us=%.17g q4_mean_us=%.17g\n",
                 data.shape.name,variant_name(variant),best_lut,best_q4);
 }
 static void usage() {
     std::puts("probe_gemv_lut2 <check|check-exact|check-round|warm|bench|profile> [up|down|edge|all] [scalar|packed|q4|all] [fp32|fp16]\n"
               "check: exact then original random; check-exact: bit equality; check-round: abs_error/sum_abs_products <1e-5. Fixed seed20261024;30 bitwise repeats.\n"
               "warm/bench default: up/down, all variants; check MUST pass first. profile requires one shape/variant.\n"
-              "bench all: scalar,q4 alternating 5 pairs, then packed,q4 alternating 5 pairs; every trial warms >=10s.\n"
+              "bench all: scalar,q4 alternating 5 pairs, then packed,q4 alternating 5 pairs; every trial warms >=10s, then repeats 100-launch batches until summed CUDA event time >=1000ms.\n"
               "TRIAL epoch bounds are host envelopes. External telemetry median is N/A if no sample lies inside.\n"
               "q4 defaults to fp32 weight scales (5 bits/weight); fp16 = 4.5 bits. LUT2 = 2.5 bits + 2048-byte codebook.\n"
               "Timing excludes allocation, transfers and q4 activation quantization. No model-quality equivalence is claimed.\n"
