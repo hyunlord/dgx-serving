@@ -102,7 +102,17 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
     auto pick_row = [&](int b, Slot& s)->int{
         float* p=&hlog[(size_t)b*V];
         if(s.temp<=0.f){ int bi=0; float bv=p[0]; for(int j=1;j<V;j++) if(p[j]>bv){bv=p[j];bi=j;} return bi; }
-        if(s.repp!=1.f) for(int t : s.hist){ float v=p[t]; p[t] = v>0.f ? v/s.repp : v*s.repp; }
+        // 반복 페널티: ★최근 윈도우 + dedup(전체 이력 복리 누적 repp^N 제거 — 긴 생성 드리프트 원인이었음).
+        //   REP_WINDOW(env·기본 128): 최근 W토큰만 대상. REP_WINDOW=0 → 전체 이력이되 dedup(복리 없음).
+        //   각 고유 토큰 1회만 v/repp(양수)·v*repp(음수) = HF 관례(복리 아님). 측정 근거: 스칼라 rep↑=축퇴↑ 반증.
+        if(s.repp!=1.f){
+            static const int REP_W = [](){ const char* e=getenv("REP_WINDOW"); return e ? std::max(0,atoi(e)) : 128; }();
+            const int hn=(int)s.hist.size(), lo=(REP_W>0 && hn>REP_W) ? hn-REP_W : 0;
+            for(int i=lo;i<hn;++i){ int t=s.hist[i];
+                bool seen=false; for(int j=lo;j<i;++j) if(s.hist[j]==t){ seen=true; break; }
+                if(seen) continue;                                   // 윈도우 내 1회만(dedup — 복리 방지)
+                float v=p[t]; p[t] = v>0.f ? v/s.repp : v*s.repp; }
+        }
         const int K = V<SK ? V : SK;
         for(int j=0;j<K;j++){ s_idx[j]=j; s_val[j]=p[j]; }
         int mn=0; for(int j=1;j<K;j++) if(s_val[j]<s_val[mn]) mn=j;

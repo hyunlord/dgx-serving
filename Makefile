@@ -174,6 +174,8 @@ test: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== run $$t ==="; $$t || exit 1; done
 	@echo "=== run tests/test_gemma4_rope_table.py (절대 골든 — 긴 생성 rope 봉인) ==="
 	@python3 tests/test_gemma4_rope_table.py || exit 1
+	@echo "=== run tests/test_longgen_degen.py (긴 생성 축퇴 게이트 — 스캐너 감도 자가증명; 라이브 스캔은 DEGEN_SERVE_URL 지정 시) ==="
+	@python3 tests/test_longgen_degen.py || exit 1
 
 clean:
 	rm -f $(TEST_BINS)

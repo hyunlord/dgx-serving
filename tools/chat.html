@@ -73,6 +73,14 @@
       <option value="greedy">Greedy</option>
     </select>
   </label>
+  <label title="sampler presets — 안정: 집중·긴 설명 / 균형: 기본 / 창의: 다양·짧은 대화">preset
+    <select id="preset">
+      <option value="">custom</option>
+      <option value="stable">안정</option>
+      <option value="balanced">균형</option>
+      <option value="creative">창의</option>
+    </select>
+  </label>
   <label title="softmax temperature (higher = more random)">temp <input id="temp" type="number" min="0.05" max="4" step="0.05" value="0.7"></label>
   <label title="nucleus sampling cutoff">top-p <input id="topp" type="number" min="0.05" max="1" step="0.05" value="0.9"></label>
   <label title="penalize tokens already generated (1 = off) — mitigates greedy repetition loops">rep-pen <input id="repp" type="number" min="1" max="2" step="0.05" value="1.1"></label>
@@ -96,6 +104,7 @@ const sendBtn = document.getElementById("send");
 const badgeEl = document.getElementById("badge");
 const ctxEl = document.getElementById("ctx");
 const modeEl = document.getElementById("mode");
+const presetEl = document.getElementById("preset");
 const tempEl = document.getElementById("temp");
 const toppEl = document.getElementById("topp");
 const reppEl = document.getElementById("repp");
@@ -135,6 +144,16 @@ function refreshSamplerUI(){
   }
 }
 modeEl.addEventListener("change", refreshSamplerUI);
+
+// ---- 샘플러 프리셋 (측정 근거: 윈도우+dedup rep penalty서 rep=1.1 축퇴 0/6 — temp로 다양성 조절) ----
+const PRESETS = { stable:{temp:0.5,topp:0.9,repp:1.1}, balanced:{temp:0.7,topp:0.9,repp:1.1}, creative:{temp:0.9,topp:0.95,repp:1.1} };
+presetEl.addEventListener("change", () => {
+  const p = PRESETS[presetEl.value]; if (!p) return;                 // custom = 현재 값 유지
+  if (canSample) modeEl.value = "sample";                            // 프리셋은 샘플링 전제
+  tempEl.value = p.temp; toppEl.value = p.topp; reppEl.value = p.repp;
+  refreshSamplerUI(); saveSettings();
+});
+for (const el of [tempEl,toppEl,reppEl]) el.addEventListener("change", () => { presetEl.value = ""; }); // 수동 변경 → custom
 
 // model badge + capabilities from /v1/models
 fetch("/v1/models").then(r => r.json()).then(d => {

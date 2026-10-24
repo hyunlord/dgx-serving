@@ -143,11 +143,22 @@ Decoding scope, honestly stated:
   generate 800 coherent tokens under plain greedy. Greedy repetition loops remain possible in
   principle (no repetition penalty on the greedy path), but are no longer the expected behavior.
 - **Sampling (plain daemons only)** — `temperature` (>0 turns it on), `top_p` (default 0.9),
-  `repetition_penalty` (default 1.1, HF convention over generated tokens; mitigates the loops
-  above), `seed` (set for reproducible output; omitted = random per request). Implemented as
-  host-side logic in the shared online loop (logits were already on the host; an implicit
-  top-64 preselect bounds host cost at ~0.3 ms/token). Sampling is a **serving option**: gates
-  keep running greedy, and a request without `temperature` takes the byte-identical greedy path.
+  `repetition_penalty` (default 1.1), `seed` (set for reproducible output; omitted = random per
+  request). Implemented as host-side logic in the shared online loop (logits were already on the
+  host; an implicit top-64 preselect bounds host cost at ~0.3 ms/token). Sampling is a **serving
+  option**: gates keep running greedy, and a request without `temperature` takes the byte-identical
+  greedy path.
+  - **Repetition penalty is windowed + deduped** (`REP_WINDOW` env, default 128). Honesty note:
+    the original penalty divided each history token's logit *per occurrence over the full history*,
+    so common tokens accumulated `repp^N` and were crushed as generation grew — this itself caused
+    long-generation sampling degeneration (language drift, repetition loops, junk LaTeX). Measured:
+    a 3-workload × rep{1.0,1.1,1.2} × 2-seed grid at 850 tokens went from **3/6 (rep=1.1) and 4/6
+    (rep=1.2) degenerate → 0/6** after windowing+dedup, with greedy output byte-identical (the
+    penalty path only runs when `temperature>0`). Locked by `tests/test_longgen_degen.py`.
+    `REP_WINDOW=0` keeps full history but still deduped (no compounding).
+  - **UI presets** (`tools/chat.html`): 안정 `t0.5`, 균형 `t0.7` (default), 창의 `t0.9/top_p0.95`
+    — all `rep 1.1` (the measured-clean value; temperature is the diversity knob). Presets are
+    reasonable defaults, not an exhaustive temperature sweep.
 - **Speculative daemons are greedy-only** (`--model gemma4-spec` / `spec`): drafts are verified
   against the target's argmax, so `temperature>0` returns an explicit 400. Pick per server:
   speed (speculative, greedy) or variety (plain, sampling).
