@@ -3,6 +3,10 @@ build/
 *.o
 *.obj
 *.exe
+# Nsight profiling outputs
+*.nsys-rep
+*.ncu-rep
+*.qdrep
 # compiled test/engine binaries (no extension, produced by nvcc)
 /tests/test_*
 !/tests/*.cu
@@ -19,6 +23,7 @@ build/
 /tools/bench_serve_gemma4
 /tools/serve_daemon_gemma4
 /tools/serve_daemon_gemma4_online
+/tools/serve_daemon_gemma4_online_win
 /tools/serve_daemon_qwen_online
 /tools/serve_daemon_qwen_spec_online
 /tools/serve_daemon_gemma4_spec_online
@@ -33,6 +38,8 @@ build/
 !/tools/*.cu
 !/tools/*.cuh
 !/tools/*.cpp
+!/tools/*.py
+!/tools/*.h
 
 # Weight dumps / quantized blobs / goldens — never commit big binaries
 *.bin
@@ -52,6 +59,10 @@ __pycache__/
 
 # OMC orchestration runtime state
 .omc/
+
+# Codex orchestration runtime state and session cache
+.omx/
+graft/.cache/
 
 # Editor / OS
 .vscode/
