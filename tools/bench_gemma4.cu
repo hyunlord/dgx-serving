@@ -137,12 +137,14 @@ int main(int argc,char**argv){
 
     // 프리필 t/s (B=1 통짜) — 별도 G4DecodeState
     { G4DecodeState st=alloc_g4_decode_state(c,MAXLEN);
+      const char* amort_env=getenv("BENCH_G4_AMORT");
+      const int amort=amort_env && strcmp(amort_env,"1")==0;
       std::vector<int> tk(ctx,1); int* d_p; CK(cudaMalloc(&d_p,ctx*4)); CK(cudaMemcpy(d_p,tk.data(),ctx*4,cudaMemcpyHostToDevice));
       reset_g4_decode_state(st);
-      if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1);   // 워밍
+      if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);   // 워밍
       CK(cudaDeviceSynchronize()); reset_g4_decode_state(st);
       CK(cudaEventRecord(t0));
-      if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1);
+      if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);
       CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
       double ms=ev(t0,t1); prefill_ts=ctx/(ms/1000.0);
       printf("\n  프리필(B=1 통짜 %d토큰): %.2f tok/s (%.3f ms) — 참고치(chunked 아님, TTFT 주장 아님)\n",ctx,prefill_ts,ms);
