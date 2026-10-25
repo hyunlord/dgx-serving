@@ -80,6 +80,26 @@ def available_bytes() -> int:
     raise ValueError("MemAvailable missing from /proc/meminfo")
 
 
+@dataclass(frozen=True, slots=True)
+class CUDAMemory:
+    free_bytes: int
+    total_bytes: int
+
+
+def cuda_memory(executable: Path) -> CUDAMemory:
+    """Read the helper's strict byte counts; malformed evidence fails closed."""
+    payload = json.loads(capture(str(executable.resolve())))
+    message = "CUDA memory helper must return integer free_bytes/total_bytes with 0 <= free <= total"
+    if not isinstance(payload, dict):
+        raise ValueError(message)
+    free, total = payload.get("free_bytes"), payload.get("total_bytes")
+    if type(free) is not int or type(total) is not int:
+        raise ValueError(message)
+    if not 0 <= free <= total or total <= 0:
+        raise ValueError(message)
+    return CUDAMemory(free, total)
+
+
 def descendants(owned: set[int]) -> None:
     pairs = [tuple(map(int, line.split())) for line in capture("ps", "-eo", "pid=,ppid=").splitlines()]
     while True:
@@ -144,6 +164,8 @@ def main() -> int:
     parser.add_argument("--name", required=True)
     parser.add_argument("--log-dir", required=True, type=Path)
     parser.add_argument("--expected-bytes", required=True, type=int)
+    parser.add_argument("--cuda-meminfo", type=Path,
+                        default=Path(__file__).resolve().with_name("cuda_meminfo"))
     parser.add_argument("--clock-gate", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -170,14 +192,21 @@ def main() -> int:
         (args.log_dir / f"memory_{args.name}.txt").write_text(free)
         available = available_bytes()
         baseline = gpu_processes()
-        result.update(available_bytes=available, limit_bytes=available * 7 // 10,
+        result.update(available_bytes=available,
                       baseline=[asdict(p) for p in baseline])
         (args.log_dir / f"baseline_{args.name}.json").write_text(json.dumps(result, indent=2))
         if any(not approved(p) for p in baseline):
             result["status"] = "unexpected_baseline_process"
             status = 87
             return status
-        if args.expected_bytes > available * 7 // 10:
+        # Check the allowlist before the helper creates its transient CUDA context.
+        memory = cuda_memory(args.cuda_meminfo)
+        limit = memory.free_bytes * 8 // 10
+        result.update(cuda_free_bytes=memory.free_bytes, cuda_total_bytes=memory.total_bytes,
+                      limit_bytes=limit, memory_budget_basis="cuda_free_bytes",
+                      cuda_meminfo=str(args.cuda_meminfo))
+        (args.log_dir / f"baseline_{args.name}.json").write_text(json.dumps(result, indent=2))
+        if args.expected_bytes > limit:
             result["status"] = "memory_budget_rejected"
             status = 88
             return status
