@@ -24,6 +24,8 @@ env G4_MMQ_PREFILL=0 MMQ256=0 tools/ppl_gemma4 \
 
 The tool accepts unique named options, rejects unknown options and malformed integers, and requires exactly `window*nwin` int32 tokens with vocabulary-valid IDs. Supported windows are 2..1024. The prepared file uses little-endian signed int32 on the target Linux/aarch64 platform. No padding, truncation, implicit BOS, or chat template insertion occurs.
 
+`--position-stats` is an optional, valueless flag and is off by default. It adds six `PPL_POSITION_STATS` stderr lines after all windows, aggregating the already-computed NLL by **scored target position** within each window: `[1,15]`, `[16,63]`, `[64,127]`, `[128,255]`, `[256,511]`, `[512,1023]`. Target position1 is predicted by logit row0; prepared BOS at input position0 is never a target. Each line contains `target_begin`, `target_end`, `count`, `sum_nll`, and `mean_nll`. Short windows leave later buckets empty (`count=0`, `sum_nll=0`, `mean_nll=null`). Counts cover exactly `nwin*(window-1)` targets, and each mean uses that bucket's own count. The flag does not change NLL calculation, window resetting, the final nine-field stdout JSON, or output when omitted.
+
 ## Token and loss accounting
 
 For the registered corpus, **1024 includes the prepared BOS**, leaving 1023 text targets in each window. Thirty-two windows therefore contain 32768 input IDs and score **32736** next-token targets. Tokenization/preparation must save the BOS policy, source and token hashes independently; the C++ executable does not infer BOS ID from a model name.
@@ -58,7 +60,7 @@ These gates replace the unavailable same-input eight-position WikiText HF refere
 
 `--golden-dir` and `--dump-dir` are mutually exclusive. Golden mode only accepts 5×1; dump mode only accepts 1024×1. Files are created exclusively, preserving prior evidence.
 
-`tools/ppl_gemma4 --self-test` exercises the actual CPU NLL routine on uniform logits, extreme logits, translation invariance and standard first-index argmax ties. This numeric smoke test does not initialize a GPU and is supplementary, not a substitute for the four runtime gates.
+`tools/ppl_gemma4 --self-test` exercises the actual CPU NLL routine on uniform logits, extreme logits, translation invariance and standard first-index argmax ties, plus position-bucket boundaries and two-window count/sum accounting for window sizes2,5,64,128,256,512,1024. This numeric smoke test does not initialize a GPU and is supplementary, not a substitute for the four runtime gates.
 
 ## Memory and measurement conditions
 

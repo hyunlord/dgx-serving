@@ -44,12 +44,14 @@ static int positive(const std::string &s) {
     errno=0; char *end=nullptr; long n=strtol(s.c_str(),&end,10);
     require(errno==0 && *end==0 && n>0 && n<=std::numeric_limits<int>::max(),"integer out of range"); return int(n);
 }
-struct Options { std::string weights,tokens,golden,dump; int window=1024,nwin=32; };
+struct Options { std::string weights,tokens,golden,dump; int window=1024,nwin=32; bool position_stats=false; };
 static Options parse(int argc,char **argv) {
     Options o; std::vector<std::string> seen;
-    for(int i=1;i<argc;i+=2) {
-        require(i+1<argc,"every option requires a value"); std::string key=argv[i],value=argv[i+1];
+    for(int i=1;i<argc;) {
+        std::string key=argv[i++];
         require(std::find(seen.begin(),seen.end(),key)==seen.end(),"duplicate option "+key); seen.push_back(key);
+        if(key=="--position-stats") { o.position_stats=true; continue; }
+        require(i<argc,"every option requires a value"); std::string value=argv[i++];
         if(key=="--weights") o.weights=value;
         else if(key=="--tokens") o.tokens=value;
         else if(key=="--window") o.window=positive(value);
@@ -89,11 +91,47 @@ static double nll(const float *x,int n,int target) {
 static double epoch_seconds() {
     return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+static constexpr int position_begin[]={1,16,64,128,256,512};
+static constexpr int position_end[]={15,63,127,255,511,1023};
+static int position_bucket(int target_position) {
+    require(target_position>=1&&target_position<=1023,"scored target position outside statistics range");
+    for(int bucket=0;bucket<6;++bucket) if(target_position<=position_end[bucket]) return bucket;
+    require(false,"missing position bucket"); return -1;
+}
+struct PositionStats {
+    double sums[6]={}; size_t counts[6]={};
+    void accumulate(int target_position,double value) {
+        int bucket=position_bucket(target_position); sums[bucket]+=value; ++counts[bucket];
+    }
+    void print() const {
+        for(int bucket=0;bucket<6;++bucket) {
+            fprintf(stderr,"PPL_POSITION_STATS target_begin=%d target_end=%d count=%zu sum_nll=%.17g mean_nll=",
+                    position_begin[bucket],position_end[bucket],counts[bucket],sums[bucket]);
+            if(counts[bucket]) fprintf(stderr,"%.17g\n",sums[bucket]/counts[bucket]);
+            else fputs("null\n",stderr);
+        }
+    }
+};
 static void self_test() {
     const float uniform[]={0,0}; require(nll(uniform,2,1)==std::log(2.0),"uniform NLL");
     const float extreme[]={1000,-1000}; require(nll(extreme,2,1)==2000,"stable extreme NLL");
     const float shifted[]={1100,-900}; require(nll(shifted,2,1)==nll(extreme,2,1),"translation invariance");
     const float tie[]={2,2,1}; require(argmax(tie,3)==0,"first-index argmax tie");
+    for(int bucket=0;bucket<6;++bucket) {
+        require(position_bucket(position_begin[bucket])==bucket,"position bucket lower boundary");
+        require(position_bucket(position_end[bucket])==bucket,"position bucket upper boundary");
+    }
+    for(int window:{2,5,64,128,256,512,1024}) {
+        PositionStats stats;
+        for(int win=0;win<2;++win) for(int target=1;target<window;++target) stats.accumulate(target,0.5);
+        size_t count=0;
+        for(int bucket=0;bucket<6;++bucket) {
+            size_t expected=2*std::max(0,std::min(window-1,position_end[bucket])-position_begin[bucket]+1);
+            require(stats.counts[bucket]==expected&&stats.sums[bucket]==0.5*expected,"position statistics accounting");
+            count+=stats.counts[bucket];
+        }
+        require(count==size_t(2*(window-1)),"position statistics total");
+    }
     puts("PPL_SELF_TEST PASS uniform/extreme/translation/argmax");
 }
 static void memory_guard(const Options &o,const ModelConfig &c) {
@@ -155,7 +193,7 @@ int main(int argc,char **argv) {
     std::vector<float> host(mul(std::min(o.window,128),V)); std::vector<double> windows;
     std::vector<float> golden;
     if(!o.golden.empty()) golden=read_exact<float>(o.golden+"/q4_logits.bin",mul(5,V));
-    double total_nll=0; size_t total_tokens=0; int matches=0;
+    double total_nll=0; size_t total_tokens=0; int matches=0; PositionStats position_stats;
     for(int win=0;win<o.nwin;++win) {
         const int *input=tokens.data()+mul(win,o.window); reset_g4_decode_state(st);
         CK(cudaMemcpy(ids,input,mul(o.window,4),cudaMemcpyHostToDevice));
@@ -172,6 +210,7 @@ int main(int argc,char **argv) {
                 if(!golden.empty()) { int expected=argmax(golden.data()+mul(position,V),V); matches+=actual==expected; fprintf(stderr,"PPL_GOLDEN row=%d actual=%d reference=%d match=%d\n",position,actual,expected,actual==expected); }
                 if(position+1==o.window) continue;
                 const double value=nll(row,V,input[position+1]); window_sum+=value; ++scored;
+                if(o.position_stats) position_stats.accumulate(position+1,value);
                 if(!o.dump.empty()&&(position==0||position==511||position==1022)) {
                     const std::string prefix=o.dump+"/row_"+std::to_string(position);
                     write_new(prefix+".bin",row,mul(V,4)); std::ostringstream meta; meta<<std::setprecision(17)<<"{\"row\":"<<position<<",\"target\":"<<input[position+1]<<",\"vocab\":"<<V<<",\"nll\":"<<value<<",\"softcap_already_applied\":true}\n";
@@ -185,6 +224,7 @@ int main(int argc,char **argv) {
     }
     require(golden.empty()||matches==5,"existing golden argmax validation failed");
     double mean=total_nll/total_tokens,ppl=std::exp(mean); require(std::isfinite(mean)&&std::isfinite(ppl),"aggregate NLL/PPL overflow");
+    if(o.position_stats) position_stats.print();
     free_g4_decode_state(st); free_weights_gemma4(w); free_config_gemma4(c);
     for(float *p:{logits,cf,sf,cs,ss}) CK(cudaFree(p)); CK(cudaFree(ids));
     const std::string model=fs::path(o.weights).lexically_normal().parent_path().filename().string();
