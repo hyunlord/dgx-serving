@@ -15,6 +15,7 @@ ENGINE_SRCS := models/smollm3.cu runtime/weights.cu
 TEST_SRCS := $(filter-out tests/test_27b.cu tests/test_gdn_27b.cu tests/test_attn_27b.cu tests/test_gemv_q4_scale.cu \
              tests/test_35b.cu tests/test_gdn_35b.cu tests/test_moe_expert.cu tests/test_rope_gen.cu tests/test_chunk_prefill.cu \
              tests/test_gemma4.cu tests/test_gemma4_decode.cu tests/test_gemma4_gen.cu tests/test_gemma4_batch.cu tests/test_gemma4_ragged.cu tests/test_gemma4_prefill_slot.cu tests/test_gemma4_verify.cu tests/test_gemma4_assistant.cu tests/test_gemma4_spec_e2e.cu tests/test_gemma4_moe.cu tests/test_gemma4_moe_golden.cu tests/test_gemma4_moe_router_iso.cu \
+             tests/test_gemma4_moe_path_diagnostic.cu \
              tests/test_long_ctx.cu tests/test_treeamort.cu tests/test_treespec.cu tests/test_treespec_depth.cu, $(wildcard tests/*.cu))
 TEST_BINS := $(TEST_SRCS:.cu=)
 
@@ -46,6 +47,11 @@ tests/test_gemma4_moe_golden: tests/test_gemma4_moe_golden.cu models/gemma4_moe.
 #   gemma4_decode.cu=alloc_g4_decode_state / gemma4_batch.cu=gemma4_moe_decode_batch·alloc_g4_batch_state.
 tests/test_gemma4_moe_decode: tests/test_gemma4_moe_decode.cu models/gemma4_moe.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_moe_decode.cu models/gemma4_moe.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
+
+# Manual capture tool: requires weights, golden data, a new output directory and uq.
+# The source includes gemma4_moe.cu for interception; exit 0 is not an accuracy gate.
+tests/test_gemma4_moe_path_diagnostic: tests/test_gemma4_moe_path_diagnostic.cu models/gemma4_moe.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_moe_path_diagnostic.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
 
 # Gemma4 26B-A4B router ISOLATED 검증 (동일 rin → 엔진 router == HF. 소형 텐서만, standalone)
 tests/test_gemma4_moe_router_iso: tests/test_gemma4_moe_router_iso.cu $(HEADERS)
