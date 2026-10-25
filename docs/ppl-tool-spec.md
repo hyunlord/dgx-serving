@@ -22,9 +22,9 @@ env G4_MMQ_PREFILL=0 MMQ256=0 tools/ppl_gemma4 \
 
 `G4_MMQ_PREFILL` must explicitly be `0` (SB) or `1` (MMQ); `MMQ256=0` is required. Both scale variants must use the same path. MMQ is requested only under the existing graph dispatch conditions; `path` in the output records the requested route, not an independent kernel trace. Configuration dimensions and scale dtype come from the manifest; dense Gemma models only. MoE input is rejected.
 
-The tool accepts unique named options, rejects unknown options and malformed integers, and requires exactly `window*nwin` int32 tokens with vocabulary-valid IDs. Supported windows are 2..1024. The prepared file uses little-endian signed int32 on the target Linux/aarch64 platform. No padding, truncation, implicit BOS, or chat template insertion occurs.
+The tool accepts unique named options, rejects unknown options and malformed integers, and requires exactly `window*nwin` int32 tokens in the original fixed-window mode with vocabulary-valid IDs. Supported windows are 2..1024. The prepared file uses little-endian signed int32 on the target Linux/aarch64 platform. No padding, truncation, implicit BOS, or chat template insertion occurs.
 
-`--position-stats` is an optional, valueless flag and is off by default. It adds six `PPL_POSITION_STATS` stderr lines after all windows, aggregating the already-computed NLL by **scored target position** within each window: `[1,15]`, `[16,63]`, `[64,127]`, `[128,255]`, `[256,511]`, `[512,1023]`. Target position1 is predicted by logit row0; prepared BOS at input position0 is never a target. Each line contains `target_begin`, `target_end`, `count`, `sum_nll`, and `mean_nll`. Short windows leave later buckets empty (`count=0`, `sum_nll=0`, `mean_nll=null`). Counts cover exactly `nwin*(window-1)` targets, and each mean uses that bucket's own count. The flag does not change NLL calculation, window resetting, the final nine-field stdout JSON, or output when omitted.
+`--position-stats` is an optional, valueless flag and is off by default. It adds six `PPL_POSITION_STATS` stderr lines after all windows, aggregating the already-computed NLL by **scored target position** within each window: `[1,15]`, `[16,63]`, `[64,127]`, `[128,255]`, `[256,511]`, `[512,1023]`. Target position1 is predicted by logit row0; prepared BOS at input position0 is never a target. Each line contains `target_begin`, `target_end`, `count`, `sum_nll`, and `mean_nll`. Short windows leave later buckets empty (`count=0`, `sum_nll=0`, `mean_nll=null`). Counts cover exactly `nwin*(window-1)` targets, and each mean uses that bucket's own count. The flag does not change NLL calculation, window resetting, the original nine-field stdout JSON (optional reference comparison adds fields), or output when omitted.
 
 ## Token and loss accounting
 
@@ -41,7 +41,7 @@ NLL = (a - logits[target]) + log(sum(exp(logits[j] - a)))
 
 It accumulates double NLL sums and counts. Aggregate PPL is `exp(total_NLL / total_targets)`, not an average of window perplexities. `per_window_nll` contains the mean NLL of each independent window. JSON double output uses 17 significant digits, sufficient for binary64 round-trip. Nonfinite logits/NLL or aggregate overflow fail rather than produce a partial success JSON.
 
-The final stdout line is one raw JSON object with exactly:
+Without reference comparison, the final stdout line is one raw JSON object with exactly:
 
 ```json
 {"model":"gemma4-12b","weights":"...","path":"SB","scale_dtype":0,"nwin":32,"ntok":32736,"mean_nll":0,"ppl":1,"per_window_nll":[]}
@@ -69,3 +69,43 @@ For V=262144 and window=1024, device logits occupy 1073741824 bytes. At most128 
 Before loading weights, the tool records a conservative memory estimate: all immediate weight-directory `.bin` file sizes (following symlinks), the largest loading buffer, manifest-specific linear KV for every layer, graph activation and quantization workspace, full logits, host chunk, RoPE storage, and 2GiB runtime reserve. It rejects estimates above 70% of current `/proc/meminfo` MemAvailable. This internal guard supplements the required external process/telemetry guard; it is not permission to overlap CPU preparation, builds, conversion, or another GPU workload. Resident allocations are already reflected in MemAvailable.
 
 Each window prints `PPL_INTERVAL window=<index> start=<epoch> end=<epoch> scope=gemma4_decode_prefill` on stderr. The start is sampled after `cudaDeviceSynchronize`, immediately before the graph call; the end is sampled after the graph and final synchronization. Select only actual100ms clock samples within these bounds for the prefill median. This host envelope includes graph allocations, launches and synchronization, but excludes model loading, token upload and CPU NLL transfer/reduction. It is not an isolated kernel clock. A whole-process clock median must not replace the per-window median. `per_window_nll` remains the **mean** NLL for each window; `PPL_WINDOW` stderr also records the NLL **sum** and target count. PPL is a quality metric, not evidence for an in-engine performance gain.
+
+
+## Conversation windows and assistant-only scoring
+
+The following options are opt-in and do not change fixed-window calls:
+
+```sh
+env G4_MMQ_PREFILL=0 MMQ256=0 tools/ppl_gemma4 \
+  --weights WEIGHTS --tokens conversations.bin --window 1024 --nwin N \
+  --lengths lengths.bin --mask mask.bin --save-ref NEW_REFERENCE_DIRECTORY
+```
+
+`--lengths` is exactly `nwin` little-endian int32 lengths. Each must be 2..`window`; `window` is the maximum allowed length, not padding. Tokens are concatenated without separators or padding, with exactly `sum(lengths)` IDs. State resets independently for each conversation. Allocations use the largest actual length. Omitting lengths retains fixed-size windows.
+
+`--mask` is exactly one uint8 per input ID, either0 or1. It marks **target tokens**, not logit rows: logit row `t` is scored only when `mask[t+1]==1`. The first token of every conversation must have mask0, and every conversation must have at least one scored target. Without a mask all positions after the first token are scored as before. All logits remain finite-checked, including unscored rows. `ntok`, per-window means, aggregate PPL and position statistics now count only the selected targets; they do not count user prompts, unselected turn delimiters, or BOS. Corpus preparation owns and records the assistant turn-start/end marker policy; the engine does not infer roles or add BOS.
+
+## Streaming reference distributions and KL
+
+`--save-ref DIR` and `--kld-ref DIR` are mutually exclusive and cannot be combined with the legacy golden/dump validation modes. The reference output directory must not exist; its parent must exist. Before loading the model, the tool reports `PPL_REFERENCE_DISK` with the exact payload estimate and a4096-byte metadata reserve, checks available disk space, and fails if it is insufficient. Payload bytes are:
+
+```
+scored_targets * vocab * 2 + scored_targets * 4
++ input_tokens * 4 + windows * 4 + input_tokens
+```
+
+For16000 targets and V=262144, distribution storage alone is8388608000 bytes. These large artifacts remain in ignored DGX storage and must not be committed. The metadata inputs are small but are included in the disk estimate.
+
+The reference directory contains:
+
+- `tokens.bin`, `lengths.bin`, `mask.bin`: exact canonical inputs, including a generated all-next-token mask for unmasked calls.
+- `format.txt`: version `PPL_REF_V1`, vocabulary size and scored-row count.
+- `logp.fp16`: selected rows in conversation/target order, each containing V fp16 log-softmax values. Double log-softmax is converted via float to fp16 round-to-nearest-even. A maximum of128 scored rows is buffered before sequential writing; a final partial block is flushed at completion.
+- `argmax.i32`: original float-logit first-index argmax for each selected row. Saving it separately avoids fp16 rounding creating false top-1 ties.
+- `complete`: written only after all expected rows were written and output streams closed successfully. Comparison rejects incomplete references.
+
+Comparison validates vocabulary, row count, exact file sizes, and byte-for-byte equality of tokens, lengths and mask before model loading. Reference fingerprints/hashes and baseline model/path are also recorded by the measurement wrapper. Float16 reference log probabilities are renormalized in float64 with log-sum-exp before calculating `KL(reference || current)`, because fp16 rounding does not preserve a probability sum of1. Current log-softmax and all KL accumulation use double precision. Thus this is KL against the **quantized, renormalized** reference; tiny nonzero same-model KL is possible from reference storage. Nonfinite values or KL below−1e-10 fail; roundoff in[−1e-10,0] is clamped to0. No PPL threshold uses KL.
+
+With `--kld-ref`, the final JSON additionally reports `mean_kl`, `kl_p99` (nearest rank, ceil(0.99*N)), `top1_match_rate` (fraction0..1 against original reference argmax), and `kl_ntok`. These metrics cover exactly the PPL-selected positions and are supplementary, not adoption gates. Reference comparison streams one reference row while processing each128-row device-to-host logits chunk; it never loads all reference distributions into RAM.
+
+`--kl-self-test` is CPU-only and prints three JSON fixtures containing stored fp16 reference log probabilities, current float logits, and the tool's KL. Independently normalize both arrays with NumPy float64, compute `sum(exp(logp_ref)*(logp_ref-logp_current))`, and require relative error<1e-6. Fixtures cover ordinary, extreme and tied logits. This tests the same production KL function and does not initialize CUDA. Keep the original `--self-test` smoke test as well.
