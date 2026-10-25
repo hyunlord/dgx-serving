@@ -6,6 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <cmath>
+#include <cerrno>
 #include <vector>
 #include <string>
 #include <cuda_runtime.h>
@@ -54,6 +57,14 @@ static size_t per_seq_bytes(const ModelConfig&c,int ml){
 
 int main(int argc,char**argv){
     setvbuf(stdout,NULL,_IOLBF,0);
+    const char *min_sec_env=getenv("BENCH_G4_PREFILL_MIN_SEC");
+    double min_prefill_sec=0;
+    if(min_sec_env){
+        char *end=nullptr; errno=0; min_prefill_sec=strtod(min_sec_env,&end);
+        if(errno || end==min_sec_env || *end || !std::isfinite(min_prefill_sec) || min_prefill_sec<=0 || !std::isfinite(min_prefill_sec*1000.0)){
+            fprintf(stderr,"BENCH_G4_PREFILL_MIN_SEC must be finite and positive\n"); return 1;
+        }
+    }
     if(argc<2){ fprintf(stderr,"usage: %s <weights_dir> [uq=1] [ctx=256] [ngen=64] [B,...]\n",argv[0]); return 1; }
     std::string WD=argv[1];
     int uq=argc>2?atoi(argv[2]):1;
@@ -143,11 +154,43 @@ int main(int argc,char**argv){
       reset_g4_decode_state(st);
       if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);   // 워밍
       CK(cudaDeviceSynchronize()); reset_g4_decode_state(st);
+      if(!min_sec_env){
       CK(cudaEventRecord(t0));
       if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);
       CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
       double ms=ev(t0,t1); prefill_ts=ctx/(ms/1000.0);
       printf("\n  프리필(B=1 통짜 %d토큰): %.2f tok/s (%.3f ms) — 참고치(chunked 아님, TTFT 주장 아님)\n",ctx,prefill_ts,ms);
+      } else {
+          auto epoch=[](){ return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); };
+          std::vector<float> first(V),last(V);
+          size_t reps=0; float total_ms=0; double end_epoch=0;
+          CK(cudaDeviceSynchronize());
+          CK(cudaEventRecord(t0));
+          const double start_epoch=epoch();
+          do {
+              reset_g4_decode_state(st);
+              if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1);
+              else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);
+              if(reps==0) CK(cudaMemcpy(first.data(),d_logit,(size_t)V*4,cudaMemcpyDeviceToHost));
+              ++reps;
+              CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
+              end_epoch=epoch();
+              CK(cudaEventElapsedTime(&total_ms,t0,t1));
+          } while(total_ms<min_prefill_sec*1000.0);
+          printf("PREFILL_INTERVAL start=%.9f end=%.9f reps=%zu\n",start_epoch,end_epoch,reps);
+          CK(cudaMemcpy(last.data(),d_logit,(size_t)V*4,cudaMemcpyDeviceToHost));
+          bool finite=true; int first_argmax=0,last_argmax=0;
+          for(int i=0;i<V;++i){
+              finite=finite && std::isfinite(first[i]) && std::isfinite(last[i]);
+              if(first[i]>first[first_argmax]) first_argmax=i;
+              if(last[i]>last[last_argmax]) last_argmax=i;
+          }
+          const bool valid=finite && first_argmax==last_argmax;
+          const double mean_ms=(double)total_ms/reps;
+          prefill_ts=(double)ctx*reps/(total_ms/1000.0);
+          printf("PREFILL_REPEAT ctx=%d reps=%zu total_ms=%.9f mean_ms=%.9f pp_tok_s=%.9f min_sec=%.9f first_argmax=%d last_argmax=%d finite=%d valid=%d accounting=CUDA_event_whole_block_including_host_gaps_and_first_logit_copy\n",ctx,reps,(double)total_ms,mean_ms,prefill_ts,min_prefill_sec,first_argmax,last_argmax,finite,valid);
+          if(!valid){ fprintf(stderr,"INVALID repeated prefill first/last logits argmax or finite check\n"); exit(1); }
+      }
       cudaFree(d_p); free_g4_decode_state(st);
     }
 
