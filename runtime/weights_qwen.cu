@@ -1,6 +1,8 @@
 #include "weights_qwen.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <string>
 #include <cuda_runtime.h>
 
@@ -12,6 +14,8 @@ static void *load_dev(const std::string &path, size_t bytes) {
     if (!f) { fprintf(stderr, "못 엶: %s\n", path.c_str()); exit(1); }
     void *host = malloc(bytes);
     if (fread(host, 1, bytes, f) != bytes) { fprintf(stderr, "크기 불일치: %s (%zu)\n", path.c_str(), bytes); exit(1); }
+    int advice_error = posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
+    if (advice_error) fprintf(stderr, "warning: posix_fadvise %s: %s\n", path.c_str(), std::strerror(advice_error));
     fclose(f);
     void *dev; WCK(cudaMalloc(&dev, bytes)); WCK(cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice));
     free(host); return dev;
