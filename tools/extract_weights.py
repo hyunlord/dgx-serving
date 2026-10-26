@@ -9,8 +9,102 @@
 """
 import argparse, json, os, re, sys
 import numpy as np
+from typing import TypedDict
 
 QBLK = 32  # docs/blueprint와 일치. 컴파일 타임 상수와 동일.
+QUANT_MODES = ("rtn", "qat-ident", "qat-q40", "orig-rtnfull", "orig-clip")
+
+
+class ReconstructionStats(TypedDict):
+    elements: int
+    blocks: int
+    squared_error: float
+    squared_input: float
+    relative_error: float
+    minus_eight: int
+    plus_seven: int
+
+
+def variant_projection(name: str) -> bool:
+    """Experimental policies affect only the seven decoder linear projections."""
+    return bool(re.fullmatch(r"L\d+_(?:(?:self_attn\.)?[qkvo](?:_proj)?|(?:mlp\.)?(?:gate|up|down)(?:_proj)?)", name))
+
+
+def add_quant_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--quant", choices=QUANT_MODES, default="rtn")
+    parser.add_argument("--quant-rule", choices=("signed-max", "positive-max"))
+    parser.add_argument("--quant-c", type=float)
+
+
+def validate_quant_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.quant == "qat-ident":
+        if args.quant_rule is None:
+            parser.error("qat-ident requires the B' selected --quant-rule")
+        if args.quant_rule == "positive-max" and (args.quant_c is None or not np.isfinite(args.quant_c) or args.quant_c <= 0):
+            parser.error("positive-max requires finite positive --quant-c")
+    elif args.quant_rule is not None or args.quant_c is not None:
+        parser.error("--quant-rule/--quant-c apply only to qat-ident")
+    if args.quant_rule != "positive-max" and args.quant_c is not None:
+        parser.error("--quant-c applies only to positive-max")
+    if args.quant != "rtn" and getattr(args, "scale_dtype", "fp32") != "fp32":
+        parser.error("experimental quantization requires fp32 scales")
+
+
+def quantize_variant(w_2d: np.ndarray, mode: str = "rtn", rule: str | None = None,
+                     c: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Round onto an explicit FP32 scale grid; no BF16 product rounding."""
+    if mode == "rtn":
+        return quantize_int4(w_2d)
+    if mode not in QUANT_MODES or (mode == "qat-ident" and rule not in ("signed-max", "positive-max")):
+        raise ValueError("unknown mode or missing qat-ident rule")
+    if rule == "positive-max" and (c is None or not np.isfinite(c) or c <= 0):
+        raise ValueError("positive-max requires a finite positive divisor")
+    w = np.ascontiguousarray(w_2d, dtype=np.float32).reshape(-1, QBLK)
+    packed = np.empty(w.size // 2, dtype=np.uint8)
+    scales = np.empty(w.shape[0], dtype=np.float32)
+    for start in range(0, len(w), 65536):
+        block = w[start:start + 65536]
+        if not np.isfinite(block).all():
+            raise ValueError("nonfinite weight")
+        peak = np.argmax(np.abs(block), axis=1)
+        scale = block[np.arange(len(block)), peak] / np.float32(-8)
+        if mode == "qat-ident" and rule == "positive-max":
+            scale = np.max(np.abs(block), axis=1) / np.float32(c)
+        scale[scale == 0] = np.float32(1e-8)
+        q = np.clip(np.rint(block / scale[:, None]), -8, 7)
+        if mode == "orig-clip":
+            best = np.square((q * scale[:, None]).astype(np.float64) - block).sum(axis=1)
+            selected = scale.copy()
+            for step in range(1, 11):
+                candidate = scale * np.float32((100 - 3 * step) / 100)
+                candidate_q = np.clip(np.rint(block / candidate[:, None]), -8, 7)
+                error = np.square((candidate_q * candidate[:, None]).astype(np.float64) - block).sum(axis=1)
+                improve = error < best
+                selected[improve], q[improve], best[improve] = candidate[improve], candidate_q[improve], error[improve]
+            scale = selected
+        nibble = (q.astype(np.int8) + 8).astype(np.uint8).reshape(-1)
+        packed[start * 16:(start + len(block)) * 16] = nibble[::2] | (nibble[1::2] << 4)
+        scales[start:start + len(block)] = scale
+    return packed, scales
+
+
+def reconstruction_stats(w_2d: np.ndarray, packed: np.ndarray, scale: np.ndarray) -> ReconstructionStats:
+    w = np.ascontiguousarray(w_2d, dtype=np.float32).reshape(-1, QBLK)
+    squared_error = squared_input = 0.0
+    low_count = high_count = 0
+    for start in range(0, len(w), 65536):
+        block = w[start:start + 65536]
+        data = packed[start * 16:(start + len(block)) * 16]
+        q = np.empty(data.size * 2, dtype=np.float32)
+        q[::2], q[1::2] = (data & 15).astype(np.float32) - 8, (data >> 4).astype(np.float32) - 8
+        reconstructed = q.reshape(-1, 32) * scale[start:start + len(block), None]
+        squared_error += float(np.square(reconstructed.astype(np.float64) - block).sum())
+        squared_input += float(np.square(block.astype(np.float64)).sum())
+        low_count += int(np.count_nonzero(q == -8))
+        high_count += int(np.count_nonzero(q == 7))
+    return {"elements": w.size, "blocks": len(w), "squared_error": squared_error,
+            "squared_input": squared_input, "relative_error": float(np.sqrt(squared_error / squared_input)) if squared_input else 0.0,
+            "minus_eight": low_count, "plus_seven": high_count}
 
 
 def quantize_int4(w_2d: np.ndarray):
@@ -47,12 +141,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
+    add_quant_arguments(ap)
     args = ap.parse_args()
+    validate_quant_arguments(args, ap)
+    os.makedirs(args.out, exist_ok=(args.quant == "rtn"))
 
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    os.makedirs(args.out, exist_ok=True)
     cfg = AutoConfig.from_pretrained(args.model)
     print(f"[extract] loading {args.model} (fp32)...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
@@ -95,11 +191,18 @@ def main():
         a.tofile(os.path.join(args.out, name + ".bin"))
         return a.shape
 
+    quantization_report = []
     def save_q4(name, t):
         w = t.detach().cpu().float().contiguous().numpy().astype(np.float32)  # [OUT, IN]
-        packed, scale = quantize_int4(w)
+        policy = args.quant if variant_projection(name) else "rtn"
+        packed, scale = quantize_variant(w, policy, args.quant_rule, args.quant_c)
         packed.tofile(os.path.join(args.out, name + "_q4.bin"))
         scale.tofile(os.path.join(args.out, name + "_scale.bin"))
+        if args.quant != "rtn":
+            baseline_packed, baseline_scale = quantize_int4(w)
+            quantization_report.append({"tensor": name, "shape": list(w.shape), "policy": policy,
+                                        "variant": reconstruction_stats(w, packed, scale),
+                                        "baseline_rtn": reconstruction_stats(w, baseline_packed, baseline_scale)})
         return w.shape, dequant_relerr(w, packed, scale)
 
     # 키 패턴 매칭 (Llama/SmolLM3 계열 범용). 새 아키텍처는 여기 매핑만 확장.
@@ -130,6 +233,11 @@ def main():
             print(f"  ... {i+1}/{L} (mean rel-err {np.mean(errs):.4f})", flush=True)
 
     manifest["quant_mean_relerr"] = float(np.mean(errs))
+    if args.quant != "rtn":
+        manifest.update({"quant_method": args.quant, "quant_rule": args.quant_rule,
+                         "quant_c": args.quant_c, "scale_dtype": 0, "lm_head_quant": "rtn"})
+        with open(os.path.join(args.out, "quantization_report.json"), "x") as f:
+            json.dump(quantization_report, f, indent=2)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"[extract] done. mean rel-err {np.mean(errs):.4f}. manifest + weights → {args.out}")

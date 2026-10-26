@@ -13,7 +13,9 @@ q4 양자화 스킴은 extract_weights.quantize_int4 와 공유 (docs/01-stage1-
 import argparse, json, os, re, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from extract_weights import quantize_int4, dequant_relerr, QBLK
+from extract_weights import (quantize_int4, dequant_relerr, QBLK, quantize_variant,
+                             variant_projection, reconstruction_stats,
+                             add_quant_arguments, validate_quant_arguments)
 
 
 def is_q4(name, ndim):
@@ -58,10 +60,12 @@ def main():
                     help="big matmul의 fp32 복사본 생략(27B+ fp32 108GB는 엔진 OOM이라 불필요). q4+small-fp32만.")
     ap.add_argument("--scale-dtype", default="fp32", choices=["fp32", "fp16"],
                     help="weight scale dtype. fp16: scale fp32→fp16 변환 저장 (트래픽↓, rel 9.3e-4 안전).")
+    add_quant_arguments(ap)
     args = ap.parse_args()
+    validate_quant_arguments(args, ap)
+    os.makedirs(args.out, exist_ok=(args.quant == "rtn"))
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
-    os.makedirs(args.out, exist_ok=True)
 
     cfg = AutoConfig.from_pretrained(args.model)
     tcfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
@@ -144,17 +148,24 @@ def main():
         })
 
     scale_fp16 = (args.scale_dtype == "fp16")
+    quantization_report = []
     def save_f32(fname, t):
         a = t.detach().cpu().float().contiguous().numpy().astype(np.float32)
         a.tofile(os.path.join(args.out, fname + ".bin"))
     def save_q4(fname, t):
         w = t.detach().cpu().float().contiguous().numpy().astype(np.float32)
-        packed, scale = quantize_int4(w)
+        policy = args.quant if variant_projection(fname) else "rtn"
+        packed, scale = quantize_variant(w, policy, args.quant_rule, args.quant_c)
         packed.tofile(os.path.join(args.out, fname + "_q4.bin"))
         if scale_fp16:
             scale.astype(np.float16).tofile(os.path.join(args.out, fname + "_scale.bin"))
         else:
             scale.tofile(os.path.join(args.out, fname + "_scale.bin"))
+        if args.quant != "rtn":
+            baseline_packed, baseline_scale = quantize_int4(w)
+            quantization_report.append({"tensor": fname, "shape": list(w.shape), "policy": policy,
+                                        "variant": reconstruction_stats(w, packed, scale),
+                                        "baseline_rtn": reconstruction_stats(w, baseline_packed, baseline_scale)})
         return dequant_relerr(w, packed, scale)
 
     def fname_of(rel):  # 상대키 → 파일 basename
@@ -203,6 +214,11 @@ def main():
 
     manifest["quant_mean_relerr"] = float(np.mean(errs)) if errs else 0.0
     manifest["scale_dtype"] = 1 if scale_fp16 else 0
+    if args.quant != "rtn":
+        manifest.update({"quant_method": args.quant, "quant_rule": args.quant_rule,
+                         "quant_c": args.quant_c, "lm_head_quant": "rtn"})
+        with open(os.path.join(args.out, "quantization_report.json"), "x") as f:
+            json.dump(quantization_report, f, indent=2)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"[extract] done. layers={L} ({layer_types.count('full_attention')} full / "
