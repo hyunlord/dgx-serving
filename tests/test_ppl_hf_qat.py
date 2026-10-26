@@ -87,3 +87,20 @@ def test_reference_refuses_existing_destination(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         ReferenceWriter(destination, 2, np.array([2, 0]), np.array([2]), np.array([0, 1]))
     assert marker.read_bytes() == b'original'
+
+
+def test_dtype_memory_plan_preserves_fp32_and_limits_bf16() -> None:
+    # Given the QAT checkpoint's full parameter count, including nontext tensors.
+    from ppl_hf_qat import memory_budget
+    elements = 11_959_730_224
+    # When planning each explicitly supported execution dtype.
+    bf16_source, bf16_budget = memory_budget(elements, 'bfloat16')
+    fp32_source, fp32_budget = memory_budget(elements, 'float32')
+    # Then BF16 has a conservative 40 GiB budget and FP32 retains 64 GiB.
+    assert (bf16_source, bf16_budget) == (23_919_460_448, 40 * 1024**3)
+    assert (fp32_source, fp32_budget) == (47_838_920_896, 64 * 1024**3)
+
+
+def test_memory_plan_keeps_workspace_reserve_for_larger_checkpoints() -> None:
+    from ppl_hf_qat import memory_budget
+    assert memory_budget(40_000_000_000, 'bfloat16') == (80_000_000_000, 96_000_000_000)

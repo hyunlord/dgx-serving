@@ -1,4 +1,4 @@
-"""Offline HF FP32 loader, preserving the supplement-7 conversion and real buffers.
+"""Offline HF streamed loader, preserving the supplement-7 conversion and real buffers.
 
 Parameters stream from safetensors to CUDA in at most 16 MiB host chunks.
 Unlike the diagnostic predecessor, no engine q4 replacement is performed.
@@ -11,7 +11,7 @@ import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 ELEMENT_CHUNK: Final = 4 * 1024 * 1024
 
@@ -50,7 +50,7 @@ def original_tensors(hf: Path) -> dict[str, TensorSource]:
     return tensors
 
 
-def load_streamed(hf: Path):
+def load_streamed(hf: Path, dtype: Literal['bfloat16', 'float32'] = 'float32'):
     """Use official key conversion and initialization, never from_pretrained weights."""
     import torch
     from accelerate import init_empty_weights
@@ -58,11 +58,17 @@ def load_streamed(hf: Path):
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import WeightRenaming, rename_source_key
 
+    target_dtype = {'bfloat16': torch.bfloat16, 'float32': torch.float32}[dtype]
     config = AutoConfig.from_pretrained(hf, local_files_only=True)
     config._attn_implementation = 'eager'
     config.text_config._attn_implementation = 'eager'
-    with init_empty_weights(include_buffers=False):
-        model = Gemma4UnifiedForConditionalGeneration(config)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(target_dtype)
+        with init_empty_weights(include_buffers=False):
+            model = Gemma4UnifiedForConditionalGeneration(config)
+    finally:
+        torch.set_default_dtype(previous_dtype)
     params = dict(model.named_parameters(remove_duplicate=False))
     buffers = dict(model.named_buffers(remove_duplicate=False))
     if any(item.is_meta for item in buffers.values()):
@@ -87,13 +93,15 @@ def load_streamed(hf: Path):
         raise RuntimeError(f'Missing checkpoint tensors: {sorted(missing)}')
     print(json.dumps({'event': 'checkpoint_coverage', 'source_tensors': len(source),
                       'model_state_tensors': len(state), 'missing_tied_aliases': sorted(missing),
-                      'buffer_names_loaded': sorted(set(source) & set(buffers)), 'renames': renames}), flush=True)
+                      'buffer_names_loaded': sorted(set(source) & set(buffers)),
+                      'initialized_buffer_dtypes': {key: str(value.dtype) for key, value in buffers.items()},
+                      'parameter_dtype': dtype, 'renames': renames}), flush=True)
     for key, item in source.items():
         source_dtype, source_bytes = {'BF16': (torch.bfloat16, 2), 'F16': (torch.float16, 2), 'F32': (torch.float32, 4)}[item.dtype]
         count = math.prod(item.shape)
         if item.end - item.offset != count * source_bytes:
             raise RuntimeError(f'Tensor byte length mismatch: {key}')
-        value = torch.empty(item.shape, device='cuda', dtype=torch.float32)
+        value = torch.empty(item.shape, device='cuda', dtype=target_dtype)
         with item.path.open('rb') as stream:
             stream.seek(item.offset)
             for begin in range(0, count, ELEMENT_CHUNK):
@@ -112,8 +120,8 @@ def load_streamed(hf: Path):
             setattr(model.get_submodule(parent), attr, value)
     if missing:
         model.lm_head.weight = model.model.language_model.embed_tokens.weight
-    if any(p.is_meta or p.dtype != torch.float32 for p in model.parameters()):
-        raise RuntimeError('Incomplete FP32 parameter load')
+    if any(p.is_meta or p.dtype != target_dtype for p in model.parameters()):
+        raise RuntimeError(f'Incomplete {dtype} parameter load')
     model = model.eval().to('cuda')
     model.config.use_cache = False
     torch.cuda.empty_cache()

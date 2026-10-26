@@ -4,7 +4,7 @@
 # dependencies = ["numpy", "torch", "transformers", "accelerate"]
 # ///
 # How to run: existing offline environment: python tools/ppl_hf_qat.py --hf LOCAL --data CHAT --out NEW --save-ref NEW_REF
-"""HF FP32 QAT evaluation on the unchanged 36-dialogue chat corpus, offline only."""
+"""HF QAT/original evaluation on the unchanged 36-dialogue chat corpus, offline only."""
 from __future__ import annotations
 
 import argparse
@@ -16,7 +16,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -115,12 +115,21 @@ class ReferenceWriter:
         durable_write(self.directory / 'complete', b'complete\n')
 
 
+def memory_budget(elements: int, dtype: Literal['bfloat16', 'float32']) -> tuple[int, int]:
+    """Keep a 16 GB workspace floor while accounting for execution parameter dtype."""
+    width, minimum = {'bfloat16': (2, 40 * 1024**3),
+                      'float32': (4, 64 * 1024**3)}[dtype]
+    source = elements * width
+    return source, max(minimum, source + 16_000_000_000)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hf', type=Path, required=True)
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--save-ref', type=Path)
+    parser.add_argument('--dtype', choices=('bfloat16', 'float32'), default='float32')
     args = parser.parse_args()
     os.environ['HF_HUB_OFFLINE'] = '1'; os.environ['TRANSFORMERS_OFFLINE'] = '1'
     import torch
@@ -144,25 +153,24 @@ def main() -> None:
                       'payload_bytes': reference_bytes, 'metadata_reserve': 4096}), flush=True)
     if args.save_ref and (args.save_ref.exists() or shutil.disk_usage(args.save_ref.parent).free < reference_bytes + 4096):
         raise RuntimeError('Reference destination exists or insufficient free disk space')
-    source_bytes = sum(math.prod(t.shape) * 4 for t in original_tensors(args.hf).values())
-    reserve = 16_000_000_000  # Streaming, eager attention, full logits, <=128 host double rows, allocator.
-    budget = max(64 * 1024**3, source_bytes + reserve)
+    source_bytes, budget = memory_budget(sum(math.prod(t.shape) for t in original_tensors(args.hf).values()), args.dtype)
+    execution_path = {'float32': 'HF_FP32_QAT_EAGER', 'bfloat16': 'HF_BF16_EAGER'}[args.dtype]
     mem = {line.split(':')[0]: int(line.split()[1]) * 1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemAvailable:', 'MemFree:', 'Cached:'))}
     free, total = torch.cuda.mem_get_info()
-    print(json.dumps({'event': 'memory_gate', 'expected_bytes': budget, 'source_fp32_bytes': source_bytes,
+    print(json.dumps({'event': 'memory_gate', 'expected_bytes': budget, 'source_parameter_bytes': source_bytes, 'dtype': args.dtype,
                       'workspace_reserve_bytes': budget - source_bytes, 'cuda_free': free, 'cuda_total': total, **mem}), flush=True)
     if budget > free * .8:
         raise RuntimeError('Expected memory exceeds CUDA free x 0.8')
     args.out.mkdir(parents=True, exist_ok=False)
     torch.backends.cuda.matmul.allow_tf32 = False; torch.backends.cudnn.allow_tf32 = False
-    print(json.dumps({'event': 'load_start', 'epoch': time.time(), 'torch': torch.__version__, 'transformers': transformers.__version__, 'tf32': False}), flush=True)
-    model = load_streamed(args.hf)
+    print(json.dumps({'event': 'load_start', 'epoch': time.time(), 'torch': torch.__version__, 'transformers': transformers.__version__, 'dtype': args.dtype, 'tf32': False}), flush=True)
+    model = load_streamed(args.hf, args.dtype)
     if model.config.text_config.vocab_size != vocab:
         raise RuntimeError('Config vocabulary changed during loading')
     reference = ReferenceWriter(args.save_ref, vocab, ids, lengths, mask) if args.save_ref else None
     if reference:
-        durable_write(args.save_ref / 'metadata.json', (json.dumps({'model': str(args.hf), 'dtype': 'float32',
-                      'path': 'HF_FP32_QAT_EAGER', 'hashes': CHECKS, 'nwin': 36, 'ntok': 16201}) + '\n').encode())
+        durable_write(args.save_ref / 'metadata.json', (json.dumps({'model': str(args.hf), 'dtype': args.dtype,
+                      'path': execution_path, 'hashes': CHECKS, 'nwin': 36, 'ntok': 16201}) + '\n').encode())
     rows = []; offset = 0; bins: list[list[float]] = [[] for _ in POSITION_BINS]
     with (args.out / 'positions.jsonl').open('x') as output, torch.inference_mode():
         for index, length_value in enumerate(lengths):
@@ -178,7 +186,7 @@ def main() -> None:
             nlls = []
             for begin in range(0, len(positions), 128):
                 selected = positions[begin:begin + 128]
-                logits = result.logits[0].index_select(0, torch.tensor(selected - 1, device='cuda')).cpu().numpy()
+                logits = result.logits[0].index_select(0, torch.tensor(selected - 1, device='cuda')).float().cpu().numpy()
                 nll, logp = score_logits(logits, window[selected])
                 if reference:
                     reference.append(logp, logits.argmax(axis=1))
@@ -200,7 +208,7 @@ def main() -> None:
     if reference:
         reference.finish()
     mean = math.fsum(row['nll_sum'] for row in rows) / ntok
-    summary = {'model': str(args.hf), 'weights': str(args.hf), 'path': 'HF_FP32_QAT_EAGER', 'scale_dtype': None,
+    summary = {'model': str(args.hf), 'weights': str(args.hf), 'path': execution_path, 'scale_dtype': None, 'dtype': args.dtype,
                'nwin': len(rows), 'ntok': ntok, 'mean_nll': mean, 'ppl': math.exp(mean),
                'per_window_nll': [row['mean_nll'] for row in rows], 'windows': rows, 'hashes': CHECKS,
                'position_bins': [{'begin': lo, 'end': hi, 'ntok': len(values), 'mean_nll': math.fsum(values) / len(values) if values else None}
