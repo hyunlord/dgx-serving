@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <climits>
 #include <cuda_runtime.h>
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
@@ -46,14 +48,26 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 // ---- mm dispatch (gemma4.cu와 동일 규약) ----
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
-static int gd_amort=0;   // 1=프리필 amortized 매트멀(SB 커널, weight 1회/≤16행). 기본0=plain gemv(golden 경로 무변경).
+static int gd_amort=0;   // 1=프리필 MMQ/SB 매트멀. 기본0=plain gemv(golden 경로 무변경).
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4){
     if(use_q4==2){ size_t n=(size_t)S*IN;
         if(gd_cap<n){ if(gd_xq)cudaFree(gd_xq); if(gd_xs)cudaFree(gd_xs); if(gd_xsum)cudaFree(gd_xsum);
             DK(cudaMalloc(&gd_xq,n)); DK(cudaMalloc(&gd_xs,(n/QBLK)*4)); DK(cudaMalloc(&gd_xsum,(n/QBLK)*4)); gd_cap=n; }
         launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S);
-        static const bool mmq_prefill=[](){ const char* v=getenv("G4_MMQ_PREFILL"); return v && strcmp(v,"1")==0; }();
-        if(mmq_prefill && gd_amort==1 && S>=16 && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
+        static const bool mmq_prefill=[](){ const char* v=getenv("G4_MMQ_PREFILL"); return !v || strcmp(v,"0")!=0; }();
+        static const int mmq_min_s=[](){
+            int value=16;
+            if(const char* v=getenv("G4_MMQ_MIN_S")){
+                char* end=nullptr; errno=0;
+                const long parsed=strtol(v,&end,10);
+                if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
+                    value=parsed<16?16:(int)parsed;
+                else fprintf(stderr,"Invalid G4_MMQ_MIN_S=%s; using 16\n",v);
+            }
+            fprintf(stderr,"G4_MMQ_MIN_S=%d\n",value);
+            return value;
+        }();
+        if(mmq_prefill && gd_amort==1 && S>=mmq_min_s && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
             launch_gemm_mmq_w4a8_auto(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype);
         } else if(gd_amort && S>1){  // 프리필: SB 커널로 weight 1회/≤16행 amortize(비-amortized plain gemv의 S× 재적재 제거).
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.

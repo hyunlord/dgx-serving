@@ -223,3 +223,14 @@ tests/test_gemma4_assistant: tests/test_gemma4_assistant.cu models/gemma4_assist
 # draft-spec 3관문: 사이클 e2e(draft→verify→accept) — spec==greedy 게이트 + 곱 실측. 12B+assistant artifacts 필요 → 수동.
 tests/test_gemma4_spec_e2e: tests/test_gemma4_spec_e2e.cu models/gemma4_assistant.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_spec_e2e.cu models/gemma4_assistant.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+
+# 12B 자산이 필요한 MMQ 청크·결정성 게이트는 기본 test와 분리한 수동 스위트.
+G4_MMQ_TEST_WEIGHTS ?= artifacts/gemma4-12b/weights
+G4_MMQ_TEST_GOLDEN ?= artifacts/gemma4-12b/golden
+tests/gemma4_mmq/prefill: tests/gemma4_mmq/prefill.cu models/gemma4_decode.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/gemma4_mmq/prefill.cu models/gemma4_decode.cu runtime/weights_gemma4.cu -o $@
+
+.PHONY: test-gemma4-mmq
+test-gemma4-mmq: tests/gemma4_mmq/prefill
+	G4_MMQ_PREFILL=1 G4_MMQ_MIN_S=16 MMQ256=0 tests/gemma4_mmq/prefill "$(G4_MMQ_TEST_WEIGHTS)" "$(G4_MMQ_TEST_GOLDEN)" chunk
+	G4_MMQ_PREFILL=1 G4_MMQ_MIN_S=16 MMQ256=0 tests/gemma4_mmq/prefill "$(G4_MMQ_TEST_WEIGHTS)" "$(G4_MMQ_TEST_GOLDEN)" determinism

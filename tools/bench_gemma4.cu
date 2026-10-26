@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cerrno>
+#include <climits>
 #include <vector>
 #include <string>
 #include <cuda_runtime.h>
@@ -149,7 +150,25 @@ int main(int argc,char**argv){
     // 프리필 t/s (B=1 통짜) — 별도 G4DecodeState
     { G4DecodeState st=alloc_g4_decode_state(c,MAXLEN);
       const char* amort_env=getenv("BENCH_G4_AMORT");
-      const int amort=amort_env && strcmp(amort_env,"1")==0;
+      const int amort=!amort_env || strcmp(amort_env,"0")!=0;
+      const char* mmq_env=getenv("G4_MMQ_PREFILL");
+      const bool mmq_enabled=!mmq_env || strcmp(mmq_env,"0")!=0;
+      int mmq_min_s=16;
+      if(const char* v=getenv("G4_MMQ_MIN_S")){
+          char* end=nullptr; errno=0;
+          const long parsed=strtol(v,&end,10);
+          if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
+              mmq_min_s=parsed<16?16:(int)parsed;
+      }
+      const bool aligned=c.hidden_size%32==0 && c.intermediate_size%32==0 &&
+          ((size_t)c.num_q_heads*c.head_dim)%32==0 &&
+          ((size_t)c.num_q_heads*(c.global_head_dim?c.global_head_dim:c.head_dim))%32==0;
+      const char* prefill_path=is_moe?"MOE":uq!=0 && uq!=2?"TILED_Q4":uq==0?"GEMV":
+          !amort || ctx<=1?"GEMV":
+          mmq_enabled && ctx>=mmq_min_s && (c.scale_dtype==0 || c.scale_dtype==1)?
+              (aligned?"MMQ":"MMQ_SB_MIXED"):"SB";
+      printf("PREFILL_PATH=%s BENCH_G4_AMORT=%d G4_MMQ_MIN_S=%d coverage=layer_matmul_dispatch lm_head_last_only=1\n",
+             prefill_path,amort,mmq_min_s);
       std::vector<int> tk(ctx,1); int* d_p; CK(cudaMalloc(&d_p,ctx*4)); CK(cudaMemcpy(d_p,tk.data(),ctx*4,cudaMemcpyHostToDevice));
       reset_g4_decode_state(st);
       if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);   // 워밍

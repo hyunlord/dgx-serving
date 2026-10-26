@@ -111,6 +111,11 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   `--bmax` (default 8) is the continuous-batching width. Long-context serving is a known limit
   (see [`performance.md`](./performance.md) §5).
 - Default quantization is W4A8 (`--uq 2`); `--uq 1` = q4. All measured serving coordinates are W4A8.
+- Dense Gemma W4A8 uses MMQ for amortized prefill by default. Set `G4_MMQ_PREFILL=0` to use the
+  previous SB path. `G4_MMQ_MIN_S` selects the minimum row count (default 16; smaller values clamp
+  to 16; invalid values fall back to 16). Decode and non-amortized calls retain their existing paths.
+  `tools/bench_gemma4` now defaults to amortized prefill; `BENCH_G4_AMORT=0` reproduces its prior
+  plain GEMV prefill path. This does not change scale dtype or adopt fp16 scales.
 - Optional: `--recipe recipes/gemma4-12b-gb10.yaml` serves with a tuned config after verifying the
   device fingerprint and memory budget at startup — see [`recipe-schema.md`](./recipe-schema.md).
 

@@ -104,7 +104,7 @@
   spec==greedy 재PASS(bit-id 게이트 3종: verify M 경계 전수·draft 재귀/ragged/KV 매핑·서빙 동시==솔로).
   남은 잔여 후보: K-quant bytes 10%↓(plain 소폭)·bf16-반올림 정합(chat accept)
   → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
-- 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
+- 프리필(2026-10 측정, 12B·fp32 scale·B1·P=512): MMQ **715.835029564~721.244315927 tok/s**(교차 5회) vs 최신 llama pp512 **1678.33 tok/s**. 같은 날 GB10, SM 2080~2093MHz 조건이며, MMQ 프리필 구간 중앙값은 5회 모두 2080MHz였다. 품질 조건 다름(llama Q4_K_M vs 엔진 W4A8). 프리필은 여전히 llama보다 느리다. 991토큰 요청의 client TTFT는 SB 약 **7.6초 → MMQ 2.47초**(각 3회, ComfyUI 상주·유휴). 반복 event 시간은 host gap을 포함한다. 7월 수치는 클럭 조건 미상이며 이 좌표와 직접 비교하지 않는다.
 
 ### 3c. 품질 기준선 (Gemma4-12B, 2026-10-26)
 

@@ -83,6 +83,12 @@ engine ceiling — continuous batching itself scales near-linearly.
 **Gemma4-12B (dense), plain vs plain, single decode:** 23.3 vs 26.8 tok/s = **0.87×** (near-parity;
 llama-bench tg64, speculative off on both sides).
 
+With MMQ prefill, a 991-token Gemma4-12B request takes about **2.47s TTFT vs 7.6s with SB**
+(client-observed first content token, three runs per path, fp32 scales, W4A8, B1, maxlen 1024,
+ComfyUI resident and idle). Same-day GB10 measurements at 2080–2093MHz give P512 prefill
+715.835029564–721.244315927 tok/s vs llama pp512 1678.33 tok/s: prefill remains slower, and
+quality conditions differ (llama Q4_K_M vs our W4A8). See the [quality baseline](docs/performance.md#3c-품질-기준선-gemma4-12b-2026-10-26).
+
 **Gemma4-12B speculative (`--model gemma4-spec`, official 0.4B assistant drafter, W4A8):** serving
 measures **50.5 tok/s chat / 46.7 code / 31.9 prose** vs ~22 plain = **1.43–2.30×**, with output
 verified token-identical to plain greedy (drafts are only accepted when they match the target's own

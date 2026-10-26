@@ -57,7 +57,7 @@ int main(int argc,char **argv) {
     require(mode=="golden" || mode=="determinism" || mode=="chunk" || mode=="dump","unknown mode");
     require(argc==(mode=="dump"?5:4),"only dump requires NEW_OUTDIR");
     const char *env=getenv("G4_MMQ_PREFILL");
-    const bool mmq=env && strcmp(env,"1")==0;
+    const bool mmq=!env || strcmp(env,"0")!=0;
     const std::string out=mode=="dump"?argv[4]:"";
     require(getenv("MMQ256") && strcmp(getenv("MMQ256"),"0")==0,"MMQ256 must equal 0");
     ModelConfig c=load_config_gemma4((wd+"/manifest.json").c_str());
