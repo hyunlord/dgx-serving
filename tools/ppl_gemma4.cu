@@ -46,7 +46,7 @@ static int positive(const std::string &s) {
     errno=0; char *end=nullptr; long n=strtol(s.c_str(),&end,10);
     require(errno==0 && *end==0 && n>0 && n<=std::numeric_limits<int>::max(),"integer out of range"); return int(n);
 }
-struct Options { std::string weights,tokens,golden,dump,lengths,mask,save_ref,kld_ref; int window=1024,nwin=32; bool position_stats=false; };
+struct Options { std::string weights,tokens,golden,dump,lengths,mask,save_ref,kld_ref; int window=1024,nwin=32,uq=2; bool position_stats=false; };
 static Options parse(int argc,char **argv) {
     Options o; std::vector<std::string> seen;
     for(int i=1;i<argc;) {
@@ -58,6 +58,7 @@ static Options parse(int argc,char **argv) {
         else if(key=="--tokens") o.tokens=value;
         else if(key=="--window") o.window=positive(value);
         else if(key=="--nwin") o.nwin=positive(value);
+        else if(key=="--uq") o.uq=positive(value);
         else if(key=="--lengths") o.lengths=value;
         else if(key=="--mask") o.mask=value;
         else if(key=="--save-ref") o.save_ref=value;
@@ -67,6 +68,7 @@ static Options parse(int argc,char **argv) {
         else require(false,"unknown option "+key);
     }
     require(!o.weights.empty()&&!o.tokens.empty(),"--weights and --tokens required");
+    require(o.uq==1||o.uq==2,"uq must be 1 or2");
     require(o.window>=2&&o.window<=1024,"window must be 2..1024 including prepared BOS");
     require(o.golden.empty()||(o.window==5&&o.nwin==1),"golden validation requires window5 nwin1");
     require(o.dump.empty()||(o.window==1024&&o.nwin==1),"three-row dump requires window1024 nwin1");
@@ -121,6 +123,12 @@ struct PositionStats {
     }
 };
 static void self_test() {
+    auto options=[](std::vector<std::string> args) {
+        std::vector<char*> argv; for(auto &arg:args) argv.push_back(arg.data());
+        return parse(int(argv.size()),argv.data());
+    };
+    require(options({"ppl","--weights","unused","--tokens","unused"}).uq==2,"default uq2");
+    for(int uq:{1,2}) require(options({"ppl","--weights","unused","--tokens","unused","--uq",std::to_string(uq)}).uq==uq,"explicit uq option");
     const float uniform[]={0,0}; require(nll(uniform,2,1)==std::log(2.0),"uniform NLL");
     const float extreme[]={1000,-1000}; require(nll(extreme,2,1)==2000,"stable extreme NLL");
     const float shifted[]={1100,-900}; require(nll(shifted,2,1)==nll(extreme,2,1),"translation invariance");
@@ -321,7 +329,7 @@ int main(int argc,char **argv) {
         const int length=lengths[win]; const int *input=tokens.data()+window_offset; reset_g4_decode_state(st);
         CK(cudaMemcpy(ids,input,mul(length,4),cudaMemcpyHostToDevice));
         CK(cudaDeviceSynchronize()); const double interval_start=epoch_seconds();
-        gemma4_decode(c,w,st,ids,length,cf,sf,cs,ss,logits,1,2,0,1,nullptr);
+        gemma4_decode(c,w,st,ids,length,cf,sf,cs,ss,logits,1,o.uq,0,1,nullptr);
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize()); const double interval_end=epoch_seconds();
         fprintf(stderr,"PPL_INTERVAL window=%d start=%.17g end=%.17g scope=gemma4_decode_prefill\n",win,interval_start,interval_end);
         require(st.n_past==length,"window reset/commit mismatch");
@@ -354,7 +362,7 @@ int main(int argc,char **argv) {
     free_g4_decode_state(st); free_weights_gemma4(w); free_config_gemma4(c);
     for(float *p:{logits,cf,sf,cs,ss}) CK(cudaFree(p)); CK(cudaFree(ids));
     const std::string model=fs::path(o.weights).lexically_normal().parent_path().filename().string();
-    std::ostringstream result; result<<std::setprecision(17)<<"{\"model\":"<<quote(model)<<",\"weights\":"<<quote(o.weights)<<",\"path\":"<<quote(mmq?"MMQ":"SB")<<",\"scale_dtype\":"<<scale_dtype<<",\"nwin\":"<<o.nwin<<",\"ntok\":"<<total_tokens<<",\"mean_nll\":"<<mean<<",\"ppl\":"<<ppl<<",\"per_window_nll\":[";
+    std::ostringstream result; result<<std::setprecision(17)<<"{\"model\":"<<quote(model)<<",\"weights\":"<<quote(o.weights)<<",\"path\":"<<quote(o.uq==1?"Q4_F32":(mmq?"MMQ":"SB"))<<",\"uq\":"<<o.uq<<",\"scale_dtype\":"<<scale_dtype<<",\"nwin\":"<<o.nwin<<",\"ntok\":"<<total_tokens<<",\"mean_nll\":"<<mean<<",\"ppl\":"<<ppl<<",\"per_window_nll\":[";
     for(size_t i=0;i<windows.size();++i) { if(i) result<<','; result<<windows[i]; } result<<"]"; reference.json(result); result<<"}";
     puts(result.str().c_str()); return 0;
 }
