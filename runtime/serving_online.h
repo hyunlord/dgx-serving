@@ -65,6 +65,8 @@ inline std::vector<int> parse_stop_ids_env(){
 //     ★계산 불변: argmax 값은 그대로 판정 — stop_id 만나기 전 토큰들은 stop 없을 때와 bit-identical(종료 조건만 추가).
 inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int>& stop_ids = {}){
     using namespace serving_online_detail;
+    const char* log_input_env = getenv("DGX_LOG_INPUT_IDS");
+    const bool log_input_ids = log_input_env && std::string(log_input_env) == "1";
     const int V = be.vocab(), maxlen = be.max_len();
     void* st = be.alloc_state(Bmax);
     std::vector<float> hlog((size_t)Bmax * V);
@@ -87,6 +89,12 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
                 int id; while(is>>id) r.ids.push_back(id);
             }
             if(r.ids.empty()) continue;
+            if(log_input_ids){
+                std::ostringstream trace;
+                trace << "INPUT_IDS req=" << r.id << " count=" << r.ids.size() << " ids=";
+                for(size_t i=0;i<r.ids.size();++i){ if(i) trace << ','; trace << r.ids[i]; }
+                fprintf(stderr,"%s\n",trace.str().c_str());
+            }
             { std::lock_guard<std::mutex> lk(mtx); queue.push_back(std::move(r)); }
             cv.notify_all();
         }
