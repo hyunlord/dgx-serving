@@ -64,6 +64,8 @@
 ★**회계 명시(중요)**: 아래는 **spec OFF plain끼리** 공정 비교다. llama의 12B **speculative 포함 66.9 t/s와 직접 비교 금지**
 (plain roofline 40.4 위 = spec 없인 물리 불가). llama-bench(tg64)=speculative 없는 순수 decode.
 
+> **품질 조건 다름(llama Q4_K_M)**: 아래 속도 비교는 동일 품질을 보장하지 않는다. 엔진의 RTN 대칭 per-32 q4와 llama Q4_K_M은 서로 다른 양자화 스킴이며, 엔진의 품질 기준선은 §3c에 별도로 기록한다.
+
 | 척도 | dgx plain (W4A8 sb) | llama plain (Q4_K_M, spec OFF) | dgx/llama |
 |---|---|---|---|
 | single decode | 23.3 t/s | 26.8 t/s (llama-bench tg64, ngl99) | **0.87×** (1.15× 느림) |
@@ -103,6 +105,21 @@
   남은 잔여 후보: K-quant bytes 10%↓(plain 소폭)·bf16-반올림 정합(chat accept)
   → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필: dgx B1 통짜 35.5 t/s vs llama pp256 1971 t/s = 큰 갭(별도 lever·chunked prefill/TTFT 트랙, plain-decode 헤드라인 아님).
+
+### 3c. 품질 기준선 (Gemma4-12B, 2026-10-26)
+
+고정된 UltraChat `test_sft` 채팅 **36대화·assistant 응답 16,201토큰**을 채점했다. 대화마다 독립 실행하고 선두 BOS를 정확히 1개 유지했으며, 역할·턴 제어 토큰은 채점에서 제외했다. 모든 경로에 같은 토큰·길이·마스크를 사용했다. ComfyUI 상주(유휴) 조건이며, 클럭은 실제 forward 구간의 100ms 표본 중앙값이다.
+
+| 경로 | PPL | SM 클럭 중앙값 |
+|---|---:|---:|
+| HF bf16 원본 | 28.547566147882474 | 2080MHz |
+| HF fp32 + 엔진 q4 복원 weight | 39.80235741370706 | 2086MHz |
+| 엔진 uq=1 (q4 weight + fp32 활성화) | 39.798947748384805 | 2086MHz |
+| 엔진 uq=2 (W4A8, MMQ OFF) | 40.097271756992043 | 2080MHz |
+
+**HF q4 복원 / 엔진 uq=1의 PPL 비율은 1.0000856722480154**로, 사전 등록한 일치 범위 0.95~1.05를 충족했다. 복원한 q4 선형층 weight만 HF 모델에 넣고 나머지 텐서는 HF 원본으로 유지했으며, 임의 3개 텐서의 복원값은 독립 C 참조와 비트 일치했다. RoPE 테이블과 sliding mask 경계도 대조를 통과했다.
+
+이 12B 평가에서 HF 원본 대비 손실 원인은 **weight 양자화(RTN 대칭 per-32)**로 판정했다. uq=2 / uq=1 PPL 비율은 1.0074957762826617로, 추가 int8 활성화 양자화 비용 5% 초과 조건에는 해당하지 않았다. 이는 해당 입력·경로에 대한 원인 분리 결과이며, llama Q4_K_M과의 품질 동등성이나 MMQ·fp16 스케일 채택을 뜻하지 않는다. fp16 스케일은 별도 품질 결과가 나오더라도 기본 적용하지 않는다.
 
 ## 4. 대역폭 지형도 (측정 결론 — "이 장비에서 가능한 것")
 
