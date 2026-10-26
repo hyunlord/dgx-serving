@@ -56,7 +56,14 @@ class OnlineDaemon:
             print("  [daemon] "+line.rstrip(), file=sys.stderr)
             if "ready" in line: break
         if self.p.poll() is not None: sys.exit("[serve_api] daemon 起動 실패(로드 중 종료).")
+        if (env if env is not None else os.environ).get("DGX_LOG_INPUT_IDS") == "1":
+            self.stderr_reader = threading.Thread(target=self._forward_stderr, daemon=True)
+            self.stderr_reader.start()
         self.reader = threading.Thread(target=self._reader, daemon=True); self.reader.start()
+
+    def _forward_stderr(self):
+        for line in self.p.stderr:
+            print("  [daemon] " + line.rstrip(), file=sys.stderr, flush=True)
 
     def _reader(self):
         """단일 스레드: daemon stdout 인터리브 출력 → req_id로 연결별 큐 분배. 'END'=완료 센티넬(None)."""
@@ -113,6 +120,18 @@ def chat_ids(tok, messages):
     return [int(x) for x in out]
 
 # ---- OpenAI 호환 HTTP 핸들러 ----
+def completion_ids(tok, prompt: str) -> list[int]:
+    ids = [int(x) for x in tok(prompt).input_ids]
+    bos = getattr(tok, "bos_token_id", None)
+    if bos is None or (ids and ids[0] == bos) or not getattr(tok, "chat_template", None):
+        return ids
+    # A chat template can add BOS even when ordinary tokenization does not.
+    chat = chat_ids(tok, [{"role": "user", "content": "Hello"}])
+    if chat and chat[0] == bos:
+        ids.insert(0, int(bos))
+    return ids
+
+
 class Handler(BaseHTTPRequestHandler):
     daemon = None; tok = None; model_id = "gemma4"; quant = "w4a8"; spec = False  # 클래스 변수(서버 起動 시 주입)
     sampling = False; maxlen = 1024                        # 샘플링 capability(plain daemon만)·KV 예산(웹UI ctx 표시용)
@@ -181,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 prompt = req.get("prompt","")
                 if isinstance(prompt, list): prompt = prompt[0] if prompt else ""
-                ids = self.tok(prompt).input_ids           # HF 토큰화(BOS 포함 — Gemma 관례)
+                ids = completion_ids(self.tok, prompt)
         except Exception as e:
             return self._json(400, {"error":{"message":str(e),"type":"invalid_request_error"}})
         self._generate(ids, max_tokens, stream, chat, sampling)
