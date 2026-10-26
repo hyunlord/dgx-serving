@@ -76,16 +76,33 @@ static Options parse(int argc,char **argv) {
     require(o.save_ref.empty()||o.kld_ref.empty(),"save-ref and kld-ref are mutually exclusive");
     require((o.golden.empty()&&o.dump.empty())||(o.lengths.empty()&&o.mask.empty()&&o.save_ref.empty()&&o.kld_ref.empty()),"validation modes require original fixed unmasked input"); return o;
 }
-template<class T> static std::vector<T> read_exact(const std::string &path,size_t count) {
+static void advise_reference_cache(int fd,const std::string &path,bool written) {
+    if(written) {
+        const int result=fdatasync(fd);
+        require(result==0,"reference fdatasync failed "+path+": "+strerror(errno));
+    }
+    const int error=posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);
+    if(error) fprintf(stderr,"warning: posix_fadvise %s: %s\n",path.c_str(),strerror(error));
+}
+static void release_reference_cache(const std::string &path,bool written) {
+    const int fd=open(path.c_str(),written?O_WRONLY:O_RDONLY);
+    require(fd>=0,"cannot open reference for cache advice "+path);
+    advise_reference_cache(fd,path,written);
+    require(close(fd)==0,"reference cache descriptor close failed "+path);
+}
+template<class T> static std::vector<T> read_exact(const std::string &path,size_t count,bool release_cache=false) {
     require(fs::is_regular_file(path)&&fs::file_size(path)==mul(count,sizeof(T)),"wrong input size "+path);
     std::vector<T> out(count); std::ifstream f(path,std::ios::binary);
-    require(bool(f.read(reinterpret_cast<char*>(out.data()),mul(count,sizeof(T)))),"read failed "+path); return out;
+    require(bool(f.read(reinterpret_cast<char*>(out.data()),mul(count,sizeof(T)))),"read failed "+path);
+    if(release_cache) release_reference_cache(path,false);
+    return out;
 }
 template<class T> static T *device(size_t count) { T *p=nullptr; CK(cudaMalloc(&p,mul(count,sizeof(T)))); return p; }
-static void write_new(const std::string &path,const void *data,size_t bytes) {
+static void write_new(const std::string &path,const void *data,size_t bytes,bool release_cache=false) {
     int fd=open(path.c_str(),O_WRONLY|O_CREAT|O_EXCL,0600); require(fd>=0,"output must be new "+path);
     const char *p=static_cast<const char*>(data); size_t remaining=bytes;
     while(remaining) { ssize_t n=write(fd,p,remaining); require(n>0,"output write failed"); p+=n; remaining-=n; }
+    if(release_cache) advise_reference_cache(fd,path,true);
     require(close(fd)==0,"output close failed");
 }
 static int argmax(const float *x,int n) {
@@ -221,20 +238,20 @@ struct Reference {
             require(!fs::exists(directory)&&fs::is_directory(parent),"reference output must be new with existing parent");
             require(fs::space(parent).available>=add(bytes,4096),"insufficient disk space for reference");
             require(fs::create_directory(directory),"cannot create reference directory");
-            write_new(directory+"/tokens.bin",tokens.data(),mul(tokens.size(),sizeof(int)));
-            write_new(directory+"/lengths.bin",lengths.data(),mul(lengths.size(),sizeof(int32_t)));
-            write_new(directory+"/mask.bin",mask.data(),mask.size());
-            write_new(directory+"/format.txt",description.data(),description.size());
+            write_new(directory+"/tokens.bin",tokens.data(),mul(tokens.size(),sizeof(int)),true);
+            write_new(directory+"/lengths.bin",lengths.data(),mul(lengths.size(),sizeof(int32_t)),true);
+            write_new(directory+"/mask.bin",mask.data(),mask.size(),true);
+            write_new(directory+"/format.txt",description.data(),description.size(),true);
             out_logp.open(directory+"/logp.fp16",std::ios::binary); out_argmax.open(directory+"/argmax.i32",std::ios::binary);
             require(bool(out_logp)&&bool(out_argmax),"cannot open reference outputs");
             buffer.reserve(mul(128,V)); tops.reserve(128);
         } else {
             require(fs::is_regular_file(directory+"/complete"),"reference is incomplete");
-            auto format=read_exact<char>(directory+"/format.txt",description.size());
+            auto format=read_exact<char>(directory+"/format.txt",description.size(),true);
             require(std::string(format.begin(),format.end())==description,"reference format/vocabulary/row count mismatch");
-            require(read_exact<int>(directory+"/tokens.bin",tokens.size())==tokens,"reference token mismatch");
-            require(read_exact<int32_t>(directory+"/lengths.bin",lengths.size())==lengths,"reference window lengths mismatch");
-            require(read_exact<uint8_t>(directory+"/mask.bin",mask.size())==mask,"reference scoring mask mismatch");
+            require(read_exact<int>(directory+"/tokens.bin",tokens.size(),true)==tokens,"reference token mismatch");
+            require(read_exact<int32_t>(directory+"/lengths.bin",lengths.size(),true)==lengths,"reference window lengths mismatch");
+            require(read_exact<uint8_t>(directory+"/mask.bin",mask.size(),true)==mask,"reference scoring mask mismatch");
             require(fs::file_size(directory+"/logp.fp16")==mul(mul(scored,V),sizeof(__half)),"reference logp size mismatch");
             require(fs::file_size(directory+"/argmax.i32")==mul(scored,sizeof(int32_t)),"reference argmax size mismatch");
             in_logp.open(directory+"/logp.fp16",std::ios::binary); in_argmax.open(directory+"/argmax.i32",std::ios::binary);
@@ -245,7 +262,11 @@ struct Reference {
         if(tops.empty()) return;
         out_logp.write(reinterpret_cast<const char*>(buffer.data()),mul(buffer.size(),sizeof(__half)));
         out_argmax.write(reinterpret_cast<const char*>(tops.data()),mul(tops.size(),sizeof(int32_t)));
-        require(bool(out_logp)&&bool(out_argmax),"reference write failed"); buffer.clear(); tops.clear();
+        out_logp.flush(); out_argmax.flush();
+        require(bool(out_logp)&&bool(out_argmax),"reference write failed");
+        release_reference_cache(directory+"/logp.fp16",true);
+        release_reference_cache(directory+"/argmax.i32",true);
+        buffer.clear(); tops.clear();
     }
     void row(const float *logits,int actual) {
         if(!save&&!compare) return;
@@ -260,10 +281,18 @@ struct Reference {
             divergences.push_back(reference_kl(buffer.data(),logits,vocab)); top_matches+=reference_top==actual;
         }
         ++written;
+        if(compare && written%128==0) {
+            release_reference_cache(directory+"/logp.fp16",false);
+            release_reference_cache(directory+"/argmax.i32",false);
+        }
     }
     void finish() {
         if(!save&&!compare) return; require(written==expected,"reference row accounting mismatch");
-        if(save) { flush(); out_logp.close(); out_argmax.close(); require(!out_logp.fail()&&!out_argmax.fail(),"reference close failed"); const char done[]="complete\n"; write_new(directory+"/complete",done,sizeof(done)-1); }
+        if(save) { flush(); out_logp.close(); out_argmax.close(); require(!out_logp.fail()&&!out_argmax.fail(),"reference close failed"); const char done[]="complete\n"; write_new(directory+"/complete",done,sizeof(done)-1,true); }
+        if(compare && written%128!=0) {
+            release_reference_cache(directory+"/logp.fp16",false);
+            release_reference_cache(directory+"/argmax.i32",false);
+        }
     }
     void json(std::ostringstream &out) const {
         if(!compare) return;

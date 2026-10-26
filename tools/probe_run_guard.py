@@ -18,6 +18,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -100,6 +101,28 @@ def cuda_memory(executable: Path) -> CUDAMemory:
     return CUDAMemory(free, total)
 
 
+def eviction_targets(command: list[str], weights: list[Path], references: list[Path],
+                     checkpoints: list[Path], artifacts: Path) -> list[Path]:
+    """Collect only run-specific inputs; PPL references must stay under artifacts."""
+    selected_weights, selected_refs = list(weights), list(references)
+    for index, argument in enumerate(command):
+        if argument in ("--weights", "--kld-ref"):
+            if index + 1 >= len(command):
+                raise ValueError(f"Missing path after {argument}")
+            target = Path(command[index + 1])
+            (selected_weights if argument == "--weights" else selected_refs).append(target)
+        elif argument.startswith("--weights="):
+            selected_weights.append(Path(argument.split("=", 1)[1]))
+        elif argument.startswith("--kld-ref="):
+            selected_refs.append(Path(argument.split("=", 1)[1]))
+    root = artifacts.resolve()
+    for target in selected_refs:
+        if not target.resolve().is_relative_to(root):
+            raise ValueError(f"PPL reference cache target is outside artifacts: {target}")
+    return list(dict.fromkeys(path.resolve(strict=True)
+                             for path in selected_weights + selected_refs + checkpoints))
+
+
 def descendants(owned: set[int]) -> None:
     pairs = [tuple(map(int, line.split())) for line in capture("ps", "-eo", "pid=,ppid=").splitlines()]
     while True:
@@ -166,6 +189,12 @@ def main() -> int:
     parser.add_argument("--expected-bytes", required=True, type=int)
     parser.add_argument("--cuda-meminfo", type=Path,
                         default=Path(__file__).resolve().with_name("cuda_meminfo"))
+    parser.add_argument("--evict-weights", action="append", type=Path, default=[],
+                        help="Run-specific weights to evict once before the memory gate (repeatable)")
+    parser.add_argument("--evict-ppl-ref", action="append", type=Path, default=[],
+                        help="Existing PPL reference under repository artifacts (repeatable)")
+    parser.add_argument("--evict-hf-checkpoint", action="append", type=Path, default=[],
+                        help="Exact last-used HF checkpoint, never the entire HF cache (repeatable)")
     parser.add_argument("--clock-gate", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -200,6 +229,17 @@ def main() -> int:
             status = 87
             return status
         # Check the allowlist before the helper creates its transient CUDA context.
+        targets = eviction_targets(command, args.evict_weights, args.evict_ppl_ref,
+                                   args.evict_hf_checkpoint, Path(__file__).resolve().parents[1] / "artifacts")
+        if targets:
+            eviction = json.loads(subprocess.check_output(
+                [sys.executable, str(Path(__file__).with_name("evict_file_cache.py")),
+                 "--cuda-meminfo", str(args.cuda_meminfo), *map(str, targets)],
+                text=True, timeout=600))
+            result["cache_eviction"] = eviction
+            (args.log_dir / f"evict_{args.name}.json").write_text(json.dumps(eviction, indent=2) + "\n")
+        else:
+            result["cache_eviction"] = {"targets": [], "status": "no_run_specific_targets"}
         memory = cuda_memory(args.cuda_meminfo)
         limit = memory.free_bytes * 8 // 10
         result.update(cuda_free_bytes=memory.free_bytes, cuda_total_bytes=memory.total_bytes,
