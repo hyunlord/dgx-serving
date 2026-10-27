@@ -11,6 +11,7 @@
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/gemv_w4a8_r10.cuh"
+#include "../kernels/gemv_w4a8_r10_d3.cuh"
 #include "../kernels/gemm_mmq_tmpl.cuh"
 #include "../kernels/gemm_tiled.cuh"
 #include "../kernels/rope.cuh"
@@ -52,6 +53,13 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
 static bool gd_decode_d1=false;
+static bool gd_decode_d3=false;
+static unsigned gd_d3_shapes=0;
+static inline bool gd_d3_shape(int in,int out){
+    const unsigned bit=in==3840 ? (out==4096?1u:out==8192?2u:out==15360?4u:out==262144?8u:0u) :
+                       out==3840 ? (in==4096?16u:in==8192?32u:in==15360?64u:0u) : 0u;
+    return (gd_d3_shapes & bit)!=0;
+}
 static inline bool gd_d1_shape(int in,int out){
     return (in==3840 && (out==4096 || out==8192 || out==15360 || out==262144)) ||
            ((in==4096 || in==8192 || in==15360) && out==3840);
@@ -81,6 +89,8 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
             for(int s0=0;s0<S;s0+=16){ int sq=(S-s0<16)?(S-s0):16;
                 launch_gemv_w4a8_sb(gd_xq+(size_t)s0*IN, gd_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gd_sdtype); }
+        } else if(gd_decode_d3 && S==1 && IN%QBLK==0 && gd_d3_shape(IN,OUT)) {
+            launch_gemv_w4a8_r10_d3_2chain(gd_xq,gd_xs,m.wq,m.sc,Y,IN,OUT,gd_sdtype);
         } else if(gd_decode_d1 && S==1 && QBLK==32 && IN%QBLK==0 && gd_d1_shape(IN,OUT)) {
             launch_gemv_w4a8_r10_d1(gd_xq,gd_xs,m.wq,m.sc,Y,IN,OUT,gd_sdtype);
         } else launch_gemv_w4a8(gd_xq,gd_xs,gd_xsum,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype);
@@ -101,6 +111,30 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
         if(enabled) fprintf(stderr,"G4_DECODE_GEMV_D1=1 (shape-limited committed Sq1 decode)\n");
         return enabled;
     }();
+    static const bool d3=[](){
+        const char* v=getenv("G4_DECODE_GEMV_D3");
+        return v && strcmp(v,"1")==0;
+    }();
+    static const unsigned d3_shapes=[](){
+        const char* v=getenv("G4_DECODE_GEMV_D3_SHAPES");
+        if(!v) return 0u;
+        char* end=nullptr; errno=0;
+        const unsigned long mask=strtoul(v,&end,0);
+        if(errno || end==v || *end!='\0' || mask>127u){
+            fprintf(stderr,"Invalid G4_DECODE_GEMV_D3_SHAPES; expected mask 0..127\n"); exit(1);
+        }
+        return (unsigned)mask;
+    }();
+    unsigned active=0;
+    const char* flags[]={"G4_DECODE_GEMV_D1", "G4_DECODE_GEMV_D2", "G4_DECODE_GEMV_D3", "G4_DECODE_QUANT_D4"};
+    for(const char* name: flags){
+        const char* v=getenv(name); active+=v && strcmp(v,"1")==0;
+    }
+    if(active>1){ fprintf(stderr,"Simultaneous R10 D flags require a separately qualified combination\n"); exit(1); }
+    gd_d3_shapes=d3_shapes;
+    gd_decode_d3=d3 && Sq==1 && st.n_past>0 && commit!=0 && amort_mm==0 &&
+                 use_q4==2 && c.scale_dtype==0 && QBLK==32 &&
+                 c.hidden_size==3840 && c.intermediate_size==15360;
     gd_decode_d1=d1 && Sq==1 && st.n_past>0 && commit!=0 && amort_mm==0 &&
                  use_q4==2 && c.scale_dtype==0;
     static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
