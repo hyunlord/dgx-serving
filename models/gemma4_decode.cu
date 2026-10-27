@@ -10,6 +10,7 @@
 #include "../kernels/gemv_f32.cuh"
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/gemv_w4a8.cuh"
+#include "../kernels/gemv_w4a8_r10.cuh"
 #include "../kernels/gemm_mmq_tmpl.cuh"
 #include "../kernels/gemm_tiled.cuh"
 #include "../kernels/rope.cuh"
@@ -50,6 +51,11 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 // ---- mm dispatch (gemma4.cu와 동일 규약) ----
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
+static bool gd_decode_d1=false;
+static inline bool gd_d1_shape(int in,int out){
+    return (in==3840 && (out==4096 || out==8192 || out==15360 || out==262144)) ||
+           ((in==4096 || in==8192 || in==15360) && out==3840);
+}
 static int gd_amort=0;   // 1=프리필 MMQ/SB 매트멀. 기본0=plain gemv(golden 경로 무변경).
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4){
     if(use_q4==2){ size_t n=(size_t)S*IN;
@@ -75,6 +81,8 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
             for(int s0=0;s0<S;s0+=16){ int sq=(S-s0<16)?(S-s0):16;
                 launch_gemv_w4a8_sb(gd_xq+(size_t)s0*IN, gd_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gd_sdtype); }
+        } else if(gd_decode_d1 && S==1 && QBLK==32 && IN%QBLK==0 && gd_d1_shape(IN,OUT)) {
+            launch_gemv_w4a8_r10_d1(gd_xq,gd_xs,m.wq,m.sc,Y,IN,OUT,gd_sdtype);
         } else launch_gemv_w4a8(gd_xq,gd_xs,gd_xsum,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype);
     } else if(use_q4) launch_gemm_tiled_q4(X,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype);
     else              launch_gemv_f32(X,m.wf,Y,IN,OUT,S);
@@ -87,6 +95,14 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
                    float *d_prenorm) {
     gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
+    static const bool d1=[](){
+        const char* v=getenv("G4_DECODE_GEMV_D1");
+        const bool enabled=v && strcmp(v,"1")==0;
+        if(enabled) fprintf(stderr,"G4_DECODE_GEMV_D1=1 (shape-limited committed Sq1 decode)\n");
+        return enabled;
+    }();
+    gd_decode_d1=d1 && Sq==1 && st.n_past>0 && commit!=0 && amort_mm==0 &&
+                 use_q4==2 && c.scale_dtype==0;
     static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     static const int flash_min_s=[](){
         int value=16;
