@@ -14,6 +14,7 @@
 #include "../kernels/gemm_tiled.cuh"
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
+#include "../kernels/attention_flash.cuh"
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
 
@@ -85,6 +86,18 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
                    float *d_prenorm) {
     gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
+    static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return v && strcmp(v,"1")==0; }();
+    static const int flash_min_s=[](){
+        int value=16;
+        if(const char* v=getenv("G4_FLASH_MIN_S")){
+            char* end=nullptr; errno=0;
+            const long parsed=strtol(v,&end,10);
+            if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
+                value=parsed<16?16:(int)parsed;
+            else fprintf(stderr,"Invalid G4_FLASH_MIN_S=%s; using 16\n",v);
+        }
+        return value;
+    }();
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
@@ -124,7 +137,10 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
         // KV 캐시 append: 슬롯 base.. (A-1 선형; A-2 캡). roped kn, v_norm된 vn.
         DK(cudaMemcpy(st.Kc[l]+(size_t)base*kvdim, kn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
         DK(cudaMemcpy(st.Vc[l]+(size_t)base*kvdim, vn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
-        launch_attn_decode(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, 0, ascale, window);
+        if(flash_prefill && Sq>=flash_min_s)
+            launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, 0, nullptr, ascale, window);
+        else
+            launch_attn_decode(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, 0, ascale, window);
         mm(L.o, attn, ob, qdim, H, Sq, use_q4);
         launch_rmsnorm(ob, L.post_attn_ln, tmp, Sq, H, eps);
         launch_add(after, x, tmp, (int)SH);   // after = x + post_attn_ln(o_proj)
