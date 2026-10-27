@@ -47,6 +47,78 @@ class ApiMetric:
     kernel_empty_intersection_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class DecodeSelection:
+    """CPU-aligned bounds plus unchanged raw kernels and explicit anomalies."""
+
+    stats: dict[str, base.Json]
+    rows: list[base.Launch]
+    bounds: tuple[int, int]
+    anomalies: list[dict[str, int]]
+
+
+def completion(db: sqlite3.Connection, last: base.Launch) -> int:
+    """Use the first host-ordered sync; never skip one due to GPU timestamps."""
+    row = db.execute("""SELECT r.end FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+        JOIN StringIds s ON s.id=r.nameId WHERE s.value LIKE 'cudaDeviceSynchronize%'
+        AND r.globalTid=? AND r.start>=? ORDER BY r.start LIMIT 1""",
+        (last.tid, last.api_end)).fetchone()
+    if row is None or row[0] < last.end:
+        raise base.TraceError("Missing completion or terminal GPU ends after first host completion")
+    return row[0]
+
+
+def aligned_stats(rows: list[base.Launch], bounds: tuple[int, int], epoch: int) -> dict[str, base.Json]:
+    """Keep duration/category sums raw and disclose union clipped at CPU bounds."""
+    start, end = bounds
+    groups = base.terminal_groups(rows, "softcap_kernel")
+    result = base.aggregate(rows, end-start, {base.last_linear(g) for g in groups}, epoch, start, end)
+    raw_union = base.union_ns([(r.start, r.end) for r in rows])
+    clipped_union = base.union_ns([(max(start, r.start), min(end, r.end)) for r in rows])
+    result.update(raw_gpu_union_ns=raw_union, gpu_union_ns=clipped_union,
+                  gpu_union_outside_wall_ns=raw_union-clipped_union,
+                  wall_minus_gpu_union_ns=end-start-clipped_union)
+    return result
+
+
+def decode_aligned(db: sqlite3.Connection, rows: list[base.Launch], epoch: int) -> DecodeSelection:
+    """Accept only observed leading cross-domain inversions with valid host order."""
+    groups = base.terminal_groups(rows, "softcap_kernel")
+    if len(groups) < 33:
+        raise base.TraceError("Need at least 33 tokens including predecessor boundary")
+    previous_group = groups[-33]
+    previous = completion(db, previous_group[-1])
+    start = previous
+    anomalies: list[dict[str, int]] = []
+    tokens: list[base.Json] = []
+    for index, group in enumerate(groups[-32:]):
+        end = completion(db, group[-1])
+        if end <= previous:
+            raise base.TraceError("Non-increasing token completion boundaries")
+        for row in group:
+            if row.api_start < previous or row.api_end > end:
+                raise base.TraceError("Token launch API crosses CPU completion boundary")
+            if row.end <= previous or row.end > end:
+                raise base.TraceError("Kernel wholly outside or ending after CPU completion interval")
+            if row.start < previous:
+                if row.start < previous_group[-1].end or row.start >= row.api_start:
+                    raise base.TraceError("Leading kernel crosses previous GPU work or lacks API inversion")
+                anomalies.append({"selected_index": index, "correlation": row.correlation,
+                    "gpu_start_ns": row.start, "previous_sync_end_ns": previous,
+                    "api_start_ns": row.api_start, "outside_token_start_ns": previous-row.start,
+                    "gpu_before_own_api_ns": row.api_start-row.start})
+        stat = aligned_stats(group, (previous, end), epoch)
+        stat.pop("shapes")
+        stat["selected_index"] = index
+        tokens.append(stat)
+        previous, previous_group = end, group
+    selected = [r for group in groups[-32:] for r in group]
+    result = aligned_stats(selected, (start, previous), epoch)
+    result.update(status="ok", token_count=32, tokens_seen=len(groups), tokens=tokens,
+        wall_scope="completion-sync to completion-sync; includes previous-token cleanup and current-token host/copies")
+    return DecodeSelection(result, selected, (start, previous), anomalies)
+
+
 def category(name: str) -> str:
     """Keep all unmatched runtime APIs visible under other."""
     for prefix, label in (("cudaMalloc", "malloc"), ("cudaFree", "free"),
@@ -67,8 +139,8 @@ def gaps(rows: list[base.Launch], bounds: tuple[int, int]) -> list[tuple[int, in
     cursor, end = bounds
     result: list[tuple[int, int]] = []
     for row in sorted(rows, key=lambda r: r.start):
-        if row.start < bounds[0] or row.end > end:
-            raise base.TraceError("Kernel crosses selected completion interval")
+        if row.end <= bounds[0] or row.end > end:
+            raise base.TraceError("Kernel outside selected completion interval")
         if row.start > cursor:
             result.append((cursor, row.start))
         cursor = max(cursor, row.end)
@@ -120,13 +192,9 @@ def run(source: Path, output: Path) -> None:
         db.row_factory = sqlite3.Row
         rows = phase(db, base.read_launches(db))
         epoch = db.execute("SELECT utcEpochNs FROM TARGET_INFO_SESSION_START_TIME").fetchone()[0]
-        groups = base.terminal_groups(rows, "softcap_kernel")
-        if len(groups) < 33:
-            raise base.TraceError("Need at least 33 tokens including predecessor boundary")
-        selected = [r for group in groups[-32:] for r in group]
-        start = base.sync_end(db, groups[-33][-1], True)
-        end = base.sync_end(db, groups[-1][-1], True)
-        decoded = base.decode(db, rows, True, epoch)
+        selection = decode_aligned(db, rows, epoch)
+        selected, decoded = selection.rows, selection.stats
+        start, end = selection.bounds
         empty = gaps(selected, (start, end))
         thread = selected[0].tid
         runtime = db.execute("""SELECT r.start,r.end,r.globalTid,s.value
@@ -143,6 +211,14 @@ def run(source: Path, output: Path) -> None:
         result = {
             "source": str(source.resolve()), "mode": "engine_w4a8_last32", "epoch_ns": epoch,
             "decode": decoded,
+            "token_start_alignment_anomalies": selection.anomalies,
+            "gpu_before_correlated_api": [{"correlation": r.correlation, "gpu_start_ns": r.start,
+                "api_start_ns": r.api_start, "inversion_ns": r.api_start-r.start}
+                for r in selected if r.start < r.api_start],
+            "alignment_note": "CPU wall and raw kernel sums are unchanged; GPU union is clipped to CPU wall. "
+                "Kernel-empty time is a CPU-aligned estimate, not exact causality. Observed inversion sizes "
+                "are not a calibrated uncertainty bound. wall = raw kernel sum - raw overlap "
+                "- gpu_union_outside_wall_ns + kernel-empty time.",
             "api_scope": "same host thread as W4A8 launch; intervals clipped to completion boundaries",
             "api_note": "Overlapping API categories are not additive causes. Synchronize can overlap GPU work. "
                         "Kernel-empty intervals can contain GPU copies; they are not proven device idle.",
