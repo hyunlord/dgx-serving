@@ -34,6 +34,8 @@ def add_quant_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quant", choices=QUANT_MODES, default="rtn")
     parser.add_argument("--quant-rule", choices=("signed-max", "positive-max"))
     parser.add_argument("--quant-c", type=float)
+    parser.add_argument("--scale-dtype", choices=("fp32", "fp16"), default="fp32",
+                        help="qat-ident: round scale before assigning q; rtn: cast scale after assigning q")
 
 
 def validate_quant_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -46,15 +48,20 @@ def validate_quant_arguments(args: argparse.Namespace, parser: argparse.Argument
         parser.error("--quant-rule/--quant-c apply only to qat-ident")
     if args.quant_rule != "positive-max" and args.quant_c is not None:
         parser.error("--quant-c applies only to positive-max")
-    if args.quant != "rtn" and getattr(args, "scale_dtype", "fp32") != "fp32":
+    if args.quant not in ("rtn", "qat-ident") and args.scale_dtype != "fp32":
         parser.error("experimental quantization requires fp32 scales")
 
 
 def quantize_variant(w_2d: np.ndarray, mode: str = "rtn", rule: str | None = None,
-                     c: float | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Round onto an explicit FP32 scale grid; no BF16 product rounding."""
+                     c: float | None = None, *, scale_dtype: str = "fp32") -> tuple[np.ndarray, np.ndarray]:
+    """Use a stored-scale grid for qat-ident; preserve legacy RTN post-casting."""
+    if scale_dtype not in ("fp32", "fp16"):
+        raise ValueError("scale_dtype must be fp32 or fp16")
     if mode == "rtn":
-        return quantize_int4(w_2d)
+        packed, scale = quantize_int4(w_2d)
+        return packed, scale.astype(scale_dtype.replace("fp", "float"))
+    if scale_dtype == "fp16" and mode != "qat-ident":
+        raise ValueError("experimental quantization requires fp32 scales except qat-ident")
     if mode not in QUANT_MODES or (mode == "qat-ident" and rule not in ("signed-max", "positive-max")):
         raise ValueError("unknown mode or missing qat-ident rule")
     if rule == "positive-max" and (c is None or not np.isfinite(c) or c <= 0):
@@ -71,6 +78,13 @@ def quantize_variant(w_2d: np.ndarray, mode: str = "rtn", rule: str | None = Non
         if mode == "qat-ident" and rule == "positive-max":
             scale = np.max(np.abs(block), axis=1) / np.float32(c)
         scale[scale == 0] = np.float32(1e-8)
+        if scale_dtype == "fp16":
+            with np.errstate(over="ignore", under="ignore"):
+                scale = scale.astype(np.float16).astype(np.float32)
+            zero_blocks = np.all(block == 0, axis=1)
+            scale[zero_blocks] = np.float32(np.nextafter(np.float16(0), np.float16(1)))
+            if np.any(~np.isfinite(scale) | (scale == 0)):
+                raise ValueError("fp16 scale underflow or overflow in a nonzero block")
         q = np.clip(np.rint(block / scale[:, None]), -8, 7)
         if mode == "orig-clip":
             best = np.square((q * scale[:, None]).astype(np.float64) - block).sum(axis=1)
@@ -85,7 +99,7 @@ def quantize_variant(w_2d: np.ndarray, mode: str = "rtn", rule: str | None = Non
         nibble = (q.astype(np.int8) + 8).astype(np.uint8).reshape(-1)
         packed[start * 16:(start + len(block)) * 16] = nibble[::2] | (nibble[1::2] << 4)
         scales[start:start + len(block)] = scale
-    return packed, scales
+    return packed, scales.astype(scale_dtype.replace("fp", "float"))
 
 
 def reconstruction_stats(w_2d: np.ndarray, packed: np.ndarray, scale: np.ndarray) -> ReconstructionStats:
@@ -195,7 +209,8 @@ def main():
     def save_q4(name, t):
         w = t.detach().cpu().float().contiguous().numpy().astype(np.float32)  # [OUT, IN]
         policy = args.quant if variant_projection(name) else "rtn"
-        packed, scale = quantize_variant(w, policy, args.quant_rule, args.quant_c)
+        packed, scale = quantize_variant(w, policy, args.quant_rule, args.quant_c,
+                                        scale_dtype=args.scale_dtype)
         packed.tofile(os.path.join(args.out, name + "_q4.bin"))
         scale.tofile(os.path.join(args.out, name + "_scale.bin"))
         if args.quant != "rtn":
@@ -235,9 +250,14 @@ def main():
     manifest["quant_mean_relerr"] = float(np.mean(errs))
     if args.quant != "rtn":
         manifest.update({"quant_method": args.quant, "quant_rule": args.quant_rule,
-                         "quant_c": args.quant_c, "scale_dtype": 0, "lm_head_quant": "rtn"})
+                         "quant_c": args.quant_c, "scale_dtype": int(args.scale_dtype == "fp16"), "lm_head_quant": "rtn"})
+        if args.quant == "qat-ident" and args.scale_dtype == "fp16":
+            manifest["quant_scale_rounding"] = "before_integer_assignment"
+            manifest["lm_head_scale_rounding"] = "after_integer_assignment"
         with open(os.path.join(args.out, "quantization_report.json"), "x") as f:
             json.dump(quantization_report, f, indent=2)
+    if args.scale_dtype == "fp16":
+        manifest["scale_dtype"] = 1
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"[extract] done. mean rel-err {np.mean(errs):.4f}. manifest + weights → {args.out}")

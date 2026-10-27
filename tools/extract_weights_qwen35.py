@@ -58,8 +58,6 @@ def main():
                     help="로드 dtype. 큰 모델(27B+)은 bfloat16로 OOM 회피 (q4 양자화는 source dtype에 거의 무관).")
     ap.add_argument("--q4-only", action="store_true",
                     help="big matmul의 fp32 복사본 생략(27B+ fp32 108GB는 엔진 OOM이라 불필요). q4+small-fp32만.")
-    ap.add_argument("--scale-dtype", default="fp32", choices=["fp32", "fp16"],
-                    help="weight scale dtype. fp16: scale fp32→fp16 변환 저장 (트래픽↓, rel 9.3e-4 안전).")
     add_quant_arguments(ap)
     args = ap.parse_args()
     validate_quant_arguments(args, ap)
@@ -155,7 +153,8 @@ def main():
     def save_q4(fname, t):
         w = t.detach().cpu().float().contiguous().numpy().astype(np.float32)
         policy = args.quant if variant_projection(fname) else "rtn"
-        packed, scale = quantize_variant(w, policy, args.quant_rule, args.quant_c)
+        packed, scale = quantize_variant(w, policy, args.quant_rule, args.quant_c,
+                                        scale_dtype=args.scale_dtype)
         packed.tofile(os.path.join(args.out, fname + "_q4.bin"))
         if scale_fp16:
             scale.astype(np.float16).tofile(os.path.join(args.out, fname + "_scale.bin"))
@@ -217,6 +216,9 @@ def main():
     if args.quant != "rtn":
         manifest.update({"quant_method": args.quant, "quant_rule": args.quant_rule,
                          "quant_c": args.quant_c, "lm_head_quant": "rtn"})
+        if args.quant == "qat-ident" and scale_fp16:
+            manifest["quant_scale_rounding"] = "before_integer_assignment"
+            manifest["lm_head_scale_rounding"] = "after_integer_assignment"
         with open(os.path.join(args.out, "quantization_report.json"), "x") as f:
             json.dump(quantization_report, f, indent=2)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:

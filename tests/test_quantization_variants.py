@@ -121,3 +121,91 @@ def test_clipping_search_matches_independent_per_block_enumeration() -> None:
         expected.append(min(enumerate(candidates), key=lambda pair: (pair[1][0], pair[0]))[1])
     np.testing.assert_array_equal(scale, [row[1] for row in expected])
     np.testing.assert_array_equal(unpack(packed, scale), [row[2] for row in expected])
+
+
+def test_ident_fp16_rounds_scale_before_integer_assignment() -> None:
+    # Given a half-step value whose q changes when scale is rounded first.
+    w = np.zeros((1, 32), dtype=np.float32)
+    w[0, 0] = np.float32(8.05 * 0.1)
+    w[0, 1] = np.float32(0.14998)
+    # When the selected grid uses fp16 scales.
+    packed, scale = quant.quantize_variant(w, "qat-ident", "positive-max", 8.05, scale_dtype="fp16")
+    # Then q=2, unlike post-casting the fp32 q=1, and storage is fp16.
+    assert scale.dtype == np.float16
+    assert packed[0] >> 4 == 10
+    old_packed, _ = quant.quantize_variant(w, "qat-ident", "positive-max", 8.05)
+    assert old_packed[0] >> 4 == 9
+
+
+def test_ident_fp16_zero_blocks_stay_finite() -> None:
+    # Given all-zero weights.
+    w = np.zeros((1, 32), dtype=np.float32)
+    # When a scale-first grid is selected.
+    packed, scale = quant.quantize_variant(w, "qat-ident", "positive-max", 8.05, scale_dtype="fp16")
+    # Then zero is represented exactly without zero-scale division.
+    assert np.isfinite(scale).all() and (scale != 0).all()
+    np.testing.assert_array_equal(unpack(packed, scale), w)
+
+
+def test_reconstruction_metrics_promote_fp16_scale_to_engine_fp32_product() -> None:
+    # Given a finite engine product that would overflow fp16 arithmetic.
+    w = np.full((1, 32), 420000, dtype=np.float32)
+    packed = np.full(16, 255, dtype=np.uint8)
+    scales = np.array([60000], dtype=np.float16)
+    # When reconstruction metrics combine fp32 q with serialized fp16 scales.
+    metrics = quant.reconstruction_stats(w, packed, scales)
+    # Then exact fp32 reconstruction has no spurious overflow error.
+    assert metrics["relative_error"] == 0
+
+
+@pytest.mark.parametrize("magnitude", [1e-10, 1e7])
+def test_ident_fp16_rejects_unrepresentable_nonzero_scale(magnitude: float) -> None:
+    # Given scales that underflow to zero or overflow to infinity.
+    w = np.full((1, 32), magnitude, dtype=np.float32)
+    # When scale-first conversion runs, then extraction stops instead of corrupting q.
+    with pytest.raises(ValueError, match="fp16 scale"):
+        quant.quantize_variant(w, "qat-ident", "positive-max", 8.05, scale_dtype="fp16")
+
+
+@pytest.mark.parametrize("script", ["extract_weights.py", "extract_weights_qwen35.py"])
+def test_ident_fp16_cli_preserves_existing_destination(tmp_path: Path, script: str) -> None:
+    # Given an existing directory, the new option must pass parsing but never overwrite it.
+    entry = Path(__file__).resolve().parents[1] / "tools" / script
+    # When the scale-first policy is requested.
+    run = subprocess.run([sys.executable, str(entry), "--model", "not-a-model", "--out", str(tmp_path),
+                          "--quant", "qat-ident", "--quant-rule", "positive-max", "--quant-c", "8.05",
+                          "--scale-dtype", "fp16"], capture_output=True, text=True, check=False)
+    # Then destination protection precedes model loading.
+    assert run.returncode != 0 and "FileExistsError" in run.stderr
+
+
+@pytest.mark.parametrize("script,basename", [("extract_weights.py", "L0_q"),
+                                          ("extract_weights_qwen35.py", "L0_self_attn.q_proj")])
+def test_cli_serializes_fp16_scales_and_manifest_for_local_model(tmp_path: Path, script: str, basename: str) -> None:
+    # Given a tiny locally constructed model (no network or GPU).
+    import json
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM
+    model = LlamaForCausalLM(LlamaConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+                                       num_attention_heads=4, num_key_value_heads=2, vocab_size=64,
+                                       layer_types=["full_attention"]))
+    with torch.no_grad():
+        model.model.layers[0].self_attn.q_proj.weight.zero_()
+        model.model.layers[0].self_attn.q_proj.weight[:, 0] = 8.05 * 0.1
+        model.model.layers[0].self_attn.q_proj.weight[:, 1] = 0.14998
+    source, output = tmp_path / "source", tmp_path / "output"
+    model.save_pretrained(source)
+    entry = Path(__file__).resolve().parents[1] / "tools" / script
+    # When the real CLI extracts a fresh output.
+    run = subprocess.run([sys.executable, str(entry), "--model", str(source), "--out", str(output),
+                          "--quant", "qat-ident", "--quant-rule", "positive-max", "--quant-c", "8.05",
+                          "--scale-dtype", "fp16"], capture_output=True, text=True, check=False)
+    # Then serialized bytes and manifest agree with the requested format.
+    assert run.returncode == 0, run.stderr
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["scale_dtype"] == 1
+    assert manifest["quant_scale_rounding"] == "before_integer_assignment"
+    scales = np.fromfile(output / f"{basename}_scale.bin", dtype=np.float16)
+    packed = np.fromfile(output / f"{basename}_q4.bin", dtype=np.uint8)
+    assert scales.size == 32 and (output / f"{basename}_scale.bin").stat().st_size == 64
+    assert np.all(packed[::16] >> 4 == 10)
