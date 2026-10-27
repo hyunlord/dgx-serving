@@ -30,9 +30,23 @@ The tool accepts unique named options, rejects unknown options and malformed int
 
 ## Token and loss accounting
 
+`--decode` is an optional, valueless execution mode for measuring single-token
+kernel variants. It resets each window as usual, then commits every input token
+with `Sq=1`, `amort_mm=0`, retaining one logit row per token. Tokens, masks, NLL
+calculation, and reference row order are unchanged. Its JSON reports
+`execution_mode="teacher_forced_decode"` and `path="W4A8_DECODE"` or
+`"Q4_DECODE"`; interval scope is `decode_teacher_forced`. Omitting the option
+preserves the existing prefill execution and output schema.
+
+Compare decode variants against a fresh baseline using the same mode. This mode
+also decodes unscored prompt tokens individually, so it does not establish the
+quality of mixed prompt-prefill/assistant-decode serving. Historical prefill PPL
+must remain separately labelled; it is not a measured decode baseline. The
+registered cumulative quality budget is unchanged.
+
 For the registered corpus, **1024 includes the prepared BOS**, leaving 1023 text targets in each window. Thirty-two windows therefore contain 32768 input IDs and score **32736** next-token targets. Tokenization/preparation must save the BOS policy, source and token hashes independently; the C++ executable does not infer BOS ID from a model name.
 
-Every window resets `n_past` to zero and overwrites its valid KV range. It calls the existing graph with `use_q4=uq` (default2), `amort_mm=1`, and `last_only=0`. Logit row `t` predicts input token `t+1`; the final row is finite-checked but unscored. No target or KV context crosses a window boundary.
+Every window resets `n_past` to zero and overwrites its valid KV range. In default prefill mode it calls the existing graph with `use_q4=uq` (default2), `amort_mm=1`, and `last_only=0`; `--decode` uses one committed token per call with `amort_mm=0` and `last_only=0`. Logit row `t` predicts input token `t+1`; the final row is finite-checked but unscored. No target or KV context crosses a window boundary.
 
 The graph already applies manifest-defined final logit softcapping. The tool must not apply softcap again. For each scored row it computes, in double precision:
 
