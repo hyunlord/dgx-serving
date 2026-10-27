@@ -88,11 +88,26 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
     const size_t qmax=(size_t)B*NQ*hd_max;
     const size_t kvmax=(size_t)B*(nkv_s*hd_s>nkv_f*hd_f?nkv_s*hd_s:nkv_f*hd_f);
 
-    float *x=bdm(BH),*norm=bdm(BH),*tmp=bdm(BH),*after=bdm(BH);
-    float *qb=bdm(qmax),*qn=bdm(qmax);
-    float *kb=bdm(kvmax),*kn=bdm(kvmax),*vb=bdm(kvmax),*vn=bdm(kvmax);
-    float *attn=bdm(qmax),*ob=bdm(BH);
-    float *g=bdm((size_t)B*FFN),*u=bdm((size_t)B*FFN),*act=bdm((size_t)B*FFN),*dn=bdm(BH);
+    // Like the existing matmul globals: serialized, single-device, non-reentrant calls.
+    // Each buffer grows independently; CUDA context/process teardown reclaims storage.
+    static float *scratch[16]={};
+    static size_t capacity[16]={};
+    float *x=gbm_grow(scratch[0],capacity[0],BH);
+    float *norm=gbm_grow(scratch[1],capacity[1],BH);
+    float *tmp=gbm_grow(scratch[2],capacity[2],BH);
+    float *after=gbm_grow(scratch[3],capacity[3],BH);
+    float *qb=gbm_grow(scratch[4],capacity[4],qmax);
+    float *qn=gbm_grow(scratch[5],capacity[5],qmax);
+    float *kb=gbm_grow(scratch[6],capacity[6],kvmax);
+    float *kn=gbm_grow(scratch[7],capacity[7],kvmax);
+    float *vb=gbm_grow(scratch[8],capacity[8],kvmax);
+    float *vn=gbm_grow(scratch[9],capacity[9],kvmax);
+    float *attn=gbm_grow(scratch[10],capacity[10],qmax);
+    float *ob=gbm_grow(scratch[11],capacity[11],BH);
+    float *g=gbm_grow(scratch[12],capacity[12],(size_t)B*FFN);
+    float *u=gbm_grow(scratch[13],capacity[13],(size_t)B*FFN);
+    float *act=gbm_grow(scratch[14],capacity[14],(size_t)B*FFN);
+    float *dn=gbm_grow(scratch[15],capacity[15],BH);
 
     launch_embedding(d_tokens, w.embed, x, B, H);
     if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,BH);
@@ -144,9 +159,6 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)B*V);
     if(commit && !ragged) st.n_past += 1;   // ragged면 per-slot 위치는 호출자(scheduler) 관리
     BK(cudaDeviceSynchronize());
-
-    float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn};
-    for(float *p:all) cudaFree(p);
 }
 
 // 26B-A4B MoE batch decode — gemma4_decode_batch(31B batch KV attn + dense mmB) + dense∥MoE MLP(B tokens).
@@ -173,12 +185,32 @@ void gemma4_moe_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchSt
     const size_t qmax=(size_t)B*NQ*hd_max;
     const size_t kvmax=(size_t)B*(nkv_s*hd_s>nkv_f*hd_f?nkv_s*hd_s:nkv_f*hd_f);
 
-    float *x=bdm(BH),*norm=bdm(BH),*tmp=bdm(BH),*after=bdm(BH);
-    float *qb=bdm(qmax),*qn=bdm(qmax);
-    float *kb=bdm(kvmax),*kn=bdm(kvmax),*vb=bdm(kvmax),*vn=bdm(kvmax);
-    float *attn=bdm(qmax),*ob=bdm(BH);
-    float *g=bdm((size_t)B*FFN),*u=bdm((size_t)B*FFN),*act=bdm((size_t)B*FFN),*dn=bdm(BH);
-    float *h1=bdm(BH),*h2=bdm(BH),*moe_in=bdm(BH),*moe_out=bdm(BH),*comb=bdm(BH),*rnorm=bdm(BH);
+    // Like the existing matmul globals: serialized, single-device, non-reentrant calls.
+    // Each buffer grows independently; CUDA context/process teardown reclaims storage.
+    static float *scratch[22]={};
+    static size_t capacity[22]={};
+    float *x=gbm_grow(scratch[0],capacity[0],BH);
+    float *norm=gbm_grow(scratch[1],capacity[1],BH);
+    float *tmp=gbm_grow(scratch[2],capacity[2],BH);
+    float *after=gbm_grow(scratch[3],capacity[3],BH);
+    float *qb=gbm_grow(scratch[4],capacity[4],qmax);
+    float *qn=gbm_grow(scratch[5],capacity[5],qmax);
+    float *kb=gbm_grow(scratch[6],capacity[6],kvmax);
+    float *kn=gbm_grow(scratch[7],capacity[7],kvmax);
+    float *vb=gbm_grow(scratch[8],capacity[8],kvmax);
+    float *vn=gbm_grow(scratch[9],capacity[9],kvmax);
+    float *attn=gbm_grow(scratch[10],capacity[10],qmax);
+    float *ob=gbm_grow(scratch[11],capacity[11],BH);
+    float *g=gbm_grow(scratch[12],capacity[12],(size_t)B*FFN);
+    float *u=gbm_grow(scratch[13],capacity[13],(size_t)B*FFN);
+    float *act=gbm_grow(scratch[14],capacity[14],(size_t)B*FFN);
+    float *dn=gbm_grow(scratch[15],capacity[15],BH);
+    float *h1=gbm_grow(scratch[16],capacity[16],BH);
+    float *h2=gbm_grow(scratch[17],capacity[17],BH);
+    float *moe_in=gbm_grow(scratch[18],capacity[18],BH);
+    float *moe_out=gbm_grow(scratch[19],capacity[19],BH);
+    float *comb=gbm_grow(scratch[20],capacity[20],BH);
+    float *rnorm=gbm_grow(scratch[21],capacity[21],BH);
 
     launch_embedding(d_tokens, w.embed, x, B, H);
     if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,BH);
@@ -258,9 +290,6 @@ void gemma4_moe_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchSt
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)B*V);
     if(commit && !ragged) st.n_past += 1;    // ragged면 per-slot 위치는 호출자 관리
     BK(cudaDeviceSynchronize());
-
-    float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn,h1,h2,moe_in,moe_out,comb,rnorm};
-    for(float *p:all) cudaFree(p);
 }
 
 // ---- chunked prefill (슬롯-b 뷰): 검증필 gemma4_decode(Sq=P) 재사용 ----
@@ -353,18 +382,36 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
         if(pos_b[a]+Nb[a]>st.max_len){ fprintf(stderr,"[gemma4_verify_concat] slot %d pos %d+%d > max_len %d — KV 예산 초과, 중단.\n",slot_ids[a],pos_b[a],Nb[a],st.max_len); exit(1); }
         for(int j=0;j<Nb[a];j++) pos_row[o+j]=pos_b[a]+j;
         o+=Nb[a]; }
-    int *d_pos_row; BK(cudaMalloc(&d_pos_row,(size_t)M*4));
+    // Same serialized, single-device lifetime as the float scratch below.
+    static int *d_pos_row=nullptr;
+    static size_t pos_capacity=0;
+    gbm_growi(d_pos_row,pos_capacity,(size_t)M);
     BK(cudaMemcpy(d_pos_row,pos_row.data(),(size_t)M*4,cudaMemcpyHostToDevice));
 
     const size_t MH=(size_t)M*H;
     const int hd_max=hd_f>hd_s?hd_f:hd_s;
     const size_t qmax=(size_t)M*NQ*hd_max;
     const size_t kvmax=(size_t)M*(nkv_s*hd_s>nkv_f*hd_f?nkv_s*hd_s:nkv_f*hd_f);
-    float *x=bdm(MH),*norm=bdm(MH),*tmp=bdm(MH),*after=bdm(MH);
-    float *qb=bdm(qmax),*qn=bdm(qmax);
-    float *kb=bdm(kvmax),*kn=bdm(kvmax),*vb=bdm(kvmax),*vn=bdm(kvmax);
-    float *attn=bdm(qmax),*ob=bdm(MH);
-    float *g=bdm((size_t)M*FFN),*u=bdm((size_t)M*FFN),*act=bdm((size_t)M*FFN),*dn=bdm(MH);
+    // Like the existing matmul globals: serialized, single-device, non-reentrant calls.
+    // Each buffer grows independently; CUDA context/process teardown reclaims storage.
+    static float *scratch[16]={};
+    static size_t capacity[16]={};
+    float *x=gbm_grow(scratch[0],capacity[0],MH);
+    float *norm=gbm_grow(scratch[1],capacity[1],MH);
+    float *tmp=gbm_grow(scratch[2],capacity[2],MH);
+    float *after=gbm_grow(scratch[3],capacity[3],MH);
+    float *qb=gbm_grow(scratch[4],capacity[4],qmax);
+    float *qn=gbm_grow(scratch[5],capacity[5],qmax);
+    float *kb=gbm_grow(scratch[6],capacity[6],kvmax);
+    float *kn=gbm_grow(scratch[7],capacity[7],kvmax);
+    float *vb=gbm_grow(scratch[8],capacity[8],kvmax);
+    float *vn=gbm_grow(scratch[9],capacity[9],kvmax);
+    float *attn=gbm_grow(scratch[10],capacity[10],qmax);
+    float *ob=gbm_grow(scratch[11],capacity[11],MH);
+    float *g=gbm_grow(scratch[12],capacity[12],(size_t)M*FFN);
+    float *u=gbm_grow(scratch[13],capacity[13],(size_t)M*FFN);
+    float *act=gbm_grow(scratch[14],capacity[14],(size_t)M*FFN);
+    float *dn=gbm_grow(scratch[15],capacity[15],MH);
 
     launch_embedding(d_tokens_cat, w.embed, x, M, H);
     if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,MH);
@@ -417,8 +464,4 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
     mmM(w.lm_head, norm, d_logits_cat, H, V, M);
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits_cat, d_logits_cat, c.final_logit_softcapping, (size_t)M*V);
     BK(cudaDeviceSynchronize());
-
-    cudaFree(d_pos_row);
-    float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn};
-    for(float *p:all) cudaFree(p);
 }

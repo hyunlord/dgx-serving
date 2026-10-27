@@ -22,6 +22,7 @@
     fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 
 static float *g4d_dm(size_t n){ float*p; DK(cudaMalloc(&p,n*4)); return p; }
+static inline float* g4d_grow(float*&p,size_t&cap,size_t n){ if(cap<n){ if(p)cudaFree(p); DK(cudaMalloc(&p,n*4)); cap=n; } return p; }
 
 // ---- KV 캐시 alloc/free (A-1: 캡=max_len 선형; A-2에서 sliding 캡) ----
 G4DecodeState alloc_g4_decode_state(const ModelConfig &c, int max_len) {
@@ -108,11 +109,26 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
     const size_t qmax=(size_t)Sq*NQ*hd_max;
     const size_t kvmax=(size_t)Sq*(nkv_s*hd_s>nkv_f*hd_f?nkv_s*hd_s:nkv_f*hd_f);
 
-    float *x=g4d_dm(SH),*norm=g4d_dm(SH),*tmp=g4d_dm(SH),*after=g4d_dm(SH);
-    float *qb=g4d_dm(qmax),*qn=g4d_dm(qmax);
-    float *kb=g4d_dm(kvmax),*kn=g4d_dm(kvmax),*vb=g4d_dm(kvmax),*vn=g4d_dm(kvmax);
-    float *attn=g4d_dm(qmax),*ob=g4d_dm(SH);
-    float *g=g4d_dm((size_t)Sq*FFN),*u=g4d_dm((size_t)Sq*FFN),*act=g4d_dm((size_t)Sq*FFN),*dn=g4d_dm(SH);
+    // Like the existing matmul globals: serialized, single-device, non-reentrant calls.
+    // Each buffer grows independently; CUDA context/process teardown reclaims storage.
+    static float *scratch[16]={};
+    static size_t capacity[16]={};
+    float *x=g4d_grow(scratch[0],capacity[0],SH);
+    float *norm=g4d_grow(scratch[1],capacity[1],SH);
+    float *tmp=g4d_grow(scratch[2],capacity[2],SH);
+    float *after=g4d_grow(scratch[3],capacity[3],SH);
+    float *qb=g4d_grow(scratch[4],capacity[4],qmax);
+    float *qn=g4d_grow(scratch[5],capacity[5],qmax);
+    float *kb=g4d_grow(scratch[6],capacity[6],kvmax);
+    float *kn=g4d_grow(scratch[7],capacity[7],kvmax);
+    float *vb=g4d_grow(scratch[8],capacity[8],kvmax);
+    float *vn=g4d_grow(scratch[9],capacity[9],kvmax);
+    float *attn=g4d_grow(scratch[10],capacity[10],qmax);
+    float *ob=g4d_grow(scratch[11],capacity[11],SH);
+    float *g=g4d_grow(scratch[12],capacity[12],(size_t)Sq*FFN);
+    float *u=g4d_grow(scratch[13],capacity[13],(size_t)Sq*FFN);
+    float *act=g4d_grow(scratch[14],capacity[14],(size_t)Sq*FFN);
+    float *dn=g4d_grow(scratch[15],capacity[15],SH);
 
     launch_embedding(d_tokens, w.embed, x, Sq, H);
     if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,SH);
@@ -164,7 +180,4 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)rows*V);
     if(commit) st.n_past += Sq;
     DK(cudaDeviceSynchronize());
-
-    float *all[]={x,norm,tmp,after,qb,qn,kb,kn,vb,vn,attn,ob,g,u,act,dn};
-    for(float *p:all) cudaFree(p);
 }
