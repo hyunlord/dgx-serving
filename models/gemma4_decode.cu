@@ -86,7 +86,7 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
                    float *d_prenorm) {
     gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
-    static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return v && strcmp(v,"1")==0; }();
+    static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     static const int flash_min_s=[](){
         int value=16;
         if(const char* v=getenv("G4_FLASH_MIN_S")){

@@ -146,6 +146,11 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   to 16; invalid values fall back to 16). Decode and non-amortized calls retain their existing paths.
   `tools/bench_gemma4` now defaults to amortized prefill; `BENCH_G4_AMORT=0` reproduces its prior
   plain GEMV prefill path. This does not change scale dtype or adopt fp16 scales.
+- Dense Gemma prefill attention uses flash by default. Set `G4_FLASH_PREFILL=0` to restore
+  fp32 attention. `G4_FLASH_MIN_S` sets the minimum query count (default 16; values below 16
+  clamp to 16; invalid values fall back to 16). KV storage remains fp32; flash converts inputs
+  to bf16 for MMA. Single-token decode and the existing verify calls with at most 9 queries
+  retain the previous attention path. This setting does not affect 26B MoE.
 - Optional: `--recipe recipes/gemma4-12b-gb10.yaml` serves with a tuned config after verifying the
   device fingerprint and memory budget at startup — see [`recipe-schema.md`](./recipe-schema.md).
 
