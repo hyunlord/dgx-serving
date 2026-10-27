@@ -146,13 +146,18 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
         launch_rmsnorm(qb, L.q_norm, qn, Sq*NQ, hd, eps);
         launch_rope(qn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, NQ, hd);
         mm(L.k, norm, kb, H, kvdim, Sq, use_q4);
-        if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn, Sq*nkv, hd, eps);  // V=v_norm(k_proj), rope 전
-        else { mm(L.v, norm, vb, H, kvdim, Sq, use_q4); launch_rmsnorm_noscale(vb, vn, Sq*nkv, hd, eps); }
-        launch_rmsnorm(kb, L.k_norm, kn, Sq*nkv, hd, eps);
-        launch_rope(kn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, nkv, hd);
-        // KV 캐시 append: 슬롯 base.. (A-1 선형; A-2 캡). roped kn, v_norm된 vn.
-        DK(cudaMemcpy(st.Kc[l]+(size_t)base*kvdim, kn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
-        DK(cudaMemcpy(st.Vc[l]+(size_t)base*kvdim, vn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
+        // One token writes its cache slice directly; kb remains raw for K-equals-V.
+        float *kn_out=Sq==1?st.Kc[l]+(size_t)base*kvdim:kn;
+        float *vn_out=Sq==1?st.Vc[l]+(size_t)base*kvdim:vn;
+        if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn_out, Sq*nkv, hd, eps);  // V=v_norm(k_proj), rope 전
+        else { mm(L.v, norm, vb, H, kvdim, Sq, use_q4); launch_rmsnorm_noscale(vb, vn_out, Sq*nkv, hd, eps); }
+        launch_rmsnorm(kb, L.k_norm, kn_out, Sq*nkv, hd, eps);
+        launch_rope(kn_out, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, nkv, hd);
+        // Multi-token calls retain the scratch-to-cache append path.
+        if(Sq!=1){
+            DK(cudaMemcpy(st.Kc[l]+(size_t)base*kvdim, kn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
+            DK(cudaMemcpy(st.Vc[l]+(size_t)base*kvdim, vn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
+        }
         if(flash_prefill && Sq>=flash_min_s)
             launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, 0, nullptr, ascale, window);
         else
