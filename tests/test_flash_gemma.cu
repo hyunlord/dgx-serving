@@ -222,6 +222,71 @@ static int positive(const char *text, bool zero = false) {
     return static_cast<int>(value);
 }
 
+static int time_kv(int hd, int nkv, int sq, float scale, int window) {
+    require((hd == 256 || hd == 512) && (nkv == 8 || nkv == 1) && (sq == 512 || sq == 1024), "unsupported timing shape");
+    require(std::isfinite(scale) && scale >= 0, "invalid attention scale");
+    const Shape s{hd,16,nkv,sq,0};
+    const float resolved_scale = scale > 0 ? scale : 1.0f / std::sqrt(static_cast<float>(hd));
+    const size_t qcount = static_cast<size_t>(sq) * 16 * hd;
+    const size_t kvcount = static_cast<size_t>(sq) * nkv * hd;
+    const size_t scratch_rows = static_cast<size_t>(sq) * 16 * ((sq + FD_SPLIT_KV - 1) / FD_SPLIT_KV);
+    const size_t gpu_bytes = qcount * 8 + kvcount * 12 + scratch_rows * (8 + hd * 4);
+    const size_t host_bytes = qcount * 20 + kvcount * 20;
+    require(gpu_bytes + host_bytes <= size_t(2) * 1024 * 1024 * 1024, "timing buffers exceed 2GiB");
+    printf("KV_TIME_MEMORY gpu_buffer_bytes=%zu host_buffer_upper_bytes=%zu total_buffer_upper_bytes=%zu cuda_context_reserve=external_guard\n", gpu_bytes, host_bytes, gpu_bytes + host_bytes);
+    Inputs input(s);
+    Device<float> q(qcount), k(kvcount), v(kvcount), out(qcount);
+    Device<__nv_bfloat16> bk(kvcount), bv(kvcount);
+    q.put(input.q); k.put(input.rounded_k); v.put(input.rounded_v); bk.put(input.bf_k); bv.put(input.bf_v);
+    auto launch = [&](bool fp32) {
+        if (fp32) launch_flash_attn(q.data, k.data, v.data, out.data, sq, 16, nkv, hd, 0, 0, nullptr, resolved_scale, window);
+        else launch_flash_attn(q.data, bk.data, bv.data, out.data, sq, 16, nkv, hd, 0, 0, nullptr, resolved_scale, window);
+        CK(cudaGetLastError());
+    };
+    launch(true); CK(cudaDeviceSynchronize()); const auto expected = download(out.data, qcount);
+    launch(false); CK(cudaDeviceSynchronize()); const auto bf_output = download(out.data, qcount);
+    require(memcmp(expected.data(), bf_output.data(), qcount * sizeof(float)) == 0, "KV timing inputs produce unequal outputs");
+    require(std::all_of(expected.begin(), expected.end(), [](float value) { return std::isfinite(value); }), "nonfinite timing output");
+    printf("KV_TIME_INPUT hd=%d nq=16 nkv=%d sq=%d base=0 window=%d scale=%.9g matched_bits=1 kv_values=bf16_rounded custom_path_both=1 fixed_buffer_reuse=1\n", hd, nkv, sq, window, resolved_scale);
+    cudaEvent_t begin, end;
+    CK(cudaEventCreate(&begin)); CK(cudaEventCreate(&end));
+    double paired_us[3][2]{};
+    for (int pair = 0; pair < 3; ++pair) {
+        for (int variant = 0; variant < 2; ++variant) {
+            const bool fp32 = variant == 0;
+            const auto warm_start = std::chrono::steady_clock::now();
+            size_t warm_reps = 0;
+            do {
+                for (int batch = 0; batch < 32; ++batch) { launch(fp32); ++warm_reps; }
+                CK(cudaDeviceSynchronize());
+            } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_start).count() < 10.0);
+            const double warm_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_start).count();
+            CK(cudaDeviceSynchronize());
+            const double start_epoch = epoch();
+            CK(cudaEventRecord(begin));
+            size_t reps = 0; float milliseconds = 0;
+            do {
+                for (int batch = 0; batch < 100; ++batch) { launch(fp32); ++reps; }
+                CK(cudaEventRecord(end)); CK(cudaEventSynchronize(end));
+                CK(cudaEventElapsedTime(&milliseconds, begin, end));
+            } while (milliseconds < 1000.0f);
+            const double end_epoch = epoch();
+            const auto actual = download(out.data, qcount);
+            const bool valid = memcmp(expected.data(), actual.data(), qcount * sizeof(float)) == 0;
+            paired_us[pair][variant] = static_cast<double>(milliseconds) * 1000.0 / reps;
+            printf("KV_TIME_INTERVAL pair=%d kv=%s start=%.17g end=%.17g\n", pair + 1, fp32 ? "float" : "bf16", start_epoch, end_epoch);
+            printf("KV_TIME_RESULT pair=%d hd=%d nq=16 nkv=%d sq=%d base=0 window=%d scale=%.9g kv=%s warm_seconds=%.17g warm_reps=%zu reps=%zu total_ms=%.17g mean_us=%.17g output_stable=%d accounting=CUDA_event_whole_loop_including_host_poll_gaps_and_both_passes\n",
+                   pair + 1, hd, nkv, sq, window, resolved_scale, fp32 ? "float" : "bf16", warm_seconds,
+                   warm_reps, reps, static_cast<double>(milliseconds), paired_us[pair][variant], valid);
+            if (!valid) { CK(cudaEventDestroy(begin)); CK(cudaEventDestroy(end)); return 1; }
+        }
+        printf("KV_TIME_RATIO pair=%d fp32_over_bf16=%.17g\n", pair + 1, paired_us[pair][0] / paired_us[pair][1]);
+    }
+    CK(cudaEventDestroy(begin)); CK(cudaEventDestroy(end));
+    printf("RESULT KV_TIME PASS pairs=3\n");
+    return 0;
+}
+
 static int accuracy(int first, int limit, int threads) {
     int index = 0, executed = 0;
     // Alternate HD at identical/decreasing scratch needs before the complete Cartesian sweep.
@@ -263,6 +328,11 @@ int main(int argc, char **argv) {
 #ifdef R09_CAPTURE_ONLY
     fprintf(stderr, "usage: %s --capture-default NEW_OUTPUT.bin\n", argv[0]); return 2;
 #else
+    if (argc == 7 && std::string(argv[1]) == "--time-kv") {
+        char *end = nullptr; const float scale = strtof(argv[5], &end);
+        require(*argv[5] && end && *end == 0, "invalid scale argument");
+        return time_kv(positive(argv[2]), positive(argv[3]), positive(argv[4]), scale, positive(argv[6], true));
+    }
     int first = 0, count = 384, threads = 8;
     for (int i = 1; i < argc; i += 2) {
         require(i + 1 < argc, "argument value missing");
