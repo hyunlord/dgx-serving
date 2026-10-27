@@ -33,7 +33,37 @@ Gemma MoE router tensors, per-layer-type RoPE, sliding windows etc. are picked u
 budget for the big models (a full fp32 load of a 27–31B model is ~110 GB and **will** hit the
 memory guard; don't).
 
-### Gemma family — 12B / 31B dense, 26B-A4B MoE (one step)
+### Gemma4-12B — recommended QAT weights
+
+Use `google/gemma-4-12B-it-qat-q4_0-unquantized`, revision
+`b6ed86275a6a5735884e208bfed95b445a684ca2` (Apache-2.0). Extract from that pinned
+local checkpoint into a new directory; retain the original RTN weights and golden files.
+The measured rule is positive absolute maximum / 8.05, signed int4 `[-8, 7]`.
+
+```bash
+python tools/extract_weights_qwen35.py \
+    --model ~/models/qat/gemma-4-12B-it-qat-q4_0-unquantized \
+    --out artifacts/gemma4-12b-qat-ident/weights --dtype bfloat16 --q4-only \
+    --quant qat-ident --quant-rule positive-max --quant-c 8.05 --scale-dtype fp32
+```
+
+Pass `--weights artifacts/gemma4-12b-qat-ident/weights` to the Gemma server.
+The matching HF FP32 reference, restored from these engine q4 files, is
+`artifacts/gemma4-12b-qat/golden/`; the unchanged W4A8 test passes its existing
+`rel < 1.5e-2` and 5/5 argmax gates. Do not compare QAT weights to the old RTN golden.
+The assistant checkpoint is unchanged. The autotune profile and recipes still name
+RTN assets; select QAT paths explicitly until those configurations are updated separately.
+
+`qat-ident --scale-dtype fp16` is a distinct scale-first experiment: round each
+projection scale to fp16 **before** assigning integer q. `convert_scale_fp16.py`
+instead preserves q and casts only the scale afterward. Embedding/norm remain FP32;
+lm_head retains the legacy RTN rule (its scale is cast after q assignment).
+On the same 36-dialogue evaluation, scale-first fp16 produced PPL
+29.089064374088686 versus fp32 28.904909148350214 (+0.6371070906790344%),
+so it failed the <0.5% gate. Keep fp32 scales for the recommended QAT path.
+
+### Gemma family — RTN alternative, 31B dense and 26B-A4B MoE
+
 
 ```bash
 python tools/extract_weights_qwen35.py --model google/gemma-4-12B-it \
@@ -76,7 +106,7 @@ The spec daemon reads both the `mtp_*.bin` head weights and the RoPE tables from
 python tools/extract_weights_assistant.py --model google/gemma-4-12B-it-assistant \
     --out artifacts/gemma4-12b-assistant/weights
 python tools/serve_api.py --model gemma4-spec --tokenizer google/gemma-4-12B-it \
-    --weights artifacts/gemma4-12b/weights \
+    --weights artifacts/gemma4-12b-qat-ident/weights \
     --assistant artifacts/gemma4-12b-assistant/weights --port 8000
 ```
 
@@ -90,7 +120,7 @@ levers, see [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured
 ```bash
 # Gemma (12B shown; 31B / 26B-A4B identical shape, no --golden needed)
 python tools/serve_api.py --model gemma4 --tokenizer google/gemma-4-12B-it \
-    --weights artifacts/gemma4-12b/weights --port 8000
+    --weights artifacts/gemma4-12b-qat-ident/weights --port 8000
 
 # Qwen plain (27B shown; 35B-A3B identical shape)
 python tools/serve_api.py --model qwen --tokenizer Qwen/Qwen3.5-27B \
