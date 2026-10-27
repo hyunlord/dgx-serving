@@ -36,6 +36,8 @@ def add_quant_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quant-c", type=float)
     parser.add_argument("--scale-dtype", choices=("fp32", "fp16"), default="fp32",
                         help="qat-ident: round scale before assigning q; rtn: cast scale after assigning q")
+    parser.add_argument("--scale-search", type=int, default=0, metavar="K",
+                        help="qat-ident fp16: minimize block SSE over rounded scale and K adjacent fp16 values each way")
 
 
 def validate_quant_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -50,13 +52,48 @@ def validate_quant_arguments(args: argparse.Namespace, parser: argparse.Argument
         parser.error("--quant-c applies only to positive-max")
     if args.quant not in ("rtn", "qat-ident") and args.scale_dtype != "fp32":
         parser.error("experimental quantization requires fp32 scales")
+    if args.scale_search < 0:
+        parser.error("--scale-search must be nonnegative")
+    if args.scale_search and (args.quant != "qat-ident" or args.scale_dtype != "fp16"):
+        parser.error("--scale-search requires --quant qat-ident --scale-dtype fp16")
+
+
+def search_fp16_scale(block: np.ndarray, rounded: np.ndarray, radius: int) -> tuple[np.ndarray, np.ndarray]:
+    """Try adjacent representable scales; exact ties keep the rounded scale first.
+
+    The order is rounded, lower 1, upper 1, lower 2, upper 2, ... .
+    Zero, nonfinite, and opposite-sign candidates are ineligible. All-zero
+    blocks retain the existing smallest-positive-subnormal fallback scale.
+    """
+    selected = rounded.copy()
+    q = np.clip(np.rint(block / rounded[:, None]), -8, 7)
+    best = np.square((q * rounded[:, None]).astype(np.float64) - block).sum(axis=1)
+    lower = rounded.astype(np.float16)
+    upper = lower.copy()
+    for _ in range(radius):
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            lower = np.nextafter(lower, np.float16(-np.inf))
+            upper = np.nextafter(upper, np.float16(np.inf))
+        for adjacent in (lower, upper):
+            candidate = adjacent.astype(np.float32)
+            valid = np.isfinite(candidate) & (candidate != 0) & (np.signbit(candidate) == np.signbit(rounded))
+            safe = np.where(valid, candidate, rounded)
+            candidate_q = np.clip(np.rint(block / safe[:, None]), -8, 7)
+            error = np.square((candidate_q * safe[:, None]).astype(np.float64) - block).sum(axis=1)
+            improve = valid & (error < best)
+            selected[improve], q[improve], best[improve] = candidate[improve], candidate_q[improve], error[improve]
+    return selected, q
 
 
 def quantize_variant(w_2d: np.ndarray, mode: str = "rtn", rule: str | None = None,
-                     c: float | None = None, *, scale_dtype: str = "fp32") -> tuple[np.ndarray, np.ndarray]:
+                     c: float | None = None, *, scale_dtype: str = "fp32", scale_search: int = 0) -> tuple[np.ndarray, np.ndarray]:
     """Use a stored-scale grid for qat-ident; preserve legacy RTN post-casting."""
     if scale_dtype not in ("fp32", "fp16"):
         raise ValueError("scale_dtype must be fp32 or fp16")
+    if type(scale_search) is not int or scale_search < 0:
+        raise ValueError("scale_search must be a nonnegative integer")
+    if scale_search and (mode != "qat-ident" or scale_dtype != "fp16"):
+        raise ValueError("scale_search requires qat-ident with fp16 scales")
     if mode == "rtn":
         packed, scale = quantize_int4(w_2d)
         return packed, scale.astype(scale_dtype.replace("fp", "float"))
@@ -86,6 +123,8 @@ def quantize_variant(w_2d: np.ndarray, mode: str = "rtn", rule: str | None = Non
             if np.any(~np.isfinite(scale) | (scale == 0)):
                 raise ValueError("fp16 scale underflow or overflow in a nonzero block")
         q = np.clip(np.rint(block / scale[:, None]), -8, 7)
+        if scale_search:
+            scale, q = search_fp16_scale(block, scale, scale_search)
         if mode == "orig-clip":
             best = np.square((q * scale[:, None]).astype(np.float64) - block).sum(axis=1)
             selected = scale.copy()
@@ -210,7 +249,8 @@ def main():
         w = t.detach().cpu().float().contiguous().numpy().astype(np.float32)  # [OUT, IN]
         policy = args.quant if variant_projection(name) else "rtn"
         packed, scale = quantize_variant(w, policy, args.quant_rule, args.quant_c,
-                                        scale_dtype=args.scale_dtype)
+                                        scale_dtype=args.scale_dtype,
+                                        scale_search=args.scale_search if policy == "qat-ident" else 0)
         packed.tofile(os.path.join(args.out, name + "_q4.bin"))
         scale.tofile(os.path.join(args.out, name + "_scale.bin"))
         if args.quant != "rtn":
@@ -254,6 +294,10 @@ def main():
         if args.quant == "qat-ident" and args.scale_dtype == "fp16":
             manifest["quant_scale_rounding"] = "before_integer_assignment"
             manifest["lm_head_scale_rounding"] = "after_integer_assignment"
+        if args.scale_search:
+            manifest["quant_scale_search_ulp"] = args.scale_search
+            manifest["quant_scale_search_objective"] = "block_sse_float64"
+            manifest["quant_scale_search_tie_order"] = "rounded,lower1,upper1,lower2,upper2,..."
         with open(os.path.join(args.out, "quantization_report.json"), "x") as f:
             json.dump(quantization_report, f, indent=2)
     if args.scale_dtype == "fp16":

@@ -154,7 +154,8 @@ def main():
         w = t.detach().cpu().float().contiguous().numpy().astype(np.float32)
         policy = args.quant if variant_projection(fname) else "rtn"
         packed, scale = quantize_variant(w, policy, args.quant_rule, args.quant_c,
-                                        scale_dtype=args.scale_dtype)
+                                        scale_dtype=args.scale_dtype,
+                                        scale_search=args.scale_search if policy == "qat-ident" else 0)
         packed.tofile(os.path.join(args.out, fname + "_q4.bin"))
         if scale_fp16:
             scale.astype(np.float16).tofile(os.path.join(args.out, fname + "_scale.bin"))
@@ -219,6 +220,10 @@ def main():
         if args.quant == "qat-ident" and scale_fp16:
             manifest["quant_scale_rounding"] = "before_integer_assignment"
             manifest["lm_head_scale_rounding"] = "after_integer_assignment"
+        if args.scale_search:
+            manifest["quant_scale_search_ulp"] = args.scale_search
+            manifest["quant_scale_search_objective"] = "block_sse_float64"
+            manifest["quant_scale_search_tie_order"] = "rounded,lower1,upper1,lower2,upper2,..."
         with open(os.path.join(args.out, "quantization_report.json"), "x") as f:
             json.dump(quantization_report, f, indent=2)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
