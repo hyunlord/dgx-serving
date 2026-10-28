@@ -51,33 +51,41 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
 static int gd_amort=0;   // 1=프리필 MMQ/SB 매트멀. 기본0=plain gemv(golden 경로 무변경).
-static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4){
-    if(use_q4==2){ size_t n=(size_t)S*IN;
-        if(gd_cap<n){ if(gd_xq)cudaFree(gd_xq); if(gd_xs)cudaFree(gd_xs); if(gd_xsum)cudaFree(gd_xsum);
-            DK(cudaMalloc(&gd_xq,n)); DK(cudaMalloc(&gd_xs,(n/QBLK)*4)); DK(cudaMalloc(&gd_xsum,(n/QBLK)*4)); gd_cap=n; }
-        launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S);
-        static const bool mmq_prefill=[](){ const char* v=getenv("G4_MMQ_PREFILL"); return !v || strcmp(v,"0")!=0; }();
-        static const int mmq_min_s=[](){
-            int value=16;
-            if(const char* v=getenv("G4_MMQ_MIN_S")){
-                char* end=nullptr; errno=0;
-                const long parsed=strtol(v,&end,10);
-                if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
-                    value=parsed<16?16:(int)parsed;
-                else fprintf(stderr,"Invalid G4_MMQ_MIN_S=%s; using 16\n",v);
-            }
-            fprintf(stderr,"G4_MMQ_MIN_S=%d\n",value);
-            return value;
-        }();
-        if(mmq_prefill && gd_amort==1 && S>=mmq_min_s && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
-            launch_gemm_mmq_w4a8_auto(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype);
+static void g4d_reserve_quant(size_t n){
+    if(gd_cap<n){ if(gd_xq)cudaFree(gd_xq); if(gd_xs)cudaFree(gd_xs); if(gd_xsum)cudaFree(gd_xsum);
+        DK(cudaMalloc(&gd_xq,n)); DK(cudaMalloc(&gd_xs,(n/QBLK)*4)); DK(cudaMalloc(&gd_xsum,(n/QBLK)*4)); gd_cap=n; }
+}
+static bool g4d_mmq_prefill(){
+    static const bool enabled=[](){ const char* v=getenv("G4_MMQ_PREFILL"); return !v || strcmp(v,"0")!=0; }();
+    return enabled;
+}
+static int g4d_mmq_min_s(){
+    static const int min_s=[](){
+        int value=16;
+        if(const char* v=getenv("G4_MMQ_MIN_S")){
+            char* end=nullptr; errno=0;
+            const long parsed=strtol(v,&end,10);
+            if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
+                value=parsed<16?16:(int)parsed;
+            else fprintf(stderr,"Invalid G4_MMQ_MIN_S=%s; using 16\n",v);
+        }
+        fprintf(stderr,"G4_MMQ_MIN_S=%d\n",value);
+        return value;
+    }();
+    return min_s;
+}
+static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4, cudaStream_t stream){
+    if(use_q4==2){
+        launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S,stream);
+        if(g4d_mmq_prefill() && gd_amort==1 && S>=g4d_mmq_min_s() && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
+            launch_gemm_mmq_w4a8_auto(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
         } else if(gd_amort && S>1){  // 프리필: SB 커널로 weight 1회/≤16행 amortize(비-amortized plain gemv의 S× 재적재 제거).
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
             for(int s0=0;s0<S;s0+=16){ int sq=(S-s0<16)?(S-s0):16;
-                launch_gemv_w4a8_sb(gd_xq+(size_t)s0*IN, gd_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gd_sdtype); }
-        } else launch_gemv_w4a8(gd_xq,gd_xs,gd_xsum,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype);
-    } else if(use_q4) launch_gemm_tiled_q4(X,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype);
-    else              launch_gemv_f32(X,m.wf,Y,IN,OUT,S);
+                launch_gemv_w4a8_sb(gd_xq+(size_t)s0*IN, gd_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gd_sdtype,stream); }
+        } else launch_gemv_w4a8(gd_xq,gd_xs,gd_xsum,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype,stream);
+    } else if(use_q4) launch_gemm_tiled_q4(X,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
+    else              launch_gemv_f32(X,m.wf,Y,IN,OUT,S,stream);
 }
 
 void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
@@ -130,8 +138,22 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
     float *act=g4d_grow(scratch[14],capacity[14],(size_t)Sq*FFN);
     float *dn=g4d_grow(scratch[15],capacity[15],SH);
 
-    launch_embedding(d_tokens, w.embed, x, Sq, H);
-    if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,SH);
+    if(use_q4==2){
+        size_t max_in=(size_t)H;
+        if((size_t)FFN>max_in) max_in=FFN;
+        if((size_t)NQ*hd_max>max_in) max_in=(size_t)NQ*hd_max;
+        g4d_reserve_quant((size_t)Sq*max_in);
+        (void)g4d_mmq_prefill();
+        (void)g4d_mmq_min_s();
+    }
+    if(Sq==1 && c.num_layers>0)
+        attn_smem_guard((const void *)attn_decode_kernel,
+                        (size_t)(hd_max+base+Sq)*sizeof(float), "attn_decode", base+Sq);
+
+    // Reservation and host state changes remain outside the enqueue-only body.
+    auto enqueue=[&](cudaStream_t stream){
+    launch_embedding(d_tokens, w.embed, x, Sq, H, stream);
+    if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,SH,stream);
 
     for(int l=0;l<c.num_layers;l++){
         const G4Layer &L=w.layers[l];
@@ -141,48 +163,53 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
         const float *cosT=full?d_cos_f:d_cos_s, *sinT=full?d_sin_f:d_sin_s;
         const int window=full?0:c.sliding_window;
 
-        launch_rmsnorm(x, L.input_ln, norm, Sq, H, eps);
-        mm(L.q, norm, qb, H, qdim, Sq, use_q4);
-        launch_rmsnorm(qb, L.q_norm, qn, Sq*NQ, hd, eps);
-        launch_rope(qn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, NQ, hd);
-        mm(L.k, norm, kb, H, kvdim, Sq, use_q4);
+        launch_rmsnorm(x, L.input_ln, norm, Sq, H, eps, stream);
+        mm(L.q, norm, qb, H, qdim, Sq, use_q4, stream);
+        launch_rmsnorm(qb, L.q_norm, qn, Sq*NQ, hd, eps, stream);
+        launch_rope(qn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, NQ, hd, stream);
+        mm(L.k, norm, kb, H, kvdim, Sq, use_q4, stream);
         // One token writes its cache slice directly; kb remains raw for K-equals-V.
         float *kn_out=Sq==1?st.Kc[l]+(size_t)base*kvdim:kn;
         float *vn_out=Sq==1?st.Vc[l]+(size_t)base*kvdim:vn;
-        if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn_out, Sq*nkv, hd, eps);  // V=v_norm(k_proj), rope 전
-        else { mm(L.v, norm, vb, H, kvdim, Sq, use_q4); launch_rmsnorm_noscale(vb, vn_out, Sq*nkv, hd, eps); }
-        launch_rmsnorm(kb, L.k_norm, kn_out, Sq*nkv, hd, eps);
-        launch_rope(kn_out, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, nkv, hd);
+        if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn_out, Sq*nkv, hd, eps, stream);  // V=v_norm(k_proj), rope 전
+        else { mm(L.v, norm, vb, H, kvdim, Sq, use_q4, stream); launch_rmsnorm_noscale(vb, vn_out, Sq*nkv, hd, eps, stream); }
+        launch_rmsnorm(kb, L.k_norm, kn_out, Sq*nkv, hd, eps, stream);
+        launch_rope(kn_out, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, nkv, hd, stream);
         // Multi-token calls retain the scratch-to-cache append path.
         if(Sq!=1){
             DK(cudaMemcpy(st.Kc[l]+(size_t)base*kvdim, kn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
             DK(cudaMemcpy(st.Vc[l]+(size_t)base*kvdim, vn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
         }
         if(flash_prefill && Sq>=flash_min_s)
-            launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, 0, nullptr, ascale, window);
+            launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
         else
-            launch_attn_decode(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, 0, ascale, window);
-        mm(L.o, attn, ob, qdim, H, Sq, use_q4);
-        launch_rmsnorm(ob, L.post_attn_ln, tmp, Sq, H, eps);
-        launch_add(after, x, tmp, (int)SH);   // after = x + post_attn_ln(o_proj)
+            launch_attn_decode(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, ascale, window);
+        mm(L.o, attn, ob, qdim, H, Sq, use_q4, stream);
+        launch_rmsnorm(ob, L.post_attn_ln, tmp, Sq, H, eps, stream);
+        launch_add(after, x, tmp, (int)SH, stream);   // after = x + post_attn_ln(o_proj)
 
-        launch_rmsnorm(after, L.pre_ffn_ln, norm, Sq, H, eps);
-        mm(L.gate, norm, g, H, FFN, Sq, use_q4);
-        mm(L.up,   norm, u, H, FFN, Sq, use_q4);
-        launch_geglu(g, u, act, (size_t)Sq*FFN);
-        mm(L.down, act, dn, FFN, H, Sq, use_q4);
-        launch_rmsnorm(dn, L.post_ffn_ln, tmp, Sq, H, eps);
-        launch_add(x, after, tmp, (int)SH);
-        if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, SH);
+        launch_rmsnorm(after, L.pre_ffn_ln, norm, Sq, H, eps, stream);
+        mm(L.gate, norm, g, H, FFN, Sq, use_q4, stream);
+        mm(L.up,   norm, u, H, FFN, Sq, use_q4, stream);
+        launch_geglu(g, u, act, (size_t)Sq*FFN, stream);
+        mm(L.down, act, dn, FFN, H, Sq, use_q4, stream);
+        launch_rmsnorm(dn, L.post_ffn_ln, tmp, Sq, H, eps, stream);
+        launch_add(x, after, tmp, (int)SH, stream);
+        if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, SH, stream);
     }
 
     // pre-norm residual 노출(3관문 assistant hook): HF hidden_states[-1] == 마지막 층 출력(final-norm 전, 실측 확정)
-    if(d_prenorm) DK(cudaMemcpy(d_prenorm, x, SH*4, cudaMemcpyDeviceToDevice));
-    launch_rmsnorm(x, w.final_norm, norm, Sq, H, eps);
+    if(d_prenorm){
+        if(stream) DK(cudaMemcpyAsync(d_prenorm, x, SH*4, cudaMemcpyDeviceToDevice, stream));
+        else DK(cudaMemcpy(d_prenorm, x, SH*4, cudaMemcpyDeviceToDevice));
+    }
+    launch_rmsnorm(x, w.final_norm, norm, Sq, H, eps, stream);
     const float *hn = last_only ? norm+(size_t)(Sq-1)*H : norm;
     int rows = last_only ? 1 : Sq;
-    mm(w.lm_head, hn, d_logits, H, V, rows, use_q4);
-    if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)rows*V);
+    mm(w.lm_head, hn, d_logits, H, V, rows, use_q4, stream);
+    if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)rows*V, stream);
+    };
+    enqueue(0);
     if(commit) st.n_past += Sq;
     DK(cudaDeviceSynchronize());
 }
