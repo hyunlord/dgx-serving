@@ -11,12 +11,27 @@ import argparse
 import array
 import json
 import math
-import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
 
 Numbers: TypeAlias = dict[str, int | float]
+JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+
+
+def decode_json(text: str, decoder: Callable[[str], JsonValue] = json.loads) -> JsonValue:
+    """Bound the standard decoder result to the JSON value grammar."""
+    return decoder(text)
+
+
+class Arguments(argparse.Namespace):
+    reference: Path = Path()
+    candidate: Path = Path()
+    mode: str = "off"
+    request: int = 0
+    reference_summary: Path | None = None
+    candidate_summary: Path | None = None
 
 
 class GateFailure(RuntimeError):
@@ -33,12 +48,12 @@ class Run:
         """Parse exactly one requested summary row and finite numeric fields."""
         rows: list[Numbers] = []
         for line in self.summary.read_text().splitlines():
-            raw = json.loads(line)
+            raw = decode_json(line)
             if not isinstance(raw, dict):
                 raise GateFailure("summary row is not an object")
             parsed: Numbers = {}
             for key, value in raw.items():
-                if not isinstance(key, str) or isinstance(value, bool):
+                if isinstance(value, bool):
                     raise GateFailure("invalid summary field")
                 if not isinstance(value, (int, float)) or not math.isfinite(value):
                     raise GateFailure(f"nonfinite/nonnumeric summary field {key}")
@@ -136,13 +151,14 @@ def compare(reference: Run, candidate: Run, mode: str) -> Numbers:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--reference", type=Path, required=True)
-    parser.add_argument("--candidate", type=Path, required=True)
-    parser.add_argument("--mode", choices=("off", "v1", "overlap", "direct", "both"), required=True)
-    parser.add_argument("--request", type=int, default=0)
-    parser.add_argument("--reference-summary", type=Path)
-    parser.add_argument("--candidate-summary", type=Path)
-    args = parser.parse_args()
+    _ = parser.add_argument("--reference", type=Path, required=True)
+    _ = parser.add_argument("--candidate", type=Path, required=True)
+    _ = parser.add_argument("--mode", choices=("off", "v1", "overlap", "direct", "both"), required=True)
+    _ = parser.add_argument("--request", type=int, default=0)
+    _ = parser.add_argument("--reference-summary", type=Path)
+    _ = parser.add_argument("--candidate-summary", type=Path)
+    args = Arguments()
+    _ = parser.parse_args(namespace=args)
     try:
         result = compare(Run(args.reference, args.reference_summary or Path(str(args.reference) + ".summary.jsonl"), args.request),
                          Run(args.candidate, args.candidate_summary or Path(str(args.candidate) + ".summary.jsonl"), args.request), args.mode)
