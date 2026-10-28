@@ -83,6 +83,17 @@ static inline void launch_attn(const float *Q, const float *K, const float *V, f
 //   block=(query i, head h), blockDim=HD. dynamic shared: qs[HD] + scores[base+Sq] (>= 최대 attendlen).
 //   scale: 0 → 1/sqrt(HD) 기본. window: 0 → 무제한 causal; w>0 → sliding(key pos j ∈ [qpos-w+1, qpos]).
 //   (scale/window는 인자 — 모델 분기 아님. Gemma4 sliding/global 층에 config로 주입.)
+// Diagnostic only (R15 noise baseline): G4_ATTN_DIAG_REVERSE=1 sums the output over keys in
+// descending order in both decode kernels. Same math, different addition order. Default off.
+static __device__ int g_attn_diag_reverse = 0;
+static inline void attn_diag_init() {
+    static const bool done = []() {
+        const char *v = getenv("G4_ATTN_DIAG_REVERSE");
+        int on = (v && v[0] == '1') ? 1 : 0;
+        if (on) { cudaMemcpyToSymbol(g_attn_diag_reverse, &on, sizeof(int)); fprintf(stderr, "G4_ATTN_DIAG_REVERSE=1\n"); }
+        return true; }();
+    (void)done;
+}
 static __global__ void attn_decode_kernel(const float *Q, const float *Kc, const float *Vc, float *O,
                                    int Sq, int NQ, int NKV, int HD, int base, float scale, int window) {
     int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
@@ -116,7 +127,8 @@ static __global__ void attn_decode_kernel(const float *Q, const float *Kc, const
     // out[d] = Σ_j (scores[j]/sum) * Vc[j,kv,d]
     if (d < HD) {
         float acc = 0.f;
-        for (int j = lo; j < attendlen; j++) acc += scores[j] * Vc[((size_t)j * NKV + kv) * HD + d];
+        if (g_attn_diag_reverse) for (int j = attendlen - 1; j >= lo; j--) acc += scores[j] * Vc[((size_t)j * NKV + kv) * HD + d];
+        else for (int j = lo; j < attendlen; j++) acc += scores[j] * Vc[((size_t)j * NKV + kv) * HD + d];
         O[((size_t)i * NQ + h) * HD + d] = acc / ssum;
     }
 }
@@ -127,6 +139,7 @@ static inline void launch_attn_decode(const float *Q, const float *Kc, const flo
     dim3 grid(Sq, NQ);
     size_t shmem = (size_t)(HD + base + Sq) * sizeof(float);
     attn_smem_guard((const void *)attn_decode_kernel, shmem, "attn_decode", base + Sq);
+    attn_diag_init();
     float sc = (scale > 0.f) ? scale : rsqrtf((float)HD);
     attn_decode_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, HD, base, sc, window);
 }
@@ -166,7 +179,8 @@ static __global__ void attn_decode_batch_kernel(const float *Q, const float *Kc,
     __syncthreads();
     if (d < HD) {
         float acc = 0.f;
-        for (int j = lo; j < attendlen; j++) acc += scores[j] * Vcb[((size_t)j * NKV + kv) * HD + d];
+        if (g_attn_diag_reverse) for (int j = attendlen - 1; j >= lo; j--) acc += scores[j] * Vcb[((size_t)j * NKV + kv) * HD + d];
+        else for (int j = lo; j < attendlen; j++) acc += scores[j] * Vcb[((size_t)j * NKV + kv) * HD + d];
         O[((size_t)b * NQ + h) * HD + d] = acc / ssum;
     }
 }
@@ -177,6 +191,7 @@ static inline void launch_attn_decode_batch(const float *Q, const float *Kc, con
     dim3 grid(B, NQ);
     size_t shmem = (size_t)(HD + base + 1) * sizeof(float);   // base=최대 attendlen 커버
     attn_smem_guard((const void *)attn_decode_batch_kernel, shmem, "attn_decode_batch", base + 1);
+    attn_diag_init();
     float sc = (scale > 0.f) ? scale : rsqrtf((float)HD);
     attn_decode_batch_kernel<<<grid, HD, shmem, st>>>(Q, Kc, Vc, O, NQ, NKV, HD, base, kv_stride, sc, window, base_b);
 }
