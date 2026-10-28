@@ -47,20 +47,39 @@ python tools/extract_weights_qwen35.py \
     --quant qat-ident --quant-rule positive-max --quant-c 8.05 --scale-dtype fp32
 ```
 
-Pass `--weights artifacts/gemma4-12b-qat-ident/weights` to the Gemma server.
-The matching HF FP32 reference, restored from these engine q4 files, is
-`artifacts/gemma4-12b-qat/golden/`; the unchanged W4A8 test passes its existing
-`rel < 1.5e-2` and 5/5 argmax gates. Do not compare QAT weights to the old RTN golden.
-The assistant checkpoint is unchanged. The autotune profile and recipes still name
-RTN assets; select QAT paths explicitly until those configurations are updated separately.
+The recommended 12B serving weights use a **simple fp16 scale conversion with q fixed**:
 
-`qat-ident --scale-dtype fp16` is a distinct scale-first experiment: round each
-projection scale to fp16 **before** assigning integer q. `convert_scale_fp16.py`
-instead preserves q and casts only the scale afterward. Embedding/norm remain FP32;
-lm_head retains the legacy RTN rule (its scale is cast after q assignment).
-On the same 36-dialogue evaluation, scale-first fp16 produced PPL
-29.089064374088686 versus fp32 28.904909148350214 (+0.6371070906790344%),
-so it failed the <0.5% gate. Keep fp32 scales for the recommended QAT path.
+```bash
+python tools/convert_scale_fp16.py \
+    artifacts/gemma4-12b-qat-ident/weights \
+    artifacts/gemma4-12b-qat-ident-fp16/weights
+```
+
+Use a new destination. The converter rounds only `_scale.bin` files paired with
+`_q4.bin` to nearest fp16, sets manifest `scale_dtype=1`, and symlinks the q4 and
+other unchanged files. It does not search scales or reassign integer q. Keep the
+source directory: the converted directory depends on those symlinks.
+Pass `--weights artifacts/gemma4-12b-qat-ident-fp16/weights` to the Gemma server.
+The dedicated HF FP32 reference restored from these converted engine weights belongs in
+`artifacts/gemma4-12b-qat-fp16/golden/`; validate it with the unchanged W4A8 test
+(`rel < 1.5e-2`, argmax 5/5). R11 verification passed with worst reported rel
+1.134e-2 and argmax 5/5, the default 47-entry test suite passed (live-server
+degeneration check skipped), and all nine spec workload/K combinations matched greedy.
+Do not substitute the fp32-scale QAT or RTN golden.
+
+The fp32-scale alternative remains `artifacts/gemma4-12b-qat-ident/weights`, with
+its matching `artifacts/gemma4-12b-qat/golden/` reference. The assistant checkpoint
+is unchanged. The autotune profile and recipes still name RTN assets; select the
+recommended weight path explicitly until those configurations are updated separately.
+
+With MMQ and flash enabled, the simple conversion measured PPL
+29.069840843282211 on the fixed 36-dialogue evaluation and improved decode in all
+five alternating pairs (see [performance.md §3f](./performance.md#3f-단순-fp16-스케일-기본-경로-2026-10-28)).
+`qat-ident --scale-dtype fp16` is a different, scale-first extraction option: it
+rounds each projection scale **before** assigning q. It is not the conversion
+command above. Its historical flash-OFF PPL 29.089064374088686 versus fp32
+28.904909148350214 failed the then-required <0.5% gate; that result remains recorded.
+Embedding/norm remain FP32, and lm_head retains the legacy RTN q assignment.
 
 ### Gemma family — RTN alternative, 31B dense and 26B-A4B MoE
 
@@ -106,7 +125,7 @@ The spec daemon reads both the `mtp_*.bin` head weights and the RoPE tables from
 python tools/extract_weights_assistant.py --model google/gemma-4-12B-it-assistant \
     --out artifacts/gemma4-12b-assistant/weights
 python tools/serve_api.py --model gemma4-spec --tokenizer google/gemma-4-12B-it \
-    --weights artifacts/gemma4-12b-qat-ident/weights \
+    --weights artifacts/gemma4-12b-qat-ident-fp16/weights \
     --assistant artifacts/gemma4-12b-assistant/weights --port 8000
 ```
 
@@ -120,7 +139,7 @@ levers, see [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured
 ```bash
 # Gemma (12B shown; 31B / 26B-A4B identical shape, no --golden needed)
 python tools/serve_api.py --model gemma4 --tokenizer google/gemma-4-12B-it \
-    --weights artifacts/gemma4-12b-qat-ident/weights --port 8000
+    --weights artifacts/gemma4-12b-qat-ident-fp16/weights --port 8000
 
 # Qwen plain (27B shown; 35B-A3B identical shape)
 python tools/serve_api.py --model qwen --tokenizer Qwen/Qwen3.5-27B \
@@ -145,7 +164,7 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   previous SB path. `G4_MMQ_MIN_S` selects the minimum row count (default 16; smaller values clamp
   to 16; invalid values fall back to 16). Decode and non-amortized calls retain their existing paths.
   `tools/bench_gemma4` now defaults to amortized prefill; `BENCH_G4_AMORT=0` reproduces its prior
-  plain GEMV prefill path. This does not change scale dtype or adopt fp16 scales.
+  plain GEMV prefill path. This setting does not change the scale dtype selected by the weight manifest.
 - Dense Gemma prefill attention uses flash by default. Set `G4_FLASH_PREFILL=0` to restore
   fp32 attention. `G4_FLASH_MIN_S` sets the minimum query count (default 16; values below 16
   clamp to 16; invalid values fall back to 16). KV storage remains fp32; flash converts inputs
