@@ -16,7 +16,7 @@ TEST_SRCS := $(filter-out tests/test_27b.cu tests/test_gdn_27b.cu tests/test_att
              tests/test_35b.cu tests/test_gdn_35b.cu tests/test_moe_expert.cu tests/test_rope_gen.cu tests/test_chunk_prefill.cu \
              tests/test_gemma4.cu tests/test_gemma4_decode.cu tests/test_gemma4_gen.cu tests/test_gemma4_batch.cu tests/test_gemma4_ragged.cu tests/test_gemma4_prefill_slot.cu tests/test_gemma4_verify.cu tests/test_gemma4_assistant.cu tests/test_gemma4_spec_e2e.cu tests/test_gemma4_moe.cu tests/test_gemma4_moe_golden.cu tests/test_gemma4_moe_router_iso.cu \
              tests/test_gemma4_moe_path_diagnostic.cu tests/test_gemma4_decode_capture.cu \
-             tests/test_attn_decode_split.cu \
+             tests/test_attn_decode_split.cu tests/test_gemma4_batch_iso.cu \
              tests/test_long_ctx.cu tests/test_treeamort.cu tests/test_treespec.cu tests/test_treespec_depth.cu, $(wildcard tests/*.cu))
 TEST_BINS := $(TEST_SRCS:.cu=)
 
@@ -31,6 +31,9 @@ tests/test_smollm3: tests/test_smollm3.cu models/smollm3.cu runtime/weights.cu $
 
 tests/test_qwen35: tests/test_qwen35.cu models/qwen35.cu runtime/weights_qwen.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_qwen35.cu models/qwen35.cu runtime/weights_qwen.cu -o $@
+
+tests/test_gemma4_batch_iso: tests/test_gemma4_batch_iso.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tests/test_gemma4_batch_iso.cu models/gemma4_decode.cu models/gemma4_batch.cu runtime/weights_gemma4.cu -o $@
 
 # R15 split-KV decode attention gates (manual: fp64 CPU reference up to 32768 keys, ~1.5 GB GPU).
 tests/test_attn_decode_split: tests/test_attn_decode_split.cu $(HEADERS)
