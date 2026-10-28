@@ -40,6 +40,30 @@ struct Gemma4OnlineBackend : OnlineBackend {
         else    gemma4_decode_batch(c,w,*s,d_tok,d_cf,d_sf,d_cs,d_ss,d_logit,0,uq,d_pos,hp.data());       // 31B(ragged 슬롯 독립)
     }
     void  logits_to_host(float* h_dst, int rows) override { CK(cudaMemcpy(h_dst, d_logit, (size_t)rows*V*4, cudaMemcpyDeviceToHost)); }
+
+    // 단일 스트림 fast-path: 슬롯 b KV 서브영역(=단일 시퀀스 KV, prefill_batch_slot과 같은 뷰)에서
+    //   gemma4_generate(S=1, G4_CUDA_GRAPH 0/1/2). dense 전용(MoE는 배치 경로 유지).
+    bool single_stream() const override { return !moe; }
+    struct Relay { int (*on_step)(int, void*); void* opaque; };
+    static int relay(const float*, int token, int, void* o){ Relay* r=(Relay*)o; return r->on_step(token, r->opaque); }
+    int generate_single(void* st, int b, int pos, int first, int max_steps,
+                        int (*on_step)(int, void*), void* opaque, SingleStats* stats) override {
+        G4BatchState* s=(G4BatchState*)st;
+        std::vector<float*> kv(2*(size_t)s->L);
+        G4DecodeState view{}; view.n_past=pos; view.max_len=s->max_len; view.L=s->L; view.kv_cap=s->kv_cap;
+        view.Kc=kv.data(); view.Vc=kv.data()+s->L;
+        const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
+        const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
+        for(int l=0;l<s->L;l++){
+            const int full=c.layer_is_full?c.layer_is_full[l]:1;
+            const size_t stride=(size_t)s->max_len*(full?nkv_f*hd_f:nkv_s*hd_s);   // gemma4_batch.cu kv_stride
+            view.Kc[l]=s->Kc[l]+(size_t)b*stride; view.Vc[l]=s->Vc[l]+(size_t)b*stride;
+        }
+        Relay r{on_step, opaque}; G4GenerationStats gs;
+        const int accepted=gemma4_generate(c,w,view,first,max_steps,-1,d_cf,d_sf,d_cs,d_ss,uq,&relay,&r,&gs);
+        if(stats){ stats->executed=gs.executed_steps; stats->accepted=gs.accepted_steps; stats->speculative=gs.speculative_steps; }
+        return accepted;
+    }
 };
 
 int main(int argc,char**argv){

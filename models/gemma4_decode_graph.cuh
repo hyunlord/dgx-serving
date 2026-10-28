@@ -138,17 +138,19 @@ static std::vector<G4GraphPatch> g4g_map(cudaGraph_t graph,const ModelConfig &c,
 int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
         int first_token,int max_steps,int eos_token,const float *cf,const float *sf,
         const float *cs,const float *ss,int use_q4,G4GenerationCallback callback,
-        void *opaque,G4GenerationStats *result_stats){
+        void *opaque,G4GenerationStats *result_stats,unsigned flags){
     G4GenerationStats stats;
     g4g_require(max_steps>=0 && first_token>=0 && first_token<c.vocab_size,"generation input");
     g4g_require(st.n_past>=0 && max_steps<=st.max_len-st.n_past,"generation capacity");
     if(!max_steps){if(result_stats)*result_stats=stats;return 0;}
     int start=st.n_past,V=c.vocab_size;
     const char *mode=getenv("G4_CUDA_GRAPH");bool v2=mode && strcmp(mode,"2")==0;
-    auto option=[](const char *name){const char *v=getenv(name);return !v || strcmp(v,"0")!=0;};
-    bool overlap=v2 && option("G4_GRAPH_OVERLAP"),direct=v2 && option("G4_GRAPH_NODE_UPDATE");
-    float *logits=nullptr,*snapshots[2]={};int *token=nullptr,*out=nullptr,*host=nullptr;
-    DK(cudaMalloc(&logits,(size_t)V*4));DK(cudaMalloc(&token,sizeof(int)));
+    // v2 = overlap by default (fastest measured R13 configuration); node updates are opt-in.
+    auto option=[](const char *name,bool fallback){const char *v=getenv(name);return v?strcmp(v,"0")!=0:fallback;};
+    bool overlap=v2 && option("G4_GRAPH_OVERLAP",true),direct=v2 && option("G4_GRAPH_NODE_UPDATE",false);
+    const bool fixed=(flags&G4_GENERATE_FIXED_INPUT)!=0;
+    float *logits=nullptr,*snapshots[2]={};int *token=nullptr,*out=nullptr,*host=nullptr,*sink=nullptr;
+    DK(cudaMalloc(&logits,(size_t)V*4));DK(cudaMalloc(&token,sizeof(int)));DK(cudaMalloc(&sink,sizeof(int)));
     DK(cudaMalloc(&out,2*sizeof(int)));DK(cudaMallocHost(&host,2*sizeof(int)));
     DK(cudaMemcpy(token,&first_token,sizeof(int),cudaMemcpyHostToDevice));
     std::vector<float> host_logits(V);
@@ -160,9 +162,9 @@ int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
             for(float v:host_logits)g4g_require(std::isfinite(v),"nonfinite logits");
             int next=(int)(std::max_element(host_logits.begin(),host_logits.end())-host_logits.begin());
             ++stats.executed_steps;++stats.accepted_steps;
-            if(callback)callback(logits,next,i,opaque);
-            if(next==eos_token)break;
-            DK(cudaMemcpy(token,&next,sizeof(int),cudaMemcpyHostToDevice));
+            const int stop=callback?callback(logits,next,i,opaque):0;
+            if(next==eos_token || stop)break;
+            if(!fixed)DK(cudaMemcpy(token,&next,sizeof(int),cudaMemcpyHostToDevice));
         }
         stats.planned_captures=g4d_graph_totals.planned_captures-before.planned_captures;
         stats.graph_updates=g4d_graph_totals.graph_updates-before.graph_updates;
@@ -190,7 +192,7 @@ int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
             DK(enqueue(capture,position,token,logits));
             if(overlap){
                 g4g_snapshot<<<(V+255)/256,256,0,capture>>>(logits,snapshots[slot],V);
-                g4g_argmax<<<1,256,0,capture>>>(logits,V,token,out+slot);
+                g4g_argmax<<<1,256,0,capture>>>(logits,V,fixed?sink:token,out+slot);
             }
             DK(cudaGetLastError());DK(cudaStreamEndCapture(capture,&graph));
             if(mapping_fallback)++stats.fallback_recaptures;else ++stats.planned_captures;stats.capture_us+=us(begin,Clock::now());return graph;
@@ -262,10 +264,10 @@ int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
                 next=(int)(std::max_element(host_logits.begin(),host_logits.end())-host_logits.begin());
             }
             ++stats.accepted_steps;st.n_past=start+(int)stats.accepted_steps;
-            if(callback)callback(overlap?snapshots[slot]:logits,next,i,opaque);
-            if(next==eos_token)break;
+            const int stop=callback?callback(overlap?snapshots[slot]:logits,next,i,opaque):0;
+            if(next==eos_token || stop)break;
             if(!overlap && i+1<max_steps){
-                DK(cudaMemcpyAsync(token,&next,sizeof(int),cudaMemcpyHostToDevice,execute));
+                if(!fixed)DK(cudaMemcpyAsync(token,&next,sizeof(int),cudaMemcpyHostToDevice,execute));
                 DK(cudaStreamSynchronize(execute));prepare(i+1);launch(i+1);
             }
         }
@@ -275,7 +277,7 @@ int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
         for(int j=0;j<2;++j){if(exec[j])DK(cudaGraphExecDestroy(exec[j]));DK(cudaEventDestroy(done[j]));DK(cudaFree(snapshots[j]));}
         if(retained)DK(cudaGraphDestroy(retained));DK(cudaStreamDestroy(capture));DK(cudaStreamDestroy(execute));
     }
-    DK(cudaFree(logits));DK(cudaFree(token));DK(cudaFree(out));DK(cudaFreeHost(host));
+    DK(cudaFree(logits));DK(cudaFree(token));DK(cudaFree(sink));DK(cudaFree(out));DK(cudaFreeHost(host));
     if(result_stats)*result_stats=stats;
     if(const char *v=getenv("G4_CUDA_GRAPH_STATS"))if(strcmp(v,"0")!=0)
         fprintf(stderr,"G4_GENERATION_STATS planned_captures=%llu fallback_recaptures=%llu node_updates=%llu graph_updates=%llu mapping_fallbacks=%llu instantiations=%llu reinstantiations=%llu update_failures=%llu setparams_failures=%llu executed_steps=%llu accepted_steps=%llu speculative_steps=%llu capture_us=%.6f update_us=%.6f\n",stats.planned_captures,stats.fallback_recaptures,stats.node_updates,stats.graph_updates,stats.mapping_fallbacks,stats.instantiations,stats.reinstantiations,stats.update_failures,stats.setparams_failures,stats.executed_steps,stats.accepted_steps,stats.speculative_steps,stats.capture_us,stats.update_us);

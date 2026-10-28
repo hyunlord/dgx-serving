@@ -7,6 +7,9 @@
 //   ★정확성 불변: 온라인 배칭이 각 요청 계산 안 바꿈 — 슬롯 격리(ragged decode 독립). 동시 N == 단독 bit-id(test_serve_online).
 //   프로토콜(태그드): stdin "<req_id> <max_tokens> [SMPL <temp> <topp> <repp> <seed>] <id0> ..." / "SHUTDOWN".
 //     stdout "<req_id> <tok>" / "<req_id> END"(single-writer). SMPL 없음(기본) = greedy(기존 프로토콜·경로 그대로).
+//   단일 스트림 fast-path(G4_SERVE_FASTPATH, 기본 1): 활성 요청 1개·greedy·대기 큐 빔이면 backend의
+//     generate_single로 S=1 생성 세션을 돌리고, 새 요청이 오면 그 스텝 뒤 배치 루프로 돌아온다.
+//     ★backend가 보장: fast-path 토큰·KV == 배치 W=1 경로(R14 게이트 2b·2c) → 전환 시점과 무관한 출력.
 //   ★샘플링은 서빙 옵션(호스트 로직·D2H는 원래 하던 것): 검증/게이트는 greedy 경로(SMPL 미주입)로 불변.
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +25,7 @@
 #include <algorithm>
 #include <random>
 #include <condition_variable>
+#include <functional>
 
 // 모델-중립 backend 훅(실서빙용 — bench ServingBackend는 dummy-prompt·logit 미노출이라 별도).
 //   backend가 모든 device op 소유. 루프는 host logit(logits_to_host 후 argmax)만 만짐.
@@ -37,6 +41,13 @@ struct OnlineBackend {
     virtual void  prefill_ids(void* st, int b, const int* h_ids, int P) = 0;
     // 활성 Bmax 슬롯 1 decode 스텝(ragged — 슬롯별 위치 h_pos[b]). logits[0:Bmax*V] 기록(슬롯별 row).
     virtual void  decode_step(void* st, const int* h_toks, const int* h_pos, int Bmax) = 0;
+    // 선택: 슬롯 b 단일 스트림 greedy 생성(입력 first, 위치 pos부터 최대 max_steps). 채택된 스텝마다
+    //   on_step(token, opaque) 호출, 0이 아니면 그 스텝 뒤 종료(미리 제출된 뒤 스텝은 backend가 drain).
+    //   반환 = 채택 스텝 수. 채택 스텝의 토큰·슬롯 KV는 decode_step(W=1) 경로와 비트 동일해야 한다.
+    struct SingleStats { unsigned long long executed=0, accepted=0, speculative=0; };
+    virtual bool  single_stream() const { return false; }
+    virtual int   generate_single(void* st, int b, int pos, int first, int max_steps,
+                                  int (*on_step)(int, void*), void* opaque, SingleStats* stats) { return 0; }
     // 최근 logit rows개(V씩)를 host로 D2H 복사(backend가 cuda 소유 — 루프는 순수 host). prefill 후 rows=1, decode 후 rows=Bmax.
     virtual void  logits_to_host(float* h_dst, int rows) = 0;
 };
@@ -47,7 +58,9 @@ namespace serving_online_detail {
                  float temp=0.f, topp=1.f, repp=1.f; unsigned long long seed=0; };
     struct Slot { long req=-1; int pos=0; int gen=0; int max_tokens=0; int last=0;   // req<0 = free
                   float temp=0.f, topp=1.f, repp=1.f;                                // 샘플러(요청별)
-                  std::mt19937_64 rng; std::vector<int> hist; };                     // seed-결정 RNG·생성 이력(반복 페널티)
+                  std::mt19937_64 rng; std::vector<int> hist;                        // seed-결정 RNG·생성 이력(반복 페널티)
+                  int fast_steps=0, batch_steps=0, fast_entries=0;                   // 경로 카운터(로그)
+                  unsigned long long fast_tail=0; };
 }
 
 // 모델-중립 온라인 daemon 루프. be=구성된 backend(weight 로드 완료), Bmax=동시 활성 슬롯 상한.
@@ -74,6 +87,9 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
 
     // 비동기 stdin reader(스레드 안전 큐). 메인 배치 루프가 스텝 경계에서 drain.
     std::deque<Req> queue; std::mutex mtx; std::condition_variable cv; std::atomic<bool> shutdown{false};
+    const char* fast_env = getenv("G4_SERVE_FASTPATH");
+    const bool fastpath = be.single_stream() && !(fast_env && std::string(fast_env) == "0");
+    unsigned long long n_fast_req=0, n_batch_req=0, n_switch=0, n_tail=0;
     std::thread reader([&]{
         std::string line;
         while(std::getline(std::cin, line)){
@@ -141,6 +157,16 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
     };
     auto n_active = [&](){ int a=0; for(int b=0;b<Bmax;b++) if(slot[b].req>=0)a++; return a; };
     auto is_stop = [&](int t){ for(int s:stop_ids) if(t==s) return true; return false; };  // EOS 집합(config 주도)
+    // 요청 종료(프로토콜 END 그대로) + 경로 카운터 로그(stderr — 프로토콜 무관).
+    auto finish = [&](Slot& s, const char* reason){
+        printf("%ld END %s\n", s.req, reason); fflush(stdout);
+        if(s.fast_steps) ++n_fast_req; else ++n_batch_req;
+        fprintf(stderr,"[online] PATH req=%ld reason=%s fast_steps=%d batch_steps=%d fast_entries=%d fast_tail=%llu sampling=%d totals_fast_req=%llu totals_batch_req=%llu totals_switch=%llu totals_tail=%llu\n",
+                s.req,reason,s.fast_steps,s.batch_steps,s.fast_entries,s.fast_tail,s.temp>0.f?1:0,n_fast_req,n_batch_req,n_switch,n_tail);
+        s=Slot();
+    };
+    auto pending = [&](long){ std::lock_guard<std::mutex> lk(mtx); return !queue.empty(); };
+    struct FastCtx { std::function<int(int)> fn; static int call(int t, void* o){ return ((FastCtx*)o)->fn(t); } };
 
     while(true){
         // 1) admit: 대기 큐 → free slot(스텝 경계). prefill(슬롯 KV) + 첫 토큰(prefill 마지막 logit argmax).
@@ -168,16 +194,43 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
                 sl.last=first;
                 if(sl.temp>0.f) sl.hist.push_back(first);
                 if(r.max_tokens>0 && is_stop(first)){        // 첫 토큰이 EOS = 빈 응답(즉시 종료·토큰 미출력)
-                    printf("%ld END stop\n", r.id); fflush(stdout); slot[b]=Slot();
+                    finish(slot[b],"stop");
                 } else {
                     if(r.max_tokens>0){ printf("%ld %d\n", r.id, first); fflush(stdout); slot[b].gen=1; }
-                    if(slot[b].req>=0 && slot[b].gen>=slot[b].max_tokens){ printf("%ld END length\n", r.id); fflush(stdout); slot[b]=Slot(); }
+                    if(slot[b].req>=0 && slot[b].gen>=slot[b].max_tokens) finish(slot[b],"length");
                 }
                 lk.lock();
             }
         }
         int A=n_active();
         if(A==0){ if(shutdown){ std::lock_guard<std::mutex> lk(mtx); if(queue.empty()) break; } continue; }
+
+        // 2a) 단일 스트림 fast-path: 활성 1개·greedy·대기 없음. 스텝 처리는 아래 3)과 같은 규칙(EOS·길이 종료).
+        //     새 요청이 생기면 그 스텝 뒤 멈추고 배치 루프로 복귀(슬롯 pos/last가 이어받음).
+        if(fastpath && A==1){
+            int b=0; while(slot[b].req<0) ++b;
+            Slot& s=slot[b];
+            const int room=std::min(s.max_tokens-s.gen, (maxlen-1)-s.pos);
+            if(s.temp<=0.f && room>0 && !pending(s.req)){
+                const char* why="limit";
+                FastCtx ctx{[&](int next)->int{
+                    ++s.fast_steps;
+                    if(is_stop(next)){ why="stop"; finish(s,"stop"); return 1; }
+                    printf("%ld %d\n", s.req, next); fflush(stdout);
+                    s.last=next; s.pos++; s.gen++;
+                    if(s.gen>=s.max_tokens || s.pos>=maxlen-1){ why="length"; finish(s,"length"); return 1; }
+                    if(pending(s.req)){ why="switch"; return 1; }
+                    return 0; }};
+                const long req=s.req; const int start=s.pos; ++s.fast_entries;
+                OnlineBackend::SingleStats ss;
+                be.generate_single(st, b, s.pos, s.last, room, &FastCtx::call, &ctx, &ss);
+                n_tail+=ss.speculative; if(s.req==req) s.fast_tail+=ss.speculative;
+                if(std::string(why)=="switch") ++n_switch;
+                fprintf(stderr,"[online] FASTPATH req=%ld start_pos=%d accepted=%llu executed=%llu tail=%llu exit=%s\n",
+                        req,start,ss.accepted,ss.executed,ss.speculative,why);
+                continue;
+            }
+        }
 
         // 2) decode 스텝: ★active-width(최대 active 슬롯+1까지만 forward — single-stream의 Bmax 전폭 낭비 제거).
         //    현재 admit이 b=0부터 채우므로 active는 앞쪽에 몰림. W=최대 active 인덱스+1.
@@ -192,12 +245,12 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
 
         // 3) 슬롯별 토큰 선택(greedy=argmax 그대로·샘플링=옵션) → 스트림 → 피드백 → 완료(슬롯 격리). active는 0..W-1.
         for(int b=0;b<W;b++){ Slot&s=slot[b]; if(s.req<0) continue;
-            int next=pick_row(b, s);
-            if(is_stop(next)){ printf("%ld END stop\n", s.req); fflush(stdout); s=Slot(); continue; }  // ★EOS: 토큰 미출력·종료(계산 불변 — 값 그대로 판정)
+            int next=pick_row(b, s); ++s.batch_steps;
+            if(is_stop(next)){ finish(s,"stop"); continue; }  // ★EOS: 토큰 미출력·종료(계산 불변 — 값 그대로 판정)
             printf("%ld %d\n", s.req, next); fflush(stdout);
             s.last=next; s.pos++; s.gen++;
             if(s.temp>0.f) s.hist.push_back(next);           // 반복 페널티 이력(샘플링 시에만 — greedy 무비용)
-            if(s.gen>=s.max_tokens || s.pos>=maxlen-1){ printf("%ld END length\n", s.req); fflush(stdout); s=Slot(); }
+            if(s.gen>=s.max_tokens || s.pos>=maxlen-1) finish(s,"length");
         }
     }
     shutdown=true; cv.notify_all();

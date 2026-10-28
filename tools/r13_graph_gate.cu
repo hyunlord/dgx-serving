@@ -61,7 +61,7 @@ struct Capture {
         if(full) logits=output(prefix+".logits.f32");
     }
 };
-static void capture(const float* d,int token,int step,void* opaque) {
+static int capture(const float* d,int token,int step,void* opaque) {
     auto& c=*static_cast<Capture*>(opaque);
     if(step!=static_cast<int>(c.tokens.size()) || token<0 || token>=c.vocab)
         throw std::runtime_error("callback step/token invalid");
@@ -77,6 +77,7 @@ static void capture(const float* d,int token,int step,void* opaque) {
             throw std::runtime_error("logits write failed");
     }
     c.inputs.push_back(c.next); c.tokens.push_back(token); c.next=token;
+    return 0;
 }
 static void save_ids(FILE* f,const std::vector<int>& ids) {
     if(fwrite(ids.data(),sizeof(int32_t),ids.size(),f)!=ids.size()) throw std::runtime_error("token write failed");

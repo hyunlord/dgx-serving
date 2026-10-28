@@ -48,18 +48,23 @@ void gemma4_decode_step(const ModelConfig &c, const G4Weights &w, G4DecodeState 
 
 // Serialized generation session. The callback must consume logits before returning;
 // it must not re-enter any Gemma operation using the shared scratch buffers.
+// A nonzero callback return ends generation after that (accepted) step, exactly like
+// eos_token: an already submitted successor is drained and st.n_past = start + accepted.
+// G4_GENERATE_FIXED_INPUT feeds first_token at every step (benchmark input policy);
+// the selected token is still reported to the callback.
 struct G4GenerationStats {
     unsigned long long planned_captures=0, fallback_recaptures=0, node_updates=0, graph_updates=0, mapping_fallbacks=0;
     unsigned long long instantiations=0, reinstantiations=0, update_failures=0, setparams_failures=0;
     unsigned long long executed_steps=0, accepted_steps=0, speculative_steps=0;
     double capture_us=0, update_us=0;
 };
-using G4GenerationCallback = void (*)(const float *d_logits, int token, int step, void *opaque);
+using G4GenerationCallback = int (*)(const float *d_logits, int token, int step, void *opaque);
+enum : unsigned { G4_GENERATE_FIXED_INPUT = 1u };
 int gemma4_generate(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    int first_token, int max_steps, int eos_token,
                    const float *cf, const float *sf, const float *cs, const float *ss,
                    int use_q4, G4GenerationCallback callback, void *opaque,
-                   G4GenerationStats *stats=nullptr);
+                   G4GenerationStats *stats=nullptr, unsigned flags=0);
 int gemma4_graph_argmax_test();
 
 // ---- Batch decode (A-3-2): B슬롯 동시. same-length(모든 슬롯 위치 base 공통) — ragged/chunked는 A-3 후속. ----

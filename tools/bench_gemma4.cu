@@ -3,6 +3,13 @@
 //   decode t/s = matmul/대역폭 바운드(roofline 17.4 관련): n_past=0부터 ngen 스텝(attention over ≤ngen keys=미미) 타이밍.
 //   ★warm 프로토콜: 고정 워밍 런(throwaway) 후 본 측정. B 스윕 전 메모리 예산 가드(unified 크래시 방지).
 //   사용법: ./bench_gemma4 <weights_dir> [uq=1] [ctx=256] [ngen=64] [B,...]
+//   single decode 입력(env): BENCH_G4_DECODE_INPUT=fixed(기본: 토큰1 반복)|greedy(argmax 피드백),
+//     BENCH_G4_DEPTH=d(기본0: 프리필로 KV를 d까지 채운 뒤 n_past=d부터 ngen 스텝), BENCH_G4_SINGLE_UQ=2(해당 uq만).
+//     G4_CUDA_GRAPH=0/1: fixed는 기존 gemma4_decode_step 루프(cudaEvent 구간), greedy는 gemma4_generate(호스트 argmax).
+//     G4_CUDA_GRAPH=2: gemma4_generate v2(fixed는 G4_GENERATE_FIXED_INPUT — 매 스텝 입력 토큰1, argmax는 계산만).
+//     gemma4_generate 측정 구간 = 호출 전체(스트림·버퍼 준비 포함, R13 하네스와 같은 회계).
+//     BENCH_G4_DUMP_LOGITS=<prefix>: 측정 스텝마다 전체 logits를 <prefix>.uq<N>.f32에 기록(정확성 게이트 전용 —
+//     D2H·파일 쓰기가 들어가므로 이 실행의 시간은 속도 결과에 쓰지 않는다).
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -77,7 +84,15 @@ int main(int argc,char**argv){
     const int V=c.vocab_size;
     const int hd_s=c.head_dim, hd_f=c.global_head_dim?c.global_head_dim:hd_s;
     int Bmax=0; for(int b:Bs) if(b>Bmax)Bmax=b;
-    int MAXLEN=ctx+ngen+8;
+    const char* input_env=getenv("BENCH_G4_DECODE_INPUT");
+    const bool greedy_input=input_env && strcmp(input_env,"greedy")==0;
+    if(input_env && !greedy_input && strcmp(input_env,"fixed")!=0){ fprintf(stderr,"BENCH_G4_DECODE_INPUT must be fixed or greedy\n"); return 1; }
+    const int depth=getenv("BENCH_G4_DEPTH")?atoi(getenv("BENCH_G4_DEPTH")):0;
+    const int single_uq=getenv("BENCH_G4_SINGLE_UQ")?atoi(getenv("BENCH_G4_SINGLE_UQ")):0;
+    const char* graph_env=getenv("G4_CUDA_GRAPH");
+    const int graph_mode=graph_env?atoi(graph_env):0;
+    if(depth<0){ fprintf(stderr,"BENCH_G4_DEPTH must be >= 0\n"); return 1; }
+    int MAXLEN=(ctx>depth?ctx:depth)+ngen+8;
     printf("# Gemma4 bench: L=%d V=%d hd_f=%d hd_s=%d uq=%d(1=q4) ctx=%d ngen=%d MAXLEN=%d\n",
            c.num_layers,V,hd_f,hd_s,uq,ctx,ngen,MAXLEN);
     // dummy dual rope(타이밍용, 값 무관) — 올바른 모양 [MAXLEN, hd]
@@ -134,23 +149,68 @@ int main(int argc,char**argv){
     const char* decode_interval_env=getenv("BENCH_G4_DECODE_INTERVAL");
     const bool decode_interval=decode_interval_env && strcmp(decode_interval_env,"1")==0;
     auto decode_epoch=[](){ return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); };
+    printf("SINGLE_DECODE_MODE input=%s depth=%d graph=%d ngen=%d\n",greedy_input?"greedy":"fixed",depth,graph_mode,ngen);
     for(int sq : std::vector<int>{1,2}){   // 1=q4(검증), 2=W4A8(perf-preview)
+        if(single_uq && sq!=single_uq) continue;
         G4DecodeState st=alloc_g4_decode_state(c,MAXLEN); reset_g4_decode_state(st);
         int tok=1; int* d1; CK(cudaMalloc(&d1,4)); CK(cudaMemcpy(d1,&tok,4,cudaMemcpyHostToDevice));
+        // 깊이 d까지 KV 채우기: 토큰1 반복 프리필(2048 청크, MMQ·flash 프리필 경로), n_past=d.
+        auto fill_depth=[&](){
+            reset_g4_decode_state(st);
+            if(depth>0){
+                std::vector<int> ones(depth,1); int* dp; CK(cudaMalloc(&dp,(size_t)depth*4));
+                CK(cudaMemcpy(dp,ones.data(),(size_t)depth*4,cudaMemcpyHostToDevice));
+                for(int o=0;o<depth;o+=2048){ int n=depth-o<2048?depth-o:2048;
+                    gemma4_decode(c,w,st,dp+o,n,cf,sf,cs,ss,d_logit,1,sq,1,1); }
+                CK(cudaDeviceSynchronize()); cudaFree(dp);
+            }
+        };
+        const char* dump_env=getenv("BENCH_G4_DUMP_LOGITS");
+        FILE* dump=nullptr; std::vector<float> dump_row(V);
+        if(dump_env){ std::string dp=std::string(dump_env)+".uq"+std::to_string(sq)+".f32";
+            dump=fopen(dp.c_str(),"wbx"); if(!dump){ fprintf(stderr,"cannot create %s\n",dp.c_str()); return 1; } }
+        auto dump_step=[&](const float* d){ if(!dump) return;
+            CK(cudaMemcpy(dump_row.data(),d,(size_t)V*4,cudaMemcpyDeviceToHost));
+            if(fwrite(dump_row.data(),4,V,dump)!=(size_t)V){ fprintf(stderr,"dump write failed\n"); exit(1); } };
+        if(!is_moe && (greedy_input || graph_mode==2)){
+            // gemma4_generate 경로: 워밍 1회(같은 구성) 후 본 측정. 구간=호출 전체.
+            struct Dump { decltype(dump_step)* f; static int call(const float* d,int,int,void* o){ (*((Dump*)o)->f)(d); return 0; } };
+            Dump dctx{&dump_step};
+            auto noop=[](const float*,int,int,void*)->int{ return 0; };
+            const unsigned flags=greedy_input?0u:G4_GENERATE_FIXED_INPUT;
+            fill_depth(); { G4GenerationStats ws; gemma4_generate(c,w,st,1,8,-1,cf,sf,cs,ss,sq,noop,nullptr,&ws,flags); }
+            fill_depth();
+            G4GenerationStats gs;
+            const double gstart=decode_epoch(); const auto c0=std::chrono::steady_clock::now();
+            const int acc=dump?gemma4_generate(c,w,st,1,ngen,-1,cf,sf,cs,ss,sq,&Dump::call,&dctx,&gs,flags)
+                              :gemma4_generate(c,w,st,1,ngen,-1,cf,sf,cs,ss,sq,noop,nullptr,&gs,flags);
+            const auto c1=std::chrono::steady_clock::now(); const double gend=decode_epoch();
+            const double ms=std::chrono::duration<double,std::milli>(c1-c0).count(); const double ts=acc/(ms/1000.0);
+            printf("DECODE_INTERVAL uq=%d start=%.17g end=%.17g steps=%d milliseconds=%.17g token_per_second=%.17g input=%s depth=%d graph=%d accounting=gemma4_generate_wall executed=%llu planned_captures=%llu instantiations=%llu update_failures=%llu\n",
+                   sq,gstart,gend,acc,ms,ts,greedy_input?"greedy":"fixed",depth,graph_mode,gs.executed_steps,gs.planned_captures,gs.instantiations,gs.update_failures);
+            printf("  %-6s single decode: %.2f t/s (%.3f ms/%d스텝) — roofline %.1f 대비 %.1f%%  [generate %s]\n",
+                   sq==2?"W4A8":"q4", ts, ms, acc, single_roof, 100.0*ts/single_roof, greedy_input?"greedy":"fixed");
+            if(dump) fclose(dump);
+            cudaFree(d1); free_g4_decode_state(st);
+            continue;
+        }
+        fill_depth();
         for(int s=0;s<8;s++){ if(is_moe) gemma4_moe_decode(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1);
                               else       gemma4_decode_step(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1); }  // 워밍
-        CK(cudaDeviceSynchronize()); reset_g4_decode_state(st);
+        CK(cudaDeviceSynchronize()); fill_depth();
         const double decode_start=decode_interval?decode_epoch():0;
         CK(cudaEventRecord(t0));
         for(int s=0;s<ngen;s++){ if(is_moe) gemma4_moe_decode(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1);
-                                 else       gemma4_decode_step(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1); }
+                                 else       gemma4_decode_step(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1);
+                                 dump_step(d_logit); }
         CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
         const double decode_end=decode_interval?decode_epoch():0;
         double ms=ev(t0,t1); double ts=ngen/(ms/1000.0);
-        if(decode_interval) printf("DECODE_INTERVAL uq=%d start=%.17g end=%.17g steps=%d milliseconds=%.17g token_per_second=%.17g\n",
-                                  sq,decode_start,decode_end,ngen,ms,ts);
+        if(decode_interval) printf("DECODE_INTERVAL uq=%d start=%.17g end=%.17g steps=%d milliseconds=%.17g token_per_second=%.17g input=fixed depth=%d graph=%d accounting=cuda_event\n",
+                                  sq,decode_start,decode_end,ngen,ms,ts,depth,graph_mode);
         printf("  %-6s single decode: %.2f t/s (%.3f ms/%d스텝) — roofline %.1f 대비 %.1f%%  [검증 경로]\n",
                sq==2?"W4A8":"q4", ts, ms, ngen, single_roof, 100.0*ts/single_roof);
+        if(dump) fclose(dump);
         cudaFree(d1); free_g4_decode_state(st);
     }
 
