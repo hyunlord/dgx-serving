@@ -46,13 +46,14 @@ static int positive(const std::string &s) {
     errno=0; char *end=nullptr; long n=strtol(s.c_str(),&end,10);
     require(errno==0 && *end==0 && n>0 && n<=std::numeric_limits<int>::max(),"integer out of range"); return int(n);
 }
-struct Options { std::string weights,tokens,golden,dump,lengths,mask,save_ref,kld_ref; int window=1024,nwin=32,uq=2; bool position_stats=false; };
+struct Options { std::string weights,tokens,golden,dump,lengths,mask,save_ref,kld_ref; int window=1024,nwin=32,uq=2; bool position_stats=false,decode=false; };
 static Options parse(int argc,char **argv) {
     Options o; std::vector<std::string> seen;
     for(int i=1;i<argc;) {
         std::string key=argv[i++];
         require(std::find(seen.begin(),seen.end(),key)==seen.end(),"duplicate option "+key); seen.push_back(key);
         if(key=="--position-stats") { o.position_stats=true; continue; }
+        if(key=="--decode") { o.decode=true; continue; }
         require(i<argc,"every option requires a value"); std::string value=argv[i++];
         if(key=="--weights") o.weights=value;
         else if(key=="--tokens") o.tokens=value;
@@ -145,6 +146,8 @@ static void self_test() {
         return parse(int(argv.size()),argv.data());
     };
     require(options({"ppl","--weights","unused","--tokens","unused"}).uq==2,"default uq2");
+    require(!options({"ppl","--weights","unused","--tokens","unused"}).decode,"default prefill execution");
+    require(options({"ppl","--weights","unused","--tokens","unused","--decode"}).decode,"explicit valueless decode option");
     for(int uq:{1,2}) require(options({"ppl","--weights","unused","--tokens","unused","--uq",std::to_string(uq)}).uq==uq,"explicit uq option");
     const float uniform[]={0,0}; require(nll(uniform,2,1)==std::log(2.0),"uniform NLL");
     const float extreme[]={1000,-1000}; require(nll(extreme,2,1)==2000,"stable extreme NLL");
@@ -358,9 +361,14 @@ int main(int argc,char **argv) {
         const int length=lengths[win]; const int *input=tokens.data()+window_offset; reset_g4_decode_state(st);
         CK(cudaMemcpy(ids,input,mul(length,4),cudaMemcpyHostToDevice));
         CK(cudaDeviceSynchronize()); const double interval_start=epoch_seconds();
-        gemma4_decode(c,w,st,ids,length,cf,sf,cs,ss,logits,1,o.uq,0,1,nullptr);
+        if(o.decode) {
+            for(int p=0;p<length;++p)
+                gemma4_decode(c,w,st,ids+p,1,cf,sf,cs,ss,logits+mul(p,V),1,o.uq,0,0,nullptr);
+        } else {
+            gemma4_decode(c,w,st,ids,length,cf,sf,cs,ss,logits,1,o.uq,0,1,nullptr);
+        }
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize()); const double interval_end=epoch_seconds();
-        fprintf(stderr,"PPL_INTERVAL window=%d start=%.17g end=%.17g scope=gemma4_decode_prefill\n",win,interval_start,interval_end);
+        fprintf(stderr,"PPL_INTERVAL window=%d start=%.17g end=%.17g scope=%s\n",win,interval_start,interval_end,o.decode?"decode_teacher_forced":"gemma4_decode_prefill");
         require(st.n_past==length,"window reset/commit mismatch");
         double window_sum=0; size_t scored=0;
         for(int begin=0;begin<length;begin+=128) {
@@ -391,7 +399,9 @@ int main(int argc,char **argv) {
     free_g4_decode_state(st); free_weights_gemma4(w); free_config_gemma4(c);
     for(float *p:{logits,cf,sf,cs,ss}) CK(cudaFree(p)); CK(cudaFree(ids));
     const std::string model=fs::path(o.weights).lexically_normal().parent_path().filename().string();
-    std::ostringstream result; result<<std::setprecision(17)<<"{\"model\":"<<quote(model)<<",\"weights\":"<<quote(o.weights)<<",\"path\":"<<quote(o.uq==1?"Q4_F32":(mmq?"MMQ":"SB"))<<",\"uq\":"<<o.uq<<",\"scale_dtype\":"<<scale_dtype<<",\"nwin\":"<<o.nwin<<",\"ntok\":"<<total_tokens<<",\"mean_nll\":"<<mean<<",\"ppl\":"<<ppl<<",\"per_window_nll\":[";
-    for(size_t i=0;i<windows.size();++i) { if(i) result<<','; result<<windows[i]; } result<<"]"; reference.json(result); result<<"}";
+    std::ostringstream result; result<<std::setprecision(17)<<"{\"model\":"<<quote(model)<<",\"weights\":"<<quote(o.weights)<<",\"path\":"<<quote(o.decode?(o.uq==1?"Q4_DECODE":"W4A8_DECODE"):(o.uq==1?"Q4_F32":(mmq?"MMQ":"SB")))<<",\"uq\":"<<o.uq<<",\"scale_dtype\":"<<scale_dtype<<",\"nwin\":"<<o.nwin<<",\"ntok\":"<<total_tokens<<",\"mean_nll\":"<<mean<<",\"ppl\":"<<ppl<<",\"per_window_nll\":[";
+    for(size_t i=0;i<windows.size();++i) { if(i) result<<','; result<<windows[i]; } result<<"]";
+    if(o.decode) result<<",\"execution_mode\":\"teacher_forced_decode\"";
+    reference.json(result); result<<"}";
     puts(result.str().c_str()); return 0;
 }
