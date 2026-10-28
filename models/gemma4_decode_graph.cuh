@@ -68,12 +68,12 @@ static std::vector<cudaGraphNode_t> g4g_chain(cudaGraph_t graph){
     std::vector<cudaGraphNode_t> all(n),chain;
     DK(cudaGraphGetNodes(graph,all.data(),&n));
     cudaGraphNode_t root=nullptr;
-    for(auto node:all){size_t deps=0;DK(cudaGraphNodeGetDependencies(node,nullptr,&deps));
+    for(auto node:all){size_t deps=0;DK(cudaGraphNodeGetDependencies(node,nullptr,nullptr,&deps));
         G4_MAP_REQUIRE(deps<=1,"captured graph is not a chain");
         if(!deps){G4_MAP_REQUIRE(root==nullptr,"multiple graph roots");root=node;}}
     for(auto node=root;node;){chain.push_back(node);size_t count=0;
-        DK(cudaGraphNodeGetDependentNodes(node,nullptr,&count));G4_MAP_REQUIRE(count<=1,"branched graph");
-        cudaGraphNode_t next=nullptr;if(count)DK(cudaGraphNodeGetDependentNodes(node,&next,&count));node=next;}
+        DK(cudaGraphNodeGetDependentNodes(node,nullptr,nullptr,&count));G4_MAP_REQUIRE(count<=1,"branched graph");
+        cudaGraphNode_t next=nullptr;if(count)DK(cudaGraphNodeGetDependentNodes(node,&next,nullptr,&count));node=next;}
     G4_MAP_REQUIRE(chain.size()==n,"graph chain coverage");return chain;
 }
 
