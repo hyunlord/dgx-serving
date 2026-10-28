@@ -46,7 +46,8 @@ void gemma4_decode_step(const ModelConfig &c, const G4Weights &w, G4DecodeState 
                    float *d_logits, int commit, int use_q4, int last_only = 0, int amort_mm = 0,
                    float *d_prenorm = nullptr);
 
-// Serialized generation session. The callback must consume logits before returning;
+// Serialized generation session (G4_CUDA_GRAPH unset or 2 = Graph v2 overlap, 0 = eager, 1 = v1).
+// The callback must consume logits before returning;
 // it must not re-enter any Gemma operation using the shared scratch buffers.
 // A nonzero callback return ends generation after that (accepted) step, exactly like
 // eos_token: an already submitted successor is drained and st.n_past = start + accepted.

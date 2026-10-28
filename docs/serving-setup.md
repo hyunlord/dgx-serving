@@ -160,6 +160,15 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   `--bmax` (default 8) is the continuous-batching width. Long-context serving is a known limit
   (see [`performance.md`](./performance.md) §5).
 - Default quantization is W4A8 (`--uq 2`); `--uq 1` = q4. All measured serving coordinates are W4A8.
+- Dense Gemma: a lone greedy request decodes through the Graph v2 single-stream session (CUDA
+  graph overlap, device-side token feedback); it returns to the batch loop at the next step when
+  another request arrives. Outputs are bit-identical to the batch path. `G4_SERVE_FASTPATH=0` keeps
+  every request on the batch path; `G4_CUDA_GRAPH=0` runs the single-stream session eagerly.
+  Sampling requests (temperature > 0) always use the batch path.
+- `stop` (string or up to 4 strings) follows OpenAI semantics: the matched text is not returned and
+  `finish_reason` is `stop`. A stop match or a dropped streaming connection cancels the request on
+  the GPU (`CANCEL <id>` to the daemon); a dropped non-streaming connection is noticed only when the
+  response is written.
 - Dense Gemma W4A8 uses MMQ for amortized prefill by default. Set `G4_MMQ_PREFILL=0` to use the
   previous SB path. `G4_MMQ_MIN_S` selects the minimum row count (default 16; smaller values clamp
   to 16; invalid values fall back to 16). Decode and non-amortized calls retain their existing paths.

@@ -6,7 +6,7 @@
 //   single decode 입력(env): BENCH_G4_DECODE_INPUT=fixed(기본: 토큰1 반복)|greedy(argmax 피드백),
 //     BENCH_G4_DEPTH=d(기본0: 프리필로 KV를 d까지 채운 뒤 n_past=d부터 ngen 스텝), BENCH_G4_SINGLE_UQ=2(해당 uq만).
 //     G4_CUDA_GRAPH=0/1: fixed는 기존 gemma4_decode_step 루프(cudaEvent 구간), greedy는 gemma4_generate(호스트 argmax).
-//     G4_CUDA_GRAPH=2: gemma4_generate v2(fixed는 G4_GENERATE_FIXED_INPUT — 매 스텝 입력 토큰1, argmax는 계산만).
+//     G4_CUDA_GRAPH=2(미지정 기본): gemma4_generate v2(fixed는 G4_GENERATE_FIXED_INPUT — 매 스텝 입력 토큰1, argmax는 계산만).
 //     gemma4_generate 측정 구간 = 호출 전체(스트림·버퍼 준비 포함, R13 하네스와 같은 회계).
 //     BENCH_G4_DUMP_LOGITS=<prefix>: 측정 스텝마다 전체 logits를 <prefix>.uq<N>.f32에 기록(정확성 게이트 전용 —
 //     D2H·파일 쓰기가 들어가므로 이 실행의 시간은 속도 결과에 쓰지 않는다).
@@ -90,7 +90,7 @@ int main(int argc,char**argv){
     const int depth=getenv("BENCH_G4_DEPTH")?atoi(getenv("BENCH_G4_DEPTH")):0;
     const int single_uq=getenv("BENCH_G4_SINGLE_UQ")?atoi(getenv("BENCH_G4_SINGLE_UQ")):0;
     const char* graph_env=getenv("G4_CUDA_GRAPH");
-    const int graph_mode=graph_env?atoi(graph_env):0;
+    const int graph_mode=graph_env?atoi(graph_env):2;   // gemma4_generate 기본 = v2(G4_CUDA_GRAPH 미지정)
     if(depth<0){ fprintf(stderr,"BENCH_G4_DEPTH must be >= 0\n"); return 1; }
     int MAXLEN=(ctx>depth?ctx:depth)+ngen+8;
     printf("# Gemma4 bench: L=%d V=%d hd_f=%d hd_s=%d uq=%d(1=q4) ctx=%d ngen=%d MAXLEN=%d\n",

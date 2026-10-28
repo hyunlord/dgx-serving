@@ -144,7 +144,8 @@ int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
     g4g_require(st.n_past>=0 && max_steps<=st.max_len-st.n_past,"generation capacity");
     if(!max_steps){if(result_stats)*result_stats=stats;return 0;}
     int start=st.n_past,V=c.vocab_size;
-    const char *mode=getenv("G4_CUDA_GRAPH");bool v2=mode && strcmp(mode,"2")==0;
+    // Default (unset) = v2 overlap; G4_CUDA_GRAPH=0 = eager, 1 = per-step v1 capture.
+    const char *mode=getenv("G4_CUDA_GRAPH");bool v2=!mode || strcmp(mode,"2")==0;
     // v2 = overlap by default (fastest measured R13 configuration); node updates are opt-in.
     auto option=[](const char *name,bool fallback){const char *v=getenv(name);return v?strcmp(v,"0")!=0:fallback;};
     bool overlap=v2 && option("G4_GRAPH_OVERLAP",true),direct=v2 && option("G4_GRAPH_NODE_UPDATE",false);
