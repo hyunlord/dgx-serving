@@ -63,9 +63,9 @@ def gpu_processes() -> list[GPUProcess]:
 
 
 def approved(process: GPUProcess) -> bool:
-    if process.pid == 4363:
+    if process.pid == 5292:
         return process.name.endswith("/Xorg")
-    if process.pid == 4681:
+    if process.pid == 5349:
         return process.name.endswith("/gnome-shell")
     if process.pid == 2278032:
         return "/ComfyUI/" in process.name and Path(process.name).name.startswith("python")
@@ -264,7 +264,13 @@ def main() -> int:
         validate_gpu_log(gpu_path)
         clock_samples(clock_path)
         if not app_samples(apps_path):
-            raise ValueError("Application monitor did not capture resident baseline")
+            header = "pid, process_name, used_gpu_memory [MiB]"
+            rows = [row.strip() for row in apps_path.read_text().splitlines() if row.strip()]
+            current = gpu_processes()
+            graphics_only = all(p.name in ("/usr/lib/xorg/Xorg", "/usr/bin/gnome-shell") and approved(p) for p in current)
+            if rows != [header] or not graphics_only or current != baseline:
+                raise ValueError("Application monitor did not capture resident baseline")
+            result["empty_compute_baseline_verified"] = True
         if args.clock_gate:
             (args.log_dir / f"clock_before_{args.name}.txt").write_text(capture("nvidia-smi", "-q", "-d", "CLOCK,PERFORMANCE"))
         during = False
