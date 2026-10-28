@@ -128,11 +128,15 @@ int main(int argc,char**argv){
                               else       gemma4_decode_batch(c,w,st,d_tok,cf,sf,cs,ss,d_logit,1,uq); }
         CK(cudaDeviceSynchronize()); st.n_past=0;   // 타이밍은 n_past=0부터(attention 미미=matmul 바운드)
         // 타이밍: ngen 스텝(same-length, commit=1)
+        const bool batch_interval=getenv("BENCH_G4_DECODE_INTERVAL") && strcmp(getenv("BENCH_G4_DECODE_INTERVAL"),"1")==0;
+        const double batch_start=std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
         CK(cudaEventRecord(t0));
         for(int s=0;s<ngen;s++){ if(is_moe) gemma4_moe_decode_batch(c,w,st,d_tok,cf,sf,cs,ss,d_logit,1,uq,nullptr,nullptr);
                                  else       gemma4_decode_batch(c,w,st,d_tok,cf,sf,cs,ss,d_logit,1,uq); }
         CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
         double ms=ev(t0,t1); double per_stream=ngen/(ms/1000.0); double aggr=(double)B*ngen/(ms/1000.0);
+        if(batch_interval) printf("BATCH_INTERVAL B=%d start=%.17g end=%.17g steps=%d milliseconds=%.17g per_stream=%.17g aggregate=%.17g accounting=cuda_event\n",
+               B,batch_start,std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(),ngen,ms,per_stream,aggr);
         printf("  %-4d | %10.2f %10.2f | %9s | %.3f ms/%d스텝\n",B,per_stream,aggr,"-",ms,ngen);
         free_g4_batch_state(st);
     }
