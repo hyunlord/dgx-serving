@@ -70,7 +70,9 @@ static inline bool gd_d3_shape(int in,int out){
 }
 static inline bool gd_d1_shape(int in,int out){
     return (in==3840 && (out==4096 || out==8192 || out==15360 || out==262144)) ||
-           ((in==4096 || in==8192 || in==15360) && out==3840);
+           ((in==4096 || in==8192 || in==15360) && out==3840) ||
+           (in==5376 && (out==8192 || out==16384 || out==21504 || out==262144)) ||
+           ((in==8192 || in==16384 || in==21504) && out==5376);
 }
 static int gd_amort=0;   // 1=프리필 MMQ/SB 매트멀. 기본0=plain gemv(golden 경로 무변경).
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4){
