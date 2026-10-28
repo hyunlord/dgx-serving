@@ -10,6 +10,7 @@
 #include "../kernels/gemv_f32.cuh"
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/gemv_w4a8.cuh"
+#include "../kernels/gemv_w4a8_d1.cuh"
 #include "../kernels/gemm_mmq_tmpl.cuh"
 #include "../kernels/gemm_tiled.cuh"
 #include "../kernels/rope.cuh"
@@ -51,6 +52,7 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
 static int gd_amort=0;   // 1=프리필 MMQ/SB 매트멀. 기본0=plain gemv(golden 경로 무변경).
+static bool gd_d1_small_call=false;
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4){
     if(use_q4==2){ size_t n=(size_t)S*IN;
         if(gd_cap<n){ if(gd_xq)cudaFree(gd_xq); if(gd_xs)cudaFree(gd_xs); if(gd_xsum)cudaFree(gd_xsum);
@@ -69,7 +71,9 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
             fprintf(stderr,"G4_MMQ_MIN_S=%d\n",value);
             return value;
         }();
-        if(mmq_prefill && gd_amort==1 && S>=mmq_min_s && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
+        if(gd_d1_small_call && gemv_d1_enabled() && gemv_d1_supported(IN,OUT,S,gd_sdtype)){
+            launch_gemv_w4a8_d1(gd_xq,gd_xs,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype);
+        } else if(mmq_prefill && gd_amort==1 && S>=mmq_min_s && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
             launch_gemm_mmq_w4a8_auto(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype);
         } else if(gd_amort && S>1){  // 프리필: SB 커널로 weight 1회/≤16행 amortize(비-amortized plain gemv의 S× 재적재 제거).
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
@@ -87,6 +91,8 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
                    float *d_prenorm) {
     gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
+    // A large prefill may pass S=1 to lm_head; use the outer call's Sq instead.
+    gd_d1_small_call=c.num_experts==0 && Sq>=1 && Sq<=16;
     static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     static const int flash_min_s=[](){
         int value=16;
