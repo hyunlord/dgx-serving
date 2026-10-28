@@ -52,9 +52,10 @@ int gemma4_graph_argmax_test(){
 struct G4GraphPatch {
     cudaGraphNode_t node=nullptr;
     cudaKernelNodeParams params{};
-    std::array<uint64_t,11> storage{};
-    std::array<void*,11> args{};
+    std::array<uint64_t,16> storage{};
+    std::array<void*,16> args{};
     int kind=0,layer=-1,hd=0,kvdim=0;
+    bool split=false;   // kind 4 is the split-KV pass 1 (grid width follows the position)
     template<class T> T get(int i) const {T v;memcpy(&v,&storage[i],sizeof(T));return v;}
     template<class T> void set(int i,T v){storage[i]=0;memcpy(&storage[i],&v,sizeof(T));}
     void bind(){for(size_t i=0;i<args.size();++i)args[i]=&storage[i];params.kernelParams=args.data();}
@@ -77,12 +78,22 @@ static std::vector<cudaGraphNode_t> g4g_chain(cudaGraph_t graph){
     G4_MAP_REQUIRE(chain.size()==n,"graph chain coverage");return chain;
 }
 
+// Split-KV decode attention kernels that carry a position argument (kernels/attention_decode_split.cuh).
+static bool g4g_is_split_p1(const void *f){
+    return f==(const void*)attn_split_p1_kernel<256,2> || f==(const void*)attn_split_p1_kernel<512,16> ||
+           f==(const void*)attn_split_p1_kernel<256,1> || f==(const void*)attn_split_p1_kernel<256,4> ||
+           f==(const void*)attn_split_p1_kernel<512,2>;
+}
+static bool g4g_is_split_combine(const void *f){
+    return f==(const void*)attn_split_combine_kernel<256> || f==(const void*)attn_split_combine_kernel<512>;
+}
+
 static std::vector<G4GraphPatch> g4g_map(cudaGraph_t graph,const ModelConfig &c,
         const G4Weights &w,const G4DecodeState &st,int base,const float *cf,const float *sf,
         const float *cs,const float *ss){
     std::vector<G4GraphPatch> out;
     std::vector<std::array<int,5>> roles(c.num_layers);
-    int rope_count=0,slots=0;
+    int rope_count=0,slots=0,combines=0,last_split_layer=-1;
     for(auto node:g4g_chain(graph)){
         cudaGraphNodeType type;DK(cudaGraphNodeGetType(node,&type));
         G4_MAP_REQUIRE(type==cudaGraphNodeTypeKernel,"unexpected non-kernel graph node");
@@ -93,11 +104,18 @@ static std::vector<G4GraphPatch> g4g_map(cudaGraph_t graph,const ModelConfig &c,
         else if(p.func==(void*)rmsnorm_kernel){patch.kind=2;sizes={8,8,8,4,4};}
         else if(p.func==(void*)rmsnorm_ns_kernel){patch.kind=3;sizes={8,8,4,4};}
         else if(p.func==(void*)attn_decode_kernel){patch.kind=4;sizes={8,8,8,8,4,4,4,4,4,4,4};}
+        else if(g4g_is_split_p1(p.func)){patch.kind=4;patch.split=true;sizes={8,8,8,8,8,8,4,4,4,4,8,8,4,4,4,4};}
+        else if(g4g_is_split_combine(p.func)){patch.kind=9;sizes={8,8,8,8,4,4,4,8,4,4,4};}
         else if(p.func==(void*)g4g_argmax){patch.kind=5;sizes={8,4,8,8};}
         else if(p.func==(void*)g4g_snapshot){patch.kind=6;sizes={8,8,4};}
         else continue;
         for(size_t i=0;i<sizes.size();++i)memcpy(&patch.storage[i],p.kernelParams[i],sizes[i]);
         int l=-1;
+        if(patch.kind==9){
+            G4_MAP_REQUIRE(last_split_layer>=0,"combine without split pass 1");
+            G4_MAP_REQUIRE(patch.get<int>(5)==base && patch.get<const int*>(7)==nullptr,"combine position signature");
+            patch.layer=last_split_layer;last_split_layer=-1;++combines;out.push_back(patch);continue;
+        }
         if(patch.kind==1){l=rope_count/2;G4_MAP_REQUIRE(l<c.num_layers,"extra rope node");++rope_count;}
         else if(patch.kind<5){
             const float *ptr=patch.get<const float*>(patch.kind==2?2:1);
@@ -124,12 +142,19 @@ static std::vector<G4GraphPatch> g4g_map(cudaGraph_t graph,const ModelConfig &c,
                     patch.get<int>(5)==patch.hd,"rope signature mismatch");
                 if(key){G4_MAP_REQUIRE(patch.get<float*>(0)==st.Kc[l]+(size_t)base*patch.kvdim,"K rope output");patch.kind=7;}
                 ++roles[l][key?1:0];slots+=key?3:2;
-            } else {++roles[l][patch.kind];++slots;}
+            } else {
+                if(patch.kind==4 && patch.split){
+                    G4_MAP_REQUIRE(patch.get<int>(8)==base && patch.get<const int*>(10)==nullptr && patch.get<long>(11)==0 &&
+                                   patch.params.gridDim.z==1,"split position signature");
+                    last_split_layer=l;
+                }
+                ++roles[l][patch.kind];++slots;}
         }
         out.push_back(patch);
     }
     for(auto r:roles)for(int count:r)G4_MAP_REQUIRE(count==1,"layer position-node role coverage");
     G4_MAP_REQUIRE(rope_count==2*c.num_layers && slots==8*c.num_layers,"position argument coverage");
+    G4_MAP_REQUIRE(combines==0 || combines==c.num_layers,"split combine coverage");
     return out;
 }
 
@@ -221,7 +246,9 @@ int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
                         if(p.kind==7)p.set(0,st.Kc[l]+(size_t)position*p.kvdim);
                     } else if(p.kind==2)p.set(2,st.Kc[l]+(size_t)position*p.kvdim);
                     else if(p.kind==3)p.set(1,st.Vc[l]+(size_t)position*p.kvdim);
+                    else if(p.kind==4 && p.split){p.set(8,position);p.params.gridDim.x=position/attn_split_chunk()+1;}
                     else if(p.kind==4){p.set(8,position);p.params.sharedMemBytes=(p.hd+position+1)*sizeof(float);}
+                    else if(p.kind==9)p.set(5,position);
                     else if(p.kind==5)p.set(3,out+slot);
                     else if(p.kind==6)p.set(1,snapshots[slot]);
                     p.bind();cudaError_t status=cudaGraphExecKernelNodeSetParams(exec[slot],p.node,&p.params);
