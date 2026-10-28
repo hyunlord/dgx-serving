@@ -131,17 +131,24 @@ int main(int argc,char**argv){
     const double single_roof = moe_single_roofline_ts(c,255.8);
     printf("  ★%s roofline 상한: %.1f t/s (active-bytes÷255.8GB/s%s)\n",
            is_moe?"MoE":"dense", single_roof, is_moe?", 병렬 dense FFN 포함":"");
+    const char* decode_interval_env=getenv("BENCH_G4_DECODE_INTERVAL");
+    const bool decode_interval=decode_interval_env && strcmp(decode_interval_env,"1")==0;
+    auto decode_epoch=[](){ return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); };
     for(int sq : std::vector<int>{1,2}){   // 1=q4(검증), 2=W4A8(perf-preview)
         G4DecodeState st=alloc_g4_decode_state(c,MAXLEN); reset_g4_decode_state(st);
         int tok=1; int* d1; CK(cudaMalloc(&d1,4)); CK(cudaMemcpy(d1,&tok,4,cudaMemcpyHostToDevice));
         for(int s=0;s<8;s++){ if(is_moe) gemma4_moe_decode(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1);
-                              else       gemma4_decode(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1); }  // 워밍
+                              else       gemma4_decode_step(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1); }  // 워밍
         CK(cudaDeviceSynchronize()); reset_g4_decode_state(st);
+        const double decode_start=decode_interval?decode_epoch():0;
         CK(cudaEventRecord(t0));
         for(int s=0;s<ngen;s++){ if(is_moe) gemma4_moe_decode(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1);
-                                 else       gemma4_decode(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1); }
+                                 else       gemma4_decode_step(c,w,st,d1,1,cf,sf,cs,ss,d_logit,1,sq,1); }
         CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
+        const double decode_end=decode_interval?decode_epoch():0;
         double ms=ev(t0,t1); double ts=ngen/(ms/1000.0);
+        if(decode_interval) printf("DECODE_INTERVAL uq=%d start=%.17g end=%.17g steps=%d milliseconds=%.17g token_per_second=%.17g\n",
+                                  sq,decode_start,decode_end,ngen,ms,ts);
         printf("  %-6s single decode: %.2f t/s (%.3f ms/%d스텝) — roofline %.1f 대비 %.1f%%  [검증 경로]\n",
                sq==2?"W4A8":"q4", ts, ms, ngen, single_roof, 100.0*ts/single_roof);
         cudaFree(d1); free_g4_decode_state(st);

@@ -70,7 +70,7 @@ int main(int argc, char** argv){
         // decode: Sq=1, 이전 생성 토큰 입력, commit=1(n_past++), last_only=1
         while(gen < mt && st.n_past < maxlen-1){
             CK(cudaMemcpy(d_tok, &next, 4, cudaMemcpyHostToDevice));
-            gemma4_decode(c,w,st,d_tok,1,d_cf,d_sf,d_cs,d_ss,d_logit,1,uq,1);
+            gemma4_decode_step(c,w,st,d_tok,1,d_cf,d_sf,d_cs,d_ss,d_logit,1,uq,1);
             next = argmax();
             printf("%d\n", next); fflush(stdout); gen++;
         }

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cerrno>
 #include <climits>
+#include <chrono>
 #include <cuda_runtime.h>
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
@@ -88,12 +89,97 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
     else              launch_gemv_f32(X,m.wf,Y,IN,OUT,S,stream);
 }
 
-void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
+struct G4DecodeGraph {
+    cudaStream_t stream=nullptr;
+    cudaGraphExec_t executable=nullptr;
+    unsigned long long steps=0, updates=0, update_failures=0, instantiations=0;
+
+    ~G4DecodeGraph(){
+        if(executable) cudaGraphExecDestroy(executable);
+        if(stream) cudaStreamDestroy(stream);
+    }
+};
+
+static bool g4d_graph_enabled(){
+    static const bool enabled=[](){ const char* v=getenv("G4_CUDA_GRAPH"); return v && strcmp(v,"1")==0; }();
+    return enabled;
+}
+
+template<class Enqueue>
+static void g4d_run_graph(Enqueue &&enqueue, int base){
+    // Same serialized, single-device lifetime as the decode scratch buffers.
+    static G4DecodeGraph graph;
+    static const bool stats=[](){ const char* v=getenv("G4_CUDA_GRAPH_STATS"); return v && strcmp(v,"1")==0; }();
+    using Clock=std::chrono::steady_clock;
+    const auto elapsed_us=[](Clock::time_point a, Clock::time_point b){
+        return std::chrono::duration<double,std::micro>(b-a).count();
+    };
+    if(!graph.stream) DK(cudaStreamCreateWithFlags(&graph.stream,cudaStreamNonBlocking));
+    const auto input_begin=Clock::now();
+    // Device inputs and benchmark timing events may have been queued on stream 0.
+    DK(cudaStreamSynchronize(0));
+    const auto capture_begin=Clock::now();
+    DK(cudaStreamBeginCapture(graph.stream,cudaStreamCaptureModeGlobal));
+    const cudaError_t enqueue_status=enqueue(graph.stream);
+    const cudaError_t launch_status=cudaGetLastError();
+    cudaGraph_t captured=nullptr;
+    const cudaError_t capture_status=cudaStreamEndCapture(graph.stream,&captured);
+    const auto capture_end=Clock::now();
+    if(enqueue_status!=cudaSuccess || launch_status!=cudaSuccess || capture_status!=cudaSuccess || !captured){
+        fprintf(stderr,"G4_CUDA_GRAPH capture failed base=%d enqueue=%s launch=%s capture=%s graph=%p\n",
+                base,cudaGetErrorString(enqueue_status),cudaGetErrorString(launch_status),
+                cudaGetErrorString(capture_status),(void*)captured);
+        if(captured) cudaGraphDestroy(captured);
+        exit(1);
+    }
+
+    if(graph.executable){
+        cudaGraphExecUpdateResultInfo info{};
+        const cudaError_t status=cudaGraphExecUpdate(graph.executable,captured,&info);
+        if(status==cudaSuccess && info.result==cudaGraphExecUpdateSuccess){
+            ++graph.updates;
+        } else {
+            ++graph.update_failures;
+            fprintf(stderr,"G4_CUDA_GRAPH update failed base=%d status=%s result=%d node=%p from=%p; reinstantiating\n",
+                    base,cudaGetErrorString(status),(int)info.result,(void*)info.errorNode,(void*)info.errorFromNode);
+            if(status!=cudaSuccess && status!=cudaErrorGraphExecUpdateFailure){
+                cudaGraphDestroy(captured);
+                DK(status);
+            }
+            // A supported update fallback must not poison the next launch check.
+            const cudaError_t last_error=cudaGetLastError();
+            if(last_error!=cudaSuccess && last_error!=cudaErrorGraphExecUpdateFailure){
+                cudaGraphDestroy(captured);
+                DK(last_error);
+            }
+            DK(cudaGraphExecDestroy(graph.executable));
+            graph.executable=nullptr;
+        }
+    }
+    if(!graph.executable){
+        DK(cudaGraphInstantiate(&graph.executable,captured,0));
+        ++graph.instantiations;
+    }
+    DK(cudaGraphDestroy(captured));
+    const auto update_end=Clock::now();
+    DK(cudaGraphLaunch(graph.executable,graph.stream));
+    const auto launch_end=Clock::now();
+    DK(cudaStreamSynchronize(graph.stream));
+    const auto sync_end=Clock::now();
+    ++graph.steps;
+    if(stats)
+        fprintf(stderr,"G4_CUDA_GRAPH_STATS base=%d step=%llu input_sync_us=%.6f capture_us=%.6f update_us=%.6f launch_us=%.6f sync_us=%.6f updates=%llu update_failures=%llu instantiations=%llu reinstantiations=%llu\n",
+                base,graph.steps,elapsed_us(input_begin,capture_begin),elapsed_us(capture_begin,capture_end),
+                elapsed_us(capture_end,update_end),elapsed_us(update_end,launch_end),elapsed_us(launch_end,sync_end),
+                graph.updates,graph.update_failures,graph.instantiations,graph.instantiations-1);
+}
+
+static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const int *d_tokens, int Sq,
                    const float *d_cos_f, const float *d_sin_f,
                    const float *d_cos_s, const float *d_sin_s,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
-                   float *d_prenorm) {
+                   float *d_prenorm, bool graph_request) {
     gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
     static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     static const int flash_min_s=[](){
@@ -151,7 +237,7 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                         (size_t)(hd_max+base+Sq)*sizeof(float), "attn_decode", base+Sq);
 
     // Reservation and host state changes remain outside the enqueue-only body.
-    auto enqueue=[&](cudaStream_t stream){
+    auto enqueue=[&](cudaStream_t stream)->cudaError_t{
     launch_embedding(d_tokens, w.embed, x, Sq, H, stream);
     if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,SH,stream);
 
@@ -200,7 +286,10 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
 
     // pre-norm residual 노출(3관문 assistant hook): HF hidden_states[-1] == 마지막 층 출력(final-norm 전, 실측 확정)
     if(d_prenorm){
-        if(stream) DK(cudaMemcpyAsync(d_prenorm, x, SH*4, cudaMemcpyDeviceToDevice, stream));
+        if(stream){
+            const cudaError_t status=cudaMemcpyAsync(d_prenorm,x,SH*4,cudaMemcpyDeviceToDevice,stream);
+            if(status!=cudaSuccess) return status;
+        }
         else DK(cudaMemcpy(d_prenorm, x, SH*4, cudaMemcpyDeviceToDevice));
     }
     launch_rmsnorm(x, w.final_norm, norm, Sq, H, eps, stream);
@@ -208,8 +297,34 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
     int rows = last_only ? 1 : Sq;
     mm(w.lm_head, hn, d_logits, H, V, rows, use_q4, stream);
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)rows*V, stream);
+    return cudaSuccess;
     };
-    enqueue(0);
-    if(commit) st.n_past += Sq;
-    DK(cudaDeviceSynchronize());
+    if(graph_request && Sq==1 && commit!=0 && amort_mm==0 && g4d_graph_enabled()){
+        g4d_run_graph(enqueue,base);
+        st.n_past += Sq;
+    } else {
+        DK(enqueue(0));
+        if(commit) st.n_past += Sq;
+        DK(cudaDeviceSynchronize());
+    }
+}
+
+void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
+                   const int *d_tokens, int Sq,
+                   const float *d_cos_f, const float *d_sin_f,
+                   const float *d_cos_s, const float *d_sin_s,
+                   float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
+                   float *d_prenorm){
+    gemma4_decode_impl(c,w,st,d_tokens,Sq,d_cos_f,d_sin_f,d_cos_s,d_sin_s,
+                      d_logits,commit,use_q4,last_only,amort_mm,d_prenorm,false);
+}
+
+void gemma4_decode_step(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
+                   const int *d_tokens, int Sq,
+                   const float *d_cos_f, const float *d_sin_f,
+                   const float *d_cos_s, const float *d_sin_s,
+                   float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
+                   float *d_prenorm){
+    gemma4_decode_impl(c,w,st,d_tokens,Sq,d_cos_f,d_sin_f,d_cos_s,d_sin_s,
+                      d_logits,commit,use_q4,last_only,amort_mm,d_prenorm,true);
 }
