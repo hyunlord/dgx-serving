@@ -6,6 +6,7 @@
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemm_batch.cuh"
+#include "../kernels/attention_decode_split.cuh"
 #include "../kernels/gemv_w4a8.cuh"   // W4A8 batch: B≤8 SB 커널(27b 축1 이식)
 #include "../kernels/gemm_mmq.cuh"    // W4A8 batch: BM=16 split-K(B≥14 opt-in)
 #include "../kernels/quantize_x.cuh"  // W4A8: 활성화 int8 양자화
@@ -45,6 +46,8 @@ void free_g4_batch_state(G4BatchState &s){
 //     B≤8 → gemv_w4a8_sb(SMAX dispatch, 1적재) / B≥14 opt-in split-K(BM16, borderline flip=스킴 변경) / else gemm_batch_w4a8.
 //     ★bit-identical은 같은 SB family 내(SMAX 버킷 동일)서 성립 — 버킷/커널 경계 넘으면 W4A8 스킴 변경(flip 가능).
 //   use_q4!=2 (q4): gemm_batch_q4(B-무관 canonical, 기존 경로 무변경).
+// G4_ATTN_SPLIT=1: dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel.
+static bool g4_attn_split(){ static const bool on=[](){ const char* v=getenv("G4_ATTN_SPLIT"); return v && strcmp(v,"1")==0; }(); return on; }
 static int gb_sdtype, gb_use_q4;
 static int8_t *gb_xq=nullptr; static float *gb_xs=nullptr; static int32_t *gb_xsum=nullptr; static size_t gb_xcap=0;
 static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT, int B){
@@ -86,6 +89,7 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
     const size_t BH=(size_t)B*H;
     const int hd_max=hd_f>hd_s?hd_f:hd_s;
     const size_t qmax=(size_t)B*NQ*hd_max;
+    if(g4_attn_split()) attn_split_reserve(B,NQ,st.max_len,hd_max);
     const size_t kvmax=(size_t)B*(nkv_s*hd_s>nkv_f*hd_f?nkv_s*hd_s:nkv_f*hd_f);
 
     // Like the existing matmul globals: serialized, single-device, non-reentrant calls.
@@ -139,7 +143,11 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
             BK(cudaMemcpy(st.Kc[l]+(size_t)b*kv_stride+pos*kvdim, kn+(size_t)b*kvdim, (size_t)kvdim*4, cudaMemcpyDeviceToDevice));
             BK(cudaMemcpy(st.Vc[l]+(size_t)b*kv_stride+pos*kvdim, vn+(size_t)b*kvdim, (size_t)kvdim*4, cudaMemcpyDeviceToDevice));
         }
-        launch_attn_decode_batch(qn, st.Kc[l], st.Vc[l], attn, B, NQ, nkv, hd, base_max, kv_stride, 0, ascale, window, ragged?d_pos_b:nullptr);
+        if(g4_attn_split())
+            launch_attn_decode_split(qn, st.Kc[l], st.Vc[l], attn, B, NQ, nkv, hd, base, 0, ragged?d_pos_b:nullptr, base_max,
+                                     kv_stride, attn_split_ns_cap(st.max_len), 0, ascale, window);
+        else
+            launch_attn_decode_batch(qn, st.Kc[l], st.Vc[l], attn, B, NQ, nkv, hd, base_max, kv_stride, 0, ascale, window, ragged?d_pos_b:nullptr);
         mmB(L.o, attn, ob, qdim, H, B);
         launch_rmsnorm(ob, L.post_attn_ln, tmp, B, H, eps);
         launch_add(after, x, tmp, (int)BH);
@@ -391,6 +399,7 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
     const size_t MH=(size_t)M*H;
     const int hd_max=hd_f>hd_s?hd_f:hd_s;
     const size_t qmax=(size_t)M*NQ*hd_max;
+    if(g4_attn_split()) attn_split_reserve(M,NQ,st.max_len,hd_max);
     const size_t kvmax=(size_t)M*(nkv_s*hd_s>nkv_f*hd_f?nkv_s*hd_s:nkv_f*hd_f);
     // Like the existing matmul globals: serialized, single-device, non-reentrant calls.
     // Each buffer grows independently; CUDA context/process teardown reclaims storage.
@@ -442,8 +451,13 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
         }
         for(int a=0;a<B_act;a++){
             const int b=slot_ids[a];
-            launch_attn_decode(qn+(size_t)off[a]*qdim, st.Kc[l]+(size_t)b*kv_stride, st.Vc[l]+(size_t)b*kv_stride,
-                               attn+(size_t)off[a]*qdim, Nb[a], NQ, nkv, hd, pos_b[a], 0, ascale, window);
+            if(g4_attn_split())
+                launch_attn_decode_split(qn+(size_t)off[a]*qdim, st.Kc[l]+(size_t)b*kv_stride, st.Vc[l]+(size_t)b*kv_stride,
+                                         attn+(size_t)off[a]*qdim, Nb[a], NQ, nkv, hd, pos_b[a], 1, nullptr, pos_b[a]+Nb[a]-1, 0,
+                                         attn_split_ns_cap(st.max_len), 0, ascale, window);
+            else
+                launch_attn_decode(qn+(size_t)off[a]*qdim, st.Kc[l]+(size_t)b*kv_stride, st.Vc[l]+(size_t)b*kv_stride,
+                                   attn+(size_t)off[a]*qdim, Nb[a], NQ, nkv, hd, pos_b[a], 0, ascale, window);
         }
         mmM(L.o, attn, ob, qdim, H, M);
         launch_rmsnorm(ob, L.post_attn_ln, tmp, M, H, eps);

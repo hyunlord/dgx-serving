@@ -22,6 +22,7 @@
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/attention_flash.cuh"
+#include "../kernels/attention_decode_split.cuh"
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
 
@@ -94,6 +95,9 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
     } else if(use_q4) launch_gemm_tiled_q4(X,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
     else              launch_gemv_f32(X,m.wf,Y,IN,OUT,S,stream);
 }
+
+// G4_ATTN_SPLIT=1: dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel.
+static bool g4_attn_split(){ static const bool on=[](){ const char* v=getenv("G4_ATTN_SPLIT"); return v && strcmp(v,"1")==0; }(); return on; }
 
 struct G4DecodeGraph {
     cudaStream_t stream=nullptr;
@@ -249,7 +253,9 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         (void)g4d_mmq_prefill();
         (void)g4d_mmq_min_s();
     }
-    if(Sq==1 && c.num_layers>0)
+    const bool attn_split=g4_attn_split() && !(flash_prefill && Sq>=flash_min_s);
+    if(attn_split) attn_split_reserve(Sq,NQ,st.max_len,hd_max);   // before any capture; max_len bound
+    if(Sq==1 && c.num_layers>0 && !attn_split)
         attn_smem_guard((const void *)attn_decode_kernel,
                         (size_t)(hd_max+base+Sq)*sizeof(float), "attn_decode", base+Sq);
 
@@ -285,6 +291,9 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         }
         if(flash_prefill && Sq>=flash_min_s)
             launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
+        else if(attn_split)
+            launch_attn_decode_split(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, 1, nullptr, base+Sq-1, 0,
+                                     attn_split_ns_cap(st.max_len), stream, ascale, window);
         else
             launch_attn_decode(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, ascale, window);
         mm(L.o, attn, ob, qdim, H, Sq, use_q4, stream);
