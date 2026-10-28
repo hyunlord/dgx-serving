@@ -20,7 +20,7 @@ static inline int gemv_d1_mode() {
 }
 static inline bool gemv_d1_enabled() { return gemv_d1_mode()!=0; }
 
-#define GEMV_D1_DEFAULT_SHAPES ""   // set from the R14 isolated per-shape timing table
+#define GEMV_D1_DEFAULT_SHAPES "3840x512"   // R14 isolated timing: only this 12B shape has a shorter S=1/4/8/16 mean with D1
 static inline bool gemv_d1_shape_selected(int IN, int OUT) {
     struct Shapes { int n=0; int in[64], out[64]; };
     static const Shapes shapes=[](){
