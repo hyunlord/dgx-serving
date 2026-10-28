@@ -5,6 +5,12 @@
 #include <cerrno>
 #include <climits>
 #include <chrono>
+#include <functional>
+#include <vector>
+#include <array>
+#include <algorithm>
+#include <cstdint>
+#include <cmath>
 #include <cuda_runtime.h>
 #include "../kernels/embedding.cuh"
 #include "../kernels/rmsnorm.cuh"
@@ -105,6 +111,8 @@ static bool g4d_graph_enabled(){
     return enabled;
 }
 
+static G4GenerationStats g4d_graph_totals;
+
 template<class Enqueue>
 static void g4d_run_graph(Enqueue &&enqueue, int base){
     // Same serialized, single-device lifetime as the decode scratch buffers.
@@ -167,6 +175,13 @@ static void g4d_run_graph(Enqueue &&enqueue, int base){
     DK(cudaStreamSynchronize(graph.stream));
     const auto sync_end=Clock::now();
     ++graph.steps;
+    g4d_graph_totals.planned_captures=graph.steps;
+    g4d_graph_totals.graph_updates=graph.updates;
+    g4d_graph_totals.update_failures=graph.update_failures;
+    g4d_graph_totals.instantiations=graph.instantiations;
+    g4d_graph_totals.reinstantiations=graph.instantiations?graph.instantiations-1:0;
+    g4d_graph_totals.capture_us+=elapsed_us(capture_begin,capture_end);
+    g4d_graph_totals.update_us+=elapsed_us(capture_end,update_end);
     if(stats)
         fprintf(stderr,"G4_CUDA_GRAPH_STATS base=%d step=%llu input_sync_us=%.6f capture_us=%.6f update_us=%.6f launch_us=%.6f sync_us=%.6f updates=%llu update_failures=%llu instantiations=%llu reinstantiations=%llu\n",
                 base,graph.steps,elapsed_us(input_begin,capture_begin),elapsed_us(capture_begin,capture_end),
@@ -174,12 +189,14 @@ static void g4d_run_graph(Enqueue &&enqueue, int base){
                 graph.updates,graph.update_failures,graph.instantiations,graph.instantiations-1);
 }
 
+using G4PreparedStep = std::function<cudaError_t(cudaStream_t,int,const int*,float*)>;
+
 static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const int *d_tokens, int Sq,
                    const float *d_cos_f, const float *d_sin_f,
                    const float *d_cos_s, const float *d_sin_s,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
-                   float *d_prenorm, bool graph_request) {
+                   float *d_prenorm, bool graph_request, G4PreparedStep *prepared=nullptr) {
     gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
     static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     static const int flash_min_s=[](){
@@ -237,7 +254,7 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
                         (size_t)(hd_max+base+Sq)*sizeof(float), "attn_decode", base+Sq);
 
     // Reservation and host state changes remain outside the enqueue-only body.
-    auto enqueue=[&](cudaStream_t stream)->cudaError_t{
+    auto enqueue=[=,&c,&w,&st](cudaStream_t stream,int base,const int *d_tokens,float *d_logits)->cudaError_t{
     launch_embedding(d_tokens, w.embed, x, Sq, H, stream);
     if(c.embed_scale>0.f) launch_scale(x,x,c.embed_scale,SH,stream);
 
@@ -299,11 +316,12 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)rows*V, stream);
     return cudaSuccess;
     };
+    if(prepared){ *prepared=enqueue; return; }
     if(graph_request && Sq==1 && commit!=0 && amort_mm==0 && g4d_graph_enabled()){
-        g4d_run_graph(enqueue,base);
+        g4d_run_graph([&](cudaStream_t stream){return enqueue(stream,base,d_tokens,d_logits);},base);
         st.n_past += Sq;
     } else {
-        DK(enqueue(0));
+        DK(enqueue(0,base,d_tokens,d_logits));
         if(commit) st.n_past += Sq;
         DK(cudaDeviceSynchronize());
     }
@@ -328,3 +346,5 @@ void gemma4_decode_step(const ModelConfig &c, const G4Weights &w, G4DecodeState 
     gemma4_decode_impl(c,w,st,d_tokens,Sq,d_cos_f,d_sin_f,d_cos_s,d_sin_s,
                       d_logits,commit,use_q4,last_only,amort_mm,d_prenorm,true);
 }
+
+#include "gemma4_decode_graph.cuh"

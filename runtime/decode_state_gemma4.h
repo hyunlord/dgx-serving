@@ -46,6 +46,22 @@ void gemma4_decode_step(const ModelConfig &c, const G4Weights &w, G4DecodeState 
                    float *d_logits, int commit, int use_q4, int last_only = 0, int amort_mm = 0,
                    float *d_prenorm = nullptr);
 
+// Serialized generation session. The callback must consume logits before returning;
+// it must not re-enter any Gemma operation using the shared scratch buffers.
+struct G4GenerationStats {
+    unsigned long long planned_captures=0, fallback_recaptures=0, node_updates=0, graph_updates=0, mapping_fallbacks=0;
+    unsigned long long instantiations=0, reinstantiations=0, update_failures=0, setparams_failures=0;
+    unsigned long long executed_steps=0, accepted_steps=0, speculative_steps=0;
+    double capture_us=0, update_us=0;
+};
+using G4GenerationCallback = void (*)(const float *d_logits, int token, int step, void *opaque);
+int gemma4_generate(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
+                   int first_token, int max_steps, int eos_token,
+                   const float *cf, const float *sf, const float *cs, const float *ss,
+                   int use_q4, G4GenerationCallback callback, void *opaque,
+                   G4GenerationStats *stats=nullptr);
+int gemma4_graph_argmax_test();
+
 // ---- Batch decode (A-3-2): B슬롯 동시. same-length(모든 슬롯 위치 base 공통) — ragged/chunked는 A-3 후속. ----
 //   KV: 층별 [B, max_len, NKV_l, hd_l] fp32 (kv_stride = max_len*NKV_l*hd_l). GDN 없어 KV만.
 struct G4BatchState {
