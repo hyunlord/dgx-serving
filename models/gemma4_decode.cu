@@ -9,6 +9,7 @@
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemv_f32.cuh"
 #include "../kernels/quantize_x.cuh"
+#include "../kernels/quantize_x_r10.cuh"
 #include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/gemv_w4a8_r10.cuh"
 #include "../kernels/gemv_w4a8_r10_d3.cuh"
@@ -53,6 +54,13 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
 static bool gd_decode_d1=false;
+static bool gd_decode_d4=false;
+static unsigned gd_d4_shapes=0;
+static inline bool gd_d4_shape(int in,int out){
+    const unsigned bit=in==3840 ? (out==4096?1u:out==8192?2u:out==15360?4u:out==262144?8u:0u) :
+                       out==3840 ? (in==4096?16u:in==8192?32u:in==15360?64u:0u) : 0u;
+    return (gd_d4_shapes & bit)!=0;
+}
 static bool gd_decode_d3=false;
 static unsigned gd_d3_shapes=0;
 static inline bool gd_d3_shape(int in,int out){
@@ -69,7 +77,9 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
     if(use_q4==2){ size_t n=(size_t)S*IN;
         if(gd_cap<n){ if(gd_xq)cudaFree(gd_xq); if(gd_xs)cudaFree(gd_xs); if(gd_xsum)cudaFree(gd_xsum);
             DK(cudaMalloc(&gd_xq,n)); DK(cudaMalloc(&gd_xs,(n/QBLK)*4)); DK(cudaMalloc(&gd_xsum,(n/QBLK)*4)); gd_cap=n; }
-        launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S);
+        if(gd_decode_d4 && S==1 && IN%QBLK==0 && gd_d4_shape(IN,OUT))
+            launch_quantize_x_q8_r10_d4(X,gd_xq,gd_xs,IN,S);
+        else launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S);
         static const bool mmq_prefill=[](){ const char* v=getenv("G4_MMQ_PREFILL"); return !v || strcmp(v,"0")!=0; }();
         static const int mmq_min_s=[](){
             int value=16;
@@ -125,12 +135,30 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
         }
         return (unsigned)mask;
     }();
+    static const bool d4=[](){
+        const char* v=getenv("G4_DECODE_QUANT_D4");
+        return v && strcmp(v,"1")==0;
+    }();
+    static const unsigned d4_shapes=[](){
+        const char* v=getenv("G4_DECODE_QUANT_D4_SHAPES");
+        if(!v) return 0u;
+        char* end=nullptr; errno=0;
+        const unsigned long mask=strtoul(v,&end,0);
+        if(errno || end==v || *end!='\0' || mask>127u){
+            fprintf(stderr,"Invalid G4_DECODE_QUANT_D4_SHAPES; expected mask 0..127\n"); exit(1);
+        }
+        return (unsigned)mask;
+    }();
     unsigned active=0;
     const char* flags[]={"G4_DECODE_GEMV_D1", "G4_DECODE_GEMV_D2", "G4_DECODE_GEMV_D3", "G4_DECODE_QUANT_D4"};
     for(const char* name: flags){
         const char* v=getenv(name); active+=v && strcmp(v,"1")==0;
     }
     if(active>1){ fprintf(stderr,"Simultaneous R10 D flags require a separately qualified combination\n"); exit(1); }
+    gd_d4_shapes=d4_shapes;
+    gd_decode_d4=d4 && Sq==1 && st.n_past>0 && commit!=0 && amort_mm==0 &&
+                 use_q4==2 && c.scale_dtype==0 && QBLK==32 &&
+                 c.hidden_size==3840 && c.intermediate_size==15360;
     gd_d3_shapes=d3_shapes;
     gd_decode_d3=d3 && Sq==1 && st.n_past>0 && commit!=0 && amort_mm==0 &&
                  use_q4==2 && c.scale_dtype==0 && QBLK==32 &&
