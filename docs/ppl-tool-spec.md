@@ -111,3 +111,11 @@ Comparison validates vocabulary, row count, exact file sizes, and byte-for-byte 
 With `--kld-ref`, the final JSON additionally reports `mean_kl`, `kl_p99` (nearest rank, ceil(0.99*N)), `top1_match_rate` (fraction0..1 against original reference argmax), and `kl_ntok`. These metrics cover exactly the PPL-selected positions and are supplementary, not adoption gates. Reference comparison streams one reference row while processing each128-row device-to-host logits chunk; it never loads all reference distributions into RAM.
 
 `--kl-self-test` is CPU-only and prints three JSON fixtures containing stored fp16 reference log probabilities, current float logits, and the tool's KL. Independently normalize both arrays with NumPy float64, compute `sum(exp(logp_ref)*(logp_ref-logp_current))`, and require relative error<1e-6. Fixtures cover ordinary, extreme and tied logits. This tests the same production KL function and does not initialize CUDA. Keep the original `--self-test` smoke test as well.
+
+## Teacher-forced single-token validation
+
+`--decode` uses the same token IDs, masks and NLL accounting, but executes every
+input token through S=1 with amortization disabled. The default remains whole-window
+prefill. JSON adds `execution_mode=teacher_forced_decode`, and interval logs identify
+`decode_teacher_forced`. Use paired OFF/ON runs of this mode for decode-only kernel
+changes; a whole-window MMQ result does not validate a GEMV change.
