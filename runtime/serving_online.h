@@ -5,10 +5,11 @@
 //   backend가 device 전송·rope·weight·상태·logit D2H 소유 → 루프는 host 토큰/argmax/스케줄만(gemma4·qwen 공유).
 //   신규(bench 대비): 실시간 비동기 주입(stdin reader 스레드+큐) + 실토큰 prefill + greedy 피드백(argmax) + 태그드 스트림 I/O.
 //   ★정확성 불변: 온라인 배칭이 각 요청 계산 안 바꿈 — 슬롯 격리(ragged decode 독립). 동시 N == 단독 bit-id(test_serve_online).
-//   프로토콜(태그드): stdin "<req_id> <max_tokens> [SMPL <temp> <topp> <repp> <seed>] <id0> ..." / "SHUTDOWN".
-//     stdout "<req_id> <tok>" / "<req_id> END"(single-writer). SMPL 없음(기본) = greedy(기존 프로토콜·경로 그대로).
+//   프로토콜(태그드): stdin "<req_id> <max_tokens> [SMPL <temp> <topp> <repp> <seed>] <id0> ..." / "CANCEL <req_id>" / "SHUTDOWN".
+//     stdout "<req_id> <tok>" / "<req_id> END <stop|length|cancel>"(single-writer). SMPL 없음(기본) = greedy(기존 프로토콜·경로 그대로).
+//     CANCEL: 다음 스텝 경계에서 대기/활성 요청을 끝낸다(END cancel). 이미 끝난 req_id는 무시.
 //   단일 스트림 fast-path(G4_SERVE_FASTPATH, 기본 1): 활성 요청 1개·greedy·대기 큐 빔이면 backend의
-//     generate_single로 S=1 생성 세션을 돌리고, 새 요청이 오면 그 스텝 뒤 배치 루프로 돌아온다.
+//     generate_single로 S=1 생성 세션을 돌리고, 새 요청/CANCEL이 오면 그 스텝 뒤 배치 루프로 돌아온다.
 //     ★backend가 보장: fast-path 토큰·KV == 배치 W=1 경로(R14 게이트 2b·2c) → 전환 시점과 무관한 출력.
 //   ★샘플링은 서빙 옵션(호스트 로직·D2H는 원래 하던 것): 검증/게이트는 greedy 경로(SMPL 미주입)로 불변.
 #include <cstdio>
@@ -87,6 +88,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
 
     // 비동기 stdin reader(스레드 안전 큐). 메인 배치 루프가 스텝 경계에서 drain.
     std::deque<Req> queue; std::mutex mtx; std::condition_variable cv; std::atomic<bool> shutdown{false};
+    std::vector<long> cancels;                                                      // mtx 보호(reader→루프)
     const char* fast_env = getenv("G4_SERVE_FASTPATH");
     const bool fastpath = be.single_stream() && !(fast_env && std::string(fast_env) == "0");
     unsigned long long n_fast_req=0, n_batch_req=0, n_switch=0, n_tail=0;
@@ -96,6 +98,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
             std::istringstream is(line); std::string first;
             if(!(is>>first)) continue;
             if(first=="SHUTDOWN"){ shutdown=true; cv.notify_all(); return; }
+            if(first=="CANCEL"){ long id; if(is>>id){ std::lock_guard<std::mutex> lk(mtx); cancels.push_back(id); } cv.notify_all(); continue; }
             Req r; r.id=atol(first.c_str());
             if(!(is>>r.max_tokens)) continue;
             std::string nx;                                  // 옵션 SMPL 필드(없으면 기존 프로토콜 그대로 = greedy)
@@ -165,7 +168,17 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
                 s.req,reason,s.fast_steps,s.batch_steps,s.fast_entries,s.fast_tail,s.temp>0.f?1:0,n_fast_req,n_batch_req,n_switch,n_tail);
         s=Slot();
     };
-    auto pending = [&](long){ std::lock_guard<std::mutex> lk(mtx); return !queue.empty(); };
+    // CANCEL 적용(스텝 경계): 대기 큐에서 제거하거나 활성 슬롯 종료. 알 수 없는 id는 무시.
+    auto apply_cancels = [&](){
+        std::vector<long> ids;
+        { std::lock_guard<std::mutex> lk(mtx); ids.swap(cancels);
+          for(long id:ids) for(auto it=queue.begin(); it!=queue.end(); ++it) if(it->id==id){
+              printf("%ld END cancel\n", id); fflush(stdout);
+              fprintf(stderr,"[online] PATH req=%ld reason=cancel queued=1\n", id); queue.erase(it); break; } }
+        for(long id:ids) for(int b=0;b<Bmax;b++) if(slot[b].req==id) finish(slot[b],"cancel");
+    };
+    auto pending = [&](long req){ std::lock_guard<std::mutex> lk(mtx);
+        if(!queue.empty()) return true; for(long id:cancels) if(id==req) return true; return false; };
     struct FastCtx { std::function<int(int)> fn; static int call(int t, void* o){ return ((FastCtx*)o)->fn(t); } };
 
     while(true){
@@ -202,11 +215,12 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
                 lk.lock();
             }
         }
+        apply_cancels();
         int A=n_active();
         if(A==0){ if(shutdown){ std::lock_guard<std::mutex> lk(mtx); if(queue.empty()) break; } continue; }
 
         // 2a) 단일 스트림 fast-path: 활성 1개·greedy·대기 없음. 스텝 처리는 아래 3)과 같은 규칙(EOS·길이 종료).
-        //     새 요청이 생기면 그 스텝 뒤 멈추고 배치 루프로 복귀(슬롯 pos/last가 이어받음).
+        //     새 요청/CANCEL이 생기면 그 스텝 뒤 멈추고 배치 루프로 복귀(슬롯 pos/last가 이어받음).
         if(fastpath && A==1){
             int b=0; while(slot[b].req<0) ++b;
             Slot& s=slot[b];

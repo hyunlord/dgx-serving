@@ -44,7 +44,8 @@ def load_and_verify_recipe(recipe_path, device_json, model_json):
 # ★직렬화 안 함: 동시 HTTP 스레드가 각자 태그드 요청을 daemon에 주입 → daemon 배치 루프가 연속 배칭.
 #   stdin 쓰기만 락(라인 원자성). stdout은 단일 reader 스레드가 읽어 req_id로 연결별 큐에 분배(경합 방지).
 class OnlineDaemon:
-    def __init__(self, cmd, env=None):                     # cmd = [daemon_bin, args...] · env = STOP_IDS 등 주입(EOS 종료)
+    def __init__(self, cmd, env=None, cancel=False):       # cmd = [daemon_bin, args...] · env = STOP_IDS 등 주입(EOS 종료)
+        self.cancel = cancel                               # daemon이 "CANCEL <rid>"를 지원(run_online_daemon 계열)
         if not os.path.exists(cmd[0]): sys.exit(f"[serve_api] daemon 바이너리 없음: {cmd[0]} (make {os.path.relpath(cmd[0],REPO)})")
         self.p = subprocess.Popen(cmd, env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -91,15 +92,22 @@ class OnlineDaemon:
         smpl = f"SMPL {sampling[0]:g} {sampling[1]:g} {sampling[2]:g} {sampling[3]} " if sampling else ""
         with self.wlock:                                   # 라인 원자성만(짧은 임계구역 — 배칭 안 막음)
             self.p.stdin.write(f"{rid} {max_tokens} " + smpl + " ".join(map(str, ids)) + "\n"); self.p.stdin.flush()
+        ended = False
         try:
             while True:
                 tok = q.get()                              # reader 스레드가 넣을 때까지 블록(다른 요청은 병행)
                 if isinstance(tok, tuple) and tok[0] == "__END__":  # 종료 센티넬(사유 포함)
                     if out is not None: out["finish_reason"] = tok[1]
+                    ended = True
                     break
                 yield tok
         finally:
             with self.qlock: self.queues.pop(rid, None)
+            # 소비자가 END 전에 닫음(stop 문자열·클라이언트 끊김) → daemon에 취소 전달(GPU 생성 중단).
+            if not ended and self.cancel:
+                try:
+                    with self.wlock: self.p.stdin.write(f"CANCEL {rid}\n"); self.p.stdin.flush()
+                except Exception: pass
 
     def close(self):
         try: self.p.stdin.write("SHUTDOWN\n"); self.p.stdin.flush(); self.p.stdin.close(); self.p.terminate()
@@ -183,6 +191,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(400, {"error":{"message":f"bad json: {e}","type":"invalid_request_error"}})
         if self._reject_unsupported(req): return
+        stops = req.get("stop")
+        if stops is None: stops = []
+        elif isinstance(stops, str): stops = [stops]
+        if not isinstance(stops, list) or len(stops) > 4 or not all(isinstance(x, str) for x in stops):
+            return self._json(400, {"error":{"message":"stop must be a string or a list of up to 4 strings","type":"invalid_request_error"}})
+        stops = [x for x in stops if x]
         sampling = self._sampling(req)
         if sampling and not self.sampling:
             return self._json(400, {"error":{"message":"sampling unsupported on this server (speculative daemon is greedy-only "
@@ -203,10 +217,25 @@ class Handler(BaseHTTPRequestHandler):
                 ids = completion_ids(self.tok, prompt)
         except Exception as e:
             return self._json(400, {"error":{"message":str(e),"type":"invalid_request_error"}})
-        self._generate(ids, max_tokens, stream, chat, sampling)
+        self._generate(ids, max_tokens, stream, chat, sampling, stops)
+
+    # stop 문자열(OpenAI 의미): 가장 앞의 일치 위치(없으면 None) / 스트리밍 보류 길이(어떤 stop의 진접두사인 꼬리).
+    @staticmethod
+    def _stop_at(text, stops):
+        hits = [i for i in (text.find(x) for x in stops) if i >= 0]
+        return min(hits) if hits else None
+
+    @staticmethod
+    def _holdback(text, stops):
+        n = 0
+        for x in stops:
+            for k in range(min(len(x) - 1, len(text)), n, -1):
+                if text.endswith(x[:k]): n = k; break
+        return n
 
     # 생성 실행(스트림/논스트림 공통) — daemon.stream(불변) + incremental detok + 메트릭(front 계산·daemon 불변).
-    def _generate(self, ids, max_tokens, stream, chat, sampling=None):
+    #   stop 문자열: 일치 문자열은 출력하지 않고 finish_reason="stop", 생성기를 닫아 daemon에 CANCEL.
+    def _generate(self, ids, max_tokens, stream, chat, sampling=None, stops=()):
         cid = ("chatcmpl-" if chat else "cmpl-")+uuid.uuid4().hex[:24]; created = int(time.time())
         obj = "chat.completion.chunk" if (chat and stream) else ("chat.completion" if chat else "text_completion")
         t0 = time.time(); t_first = None; acc = []; prev_text = ""
@@ -217,14 +246,32 @@ class Handler(BaseHTTPRequestHandler):
             if chat:                                       # chat 관례: 첫 청크에 role
                 self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
                            "choices":[{"delta":{"role":"assistant"},"index":0,"finish_reason":None}]})
-            for tid in self.daemon.stream(ids, max_tokens, rinfo, sampling):
-                if t_first is None: t_first = time.time()
-                acc.append(tid)
-                cur = self.tok.decode(acc, skip_special_tokens=True)
-                delta = cur[len(prev_text):]; prev_text = cur
-                ch = ({"delta":{"content":delta}} if chat else {"text":delta})
-                self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
-                           "choices":[{**ch,"index":0,"finish_reason":None}]})
+            gen = self.daemon.stream(ids, max_tokens, rinfo, sampling)
+            try:
+                for tid in gen:
+                    if t_first is None: t_first = time.time()
+                    acc.append(tid)
+                    cur = self.tok.decode(acc, skip_special_tokens=True)
+                    cut = self._stop_at(cur, stops) if stops else None
+                    end = cut if cut is not None else len(cur) - (self._holdback(cur, stops) if stops else 0)
+                    delta = cur[len(prev_text):end] if end > len(prev_text) else ""
+                    if delta:
+                        prev_text = cur[:end]
+                        ch = ({"delta":{"content":delta}} if chat else {"text":delta})
+                        self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
+                                   "choices":[{**ch,"index":0,"finish_reason":None}]})
+                    if cut is not None:
+                        rinfo["finish_reason"] = "stop"; break
+                else:
+                    if stops and len(prev_text) < len(cur := self.tok.decode(acc, skip_special_tokens=True)):
+                        tail = cur[len(prev_text):]          # 생성 종료: 보류했던 꼬리(일치 아님) 방출
+                        ch = ({"delta":{"content":tail}} if chat else {"text":tail})
+                        self._sse({"id":cid,"object":obj,"created":created,"model":self.model_id,
+                                   "choices":[{**ch,"index":0,"finish_reason":None}]})
+            except (BrokenPipeError, ConnectionResetError):
+                return                                     # 클라이언트 끊김 → finally에서 생성기 닫힘 → CANCEL
+            finally:
+                gen.close()
             # 종료 청크: finish_reason + usage + timings(메트릭 — 마지막 이벤트에 포함)
             tm = self._timings(len(ids), acc, t0, t_first)
             fr = rinfo["finish_reason"]                    # daemon 권위(stop=EOS 만남 / length=max_tokens·maxlen)
@@ -233,10 +280,20 @@ class Handler(BaseHTTPRequestHandler):
                        "choices":[{**fin,"index":0,"finish_reason":fr}], "usage":tm["usage"], "timings":tm["timings"]})
             self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
         else:
-            for tid in self.daemon.stream(ids, max_tokens, rinfo, sampling):
-                if t_first is None: t_first = time.time()
-                acc.append(tid)
-            text = self.tok.decode(acc, skip_special_tokens=True)
+            gen = self.daemon.stream(ids, max_tokens, rinfo, sampling)
+            text = None
+            try:
+                for tid in gen:
+                    if t_first is None: t_first = time.time()
+                    acc.append(tid)
+                    if stops:
+                        cur = self.tok.decode(acc, skip_special_tokens=True)
+                        cut = self._stop_at(cur, stops)
+                        if cut is not None:
+                            text = cur[:cut]; rinfo["finish_reason"] = "stop"; break
+            finally:
+                gen.close()
+            if text is None: text = self.tok.decode(acc, skip_special_tokens=True)
             tm = self._timings(len(ids), acc, t0, t_first)
             fr = rinfo["finish_reason"]                    # daemon 권위(stop=EOS / length=max_tokens·maxlen)
             choice = ({"message":{"role":"assistant","content":text}} if chat else {"text":text})
@@ -315,7 +372,7 @@ def main():
     else:                                                          # qwen(27b·35b plain) — golden(rope) 필수
         if not args.golden: sys.exit("[serve_api] --model qwen 은 --golden(rope dir) 필수")
         cmd = [os.path.join(REPO,"tools","serve_daemon_qwen_online"), args.weights, args.golden, str(uq), str(args.maxlen), str(args.bmax)]
-    Handler.daemon = OnlineDaemon(cmd, env=daemon_env)
+    Handler.daemon = OnlineDaemon(cmd, env=daemon_env, cancel=(args.model in ("gemma4","qwen")))  # run_online_daemon 계열만 CANCEL
     Handler.model_id = model_id
     Handler.quant = {2:"w4a8", 1:"q4", 0:"fp32"}.get(uq, "w4a8")
     Handler.spec = (args.model in ("spec","gemma4-spec"))  # 모델 배지(/v1/models·웹UI)용 — spec 표시
