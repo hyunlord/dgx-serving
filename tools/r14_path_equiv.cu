@@ -5,6 +5,7 @@
 //   Every step's full logits and argmax token are compared byte-for-byte; logits are also written
 //   (<out>.batch.f32 / <out>.fast.f32, exclusive create) for external cmp.
 //   Usage: r14_path_equiv <weights> <prompt.bin> <out_prefix> [steps=128] [maxlen=2048] [Bmax=8]
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,7 +84,7 @@ int main(int argc,char **argv){
     G4GenerationStats gs{};
     int accepted=gemma4_generate(c,w,view,first_f,steps,-1,cf,sf,cs,ss,uq,on_step,&cap,&gs);
 
-    const char *mode=getenv("G4_CUDA_GRAPH");
+    const char *mode=knob_raw("G4_CUDA_GRAPH");
     int first_div=-1; double maxd=0; int tok_div=-1;
     for(int s=0;s<steps && s<(int)frow.size();s++){
         if(memcmp(brow[s].data(),frow[s].data(),(size_t)V*4)!=0 && first_div<0) first_div=s;

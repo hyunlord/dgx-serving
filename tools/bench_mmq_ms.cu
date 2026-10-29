@@ -1,6 +1,7 @@
 // (파이프 POC) multi-stage 벤치 — ms<BM,BN,KT,WM,WN,STAGES> 게이트+타이밍.
 //   컴파일: -DSB_BM=256 -DSB_BN=64 -DSB_KT=64 -DSB_WM=4 -DSB_WN=2 -DSB_STAGES=3
 //   ★게이트: (1)STAGES==2면 ms==tmpl BITWISE(깊이 일반화가 계산 불변) (2)ms vs gemv rel<1e-5 (3)결정성. "빠른데 틀림" 차단.
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -29,6 +30,7 @@ static void quantW(const std::vector<float>&w,int N,int K,std::vector<uint8_t>&p
             size_t gi=(size_t)n*K+b*QBLK+k; if(gi&1)pk[gi/2]|=(q<<4); else pk[gi/2]|=q;}}
 }
 int main(int argc,char**argv){
+    knobs_init("bench_mmq_ms");
     int M=argc>1?atoi(argv[1]):512, N=argc>2?atoi(argv[2]):17408, K=argc>3?atoi(argv[3]):5120, R=argc>4?atoi(argv[4]):100;
     int nblk=K/QBLK; unsigned seed=7;
     std::vector<float> Xf((size_t)M*K),Wf((size_t)N*K); for(auto&v:Xf)v=frand(seed); for(auto&v:Wf)v=frand(seed)*0.3f;

@@ -1,4 +1,5 @@
 // Dense Gemma teacher-forced PPL; existing graph/weights remain unchanged.
+#include "runtime/knobs.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -305,6 +306,7 @@ struct Reference {
     }
 };
 int main(int argc,char **argv) {
+    knobs_init("ppl_gemma4");
     if(argc==2&&strcmp(argv[1],"--self-test")==0) { self_test(); return 0; }
     if(argc==2&&strcmp(argv[1],"--kl-self-test")==0) { kl_self_test(); return 0; }
     Options o=parse(argc,argv); const std::string manifest=o.weights+"/manifest.json";
@@ -314,10 +316,10 @@ int main(int argc,char **argv) {
     require(c.num_q_heads>0&&c.num_kv_heads>0&&c.head_dim>0&&(c.scale_dtype==0||c.scale_dtype==1),"invalid model dimensions or scale dtype");
     require(c.layer_is_full!=nullptr,"layer type configuration missing");
     const int scale_dtype=c.scale_dtype;
-    const char *env=getenv("G4_MMQ_PREFILL");
+    const char *env=knob_raw("G4_MMQ_PREFILL");
     require(env&&(strcmp(env,"0")==0||strcmp(env,"1")==0),"explicit G4_MMQ_PREFILL=0 or1 required");
     const bool mmq=strcmp(env,"1")==0; require(o.golden.empty()||!mmq,"golden validation requires MMQ OFF");
-    const char *tile=getenv("MMQ256"); require(tile&&strcmp(tile,"0")==0,"explicit MMQ256=0 required");
+    const char *tile=knob_raw("MMQ256"); require(tile&&strcmp(tile,"0")==0,"explicit MMQ256=0 required");
     std::vector<int32_t> lengths(o.nwin,o.window);
     if(!o.lengths.empty()) lengths=read_exact<int32_t>(o.lengths,o.nwin);
     size_t input_count=0; int maximum=0;

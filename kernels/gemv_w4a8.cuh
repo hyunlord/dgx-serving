@@ -1,5 +1,6 @@
 #ifndef DGX_GEMV_W4A8_CUH
 #define DGX_GEMV_W4A8_CUH
+#include "runtime/knobs.h"
 #include <cstdint>
 #include "reduce.cuh"
 #include "qscale.cuh"
@@ -101,7 +102,7 @@ static inline void launch_gemv_w4a8_mlp(const int8_t *xq, const float *xs, const
 static inline void launch_gemv_w4a8_mlp_auto(const int8_t *xq, const float *xs, const int32_t *xsum,
                                     const uint8_t *Wq, const void *sw, float *Y,
                                     int IN, int OUT, int S, int scale_dtype = 0, cudaStream_t st = 0) {
-    static int u = getenv("MLP_U") ? atoi(getenv("MLP_U")) : 2;
+    static int u = knob_raw("MLP_U") ? atoi(knob_raw("MLP_U")) : 2;
     switch(u){ case 3: launch_gemv_w4a8_mlp<3>(xq,xs,xsum,Wq,sw,Y,IN,OUT,S,scale_dtype,st); break;
                case 4: launch_gemv_w4a8_mlp<4>(xq,xs,xsum,Wq,sw,Y,IN,OUT,S,scale_dtype,st); break;
                case 6: launch_gemv_w4a8_mlp<6>(xq,xs,xsum,Wq,sw,Y,IN,OUT,S,scale_dtype,st); break;

@@ -1,3 +1,4 @@
+#include "runtime/knobs.h"
 #include "../runtime/decode_state_gemma4.h"
 #include <cstdio>
 #include <cstdlib>
@@ -67,13 +68,13 @@ static void g4d_reserve_quant(size_t n){
         DK(cudaMalloc(&gd_xq,n)); DK(cudaMalloc(&gd_xs,(n/QBLK)*4)); DK(cudaMalloc(&gd_xsum,(n/QBLK)*4)); gd_cap=n; }
 }
 static bool g4d_mmq_prefill(){
-    static const bool enabled=[](){ const char* v=getenv("G4_MMQ_PREFILL"); return !v || strcmp(v,"0")!=0; }();
+    static const bool enabled=[](){ const char* v=knob_raw("G4_MMQ_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     return enabled;
 }
 static int g4d_mmq_min_s(){
     static const int min_s=[](){
         int value=16;
-        if(const char* v=getenv("G4_MMQ_MIN_S")){
+        if(const char* v=knob_raw("G4_MMQ_MIN_S")){
             char* end=nullptr; errno=0;
             const long parsed=strtol(v,&end,10);
             if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
@@ -101,7 +102,7 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
 
 // Dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel by default (R15);
 // G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
-static bool g4_attn_split(){ static const bool on=[](){ const char* v=getenv("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
+static bool g4_attn_split(){ static const bool on=[](){ const char* v=knob_raw("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
 
 struct G4DecodeGraph {
     cudaStream_t stream=nullptr;
@@ -115,7 +116,7 @@ struct G4DecodeGraph {
 };
 
 static bool g4d_graph_enabled(){
-    static const bool enabled=[](){ const char* v=getenv("G4_CUDA_GRAPH"); return v && strcmp(v,"1")==0; }();
+    static const bool enabled=[](){ const char* v=knob_raw("G4_CUDA_GRAPH"); return v && strcmp(v,"1")==0; }();
     return enabled;
 }
 
@@ -125,7 +126,7 @@ template<class Enqueue>
 static void g4d_run_graph(Enqueue &&enqueue, int base){
     // Same serialized, single-device lifetime as the decode scratch buffers.
     static G4DecodeGraph graph;
-    static const bool stats=[](){ const char* v=getenv("G4_CUDA_GRAPH_STATS"); return v && strcmp(v,"1")==0; }();
+    static const bool stats=[](){ const char* v=knob_raw("G4_CUDA_GRAPH_STATS"); return v && strcmp(v,"1")==0; }();
     using Clock=std::chrono::steady_clock;
     const auto elapsed_us=[](Clock::time_point a, Clock::time_point b){
         return std::chrono::duration<double,std::micro>(b-a).count();
@@ -206,10 +207,10 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
                    float *d_prenorm, bool graph_request, G4PreparedStep *prepared=nullptr) {
     gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
-    static const bool flash_prefill=[](){ const char* v=getenv("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
+    static const bool flash_prefill=[](){ const char* v=knob_raw("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     static const int flash_min_s=[](){
         int value=16;
-        if(const char* v=getenv("G4_FLASH_MIN_S")){
+        if(const char* v=knob_raw("G4_FLASH_MIN_S")){
             char* end=nullptr; errno=0;
             const long parsed=strtol(v,&end,10);
             if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)

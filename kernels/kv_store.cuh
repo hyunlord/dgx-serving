@@ -7,6 +7,7 @@
 //   K/V are produced in fp32 scratch and written with kv_store() (round-to-nearest conversion); readers
 //   load with kv_load() / kv_load4() and compute in fp32.
 //   G4_KV_STATS=1 counts non-finite stored values and the max |value| of stored K and V (printed at exit).
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,9 +25,9 @@ inline int g_kv_dtype_override = -1;
 inline int g4_kv_dtype() {
     if (g_kv_dtype_override >= 0) return g_kv_dtype_override;
     static const int dtype = []() {
-        const char *v = getenv("G4_KV_DTYPE");
+        const char *v = knob_raw("G4_KV_DTYPE");
         if (!v || !*v) {
-            const char *split = getenv("G4_ATTN_SPLIT");
+            const char *split = knob_raw("G4_ATTN_SPLIT");
             return (split && !strcmp(split, "0")) ? (int)KV_FP32 : (int)KV_F16;
         }
         if (!strcmp(v, "fp32")) return (int)KV_FP32;
@@ -39,7 +40,7 @@ inline int g4_kv_dtype() {
 // Called when a MoE model's state is allocated (before any KV access in that process).
 inline void g4_kv_force_fp32(const char *why) {
     if (g_kv_dtype_override == 0) return;
-    if (getenv("G4_KV_DTYPE") && strcmp(getenv("G4_KV_DTYPE"), "fp32")) fprintf(stderr, "G4_KV_DTYPE ignored (%s): fp32 KV\n", why);
+    if (knob_raw("G4_KV_DTYPE") && strcmp(knob_raw("G4_KV_DTYPE"), "fp32")) fprintf(stderr, "G4_KV_DTYPE ignored (%s): fp32 KV\n", why);
     g_kv_dtype_override = 0;
 }
 static inline size_t g4_kv_elem() { return g4_kv_dtype() == KV_FP32 ? 4 : 2; }
@@ -85,7 +86,7 @@ static __global__ void kv_store_kernel(const float *src, T *dst, size_t n, int s
 }
 static inline bool g4_kv_stats_enabled() {
     static const bool on = []() {
-        const char *v = getenv("G4_KV_STATS");
+        const char *v = knob_raw("G4_KV_STATS");
         if (!(v && v[0] == '1')) return false;
         atexit([]() {
             unsigned int h[4] = {};

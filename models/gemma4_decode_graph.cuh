@@ -170,9 +170,9 @@ int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
     if(!max_steps){if(result_stats)*result_stats=stats;return 0;}
     int start=st.n_past,V=c.vocab_size;
     // Default (unset) = v2 overlap; G4_CUDA_GRAPH=0 = eager, 1 = per-step v1 capture.
-    const char *mode=getenv("G4_CUDA_GRAPH");bool v2=!mode || strcmp(mode,"2")==0;
+    const char *mode=knob_raw("G4_CUDA_GRAPH");bool v2=!mode || strcmp(mode,"2")==0;
     // v2 = overlap by default (fastest measured R13 configuration); node updates are opt-in.
-    auto option=[](const char *name,bool fallback){const char *v=getenv(name);return v?strcmp(v,"0")!=0:fallback;};
+    auto option=[](const char *name,bool fallback){const char *v=knob_raw(name);return v?strcmp(v,"0")!=0:fallback;};
     bool overlap=v2 && option("G4_GRAPH_OVERLAP",true),direct=v2 && option("G4_GRAPH_NODE_UPDATE",false);
     const bool fixed=(flags&G4_GENERATE_FIXED_INPUT)!=0;
     float *logits=nullptr,*snapshots[2]={};int *token=nullptr,*out=nullptr,*host=nullptr,*sink=nullptr;
@@ -307,7 +307,7 @@ int gemma4_generate(const ModelConfig &c,const G4Weights &w,G4DecodeState &st,
     }
     DK(cudaFree(logits));DK(cudaFree(token));DK(cudaFree(sink));DK(cudaFree(out));DK(cudaFreeHost(host));
     if(result_stats)*result_stats=stats;
-    if(const char *v=getenv("G4_CUDA_GRAPH_STATS"))if(strcmp(v,"0")!=0)
+    if(const char *v=knob_raw("G4_CUDA_GRAPH_STATS"))if(strcmp(v,"0")!=0)
         fprintf(stderr,"G4_GENERATION_STATS planned_captures=%llu fallback_recaptures=%llu node_updates=%llu graph_updates=%llu mapping_fallbacks=%llu instantiations=%llu reinstantiations=%llu update_failures=%llu setparams_failures=%llu executed_steps=%llu accepted_steps=%llu speculative_steps=%llu capture_us=%.6f update_us=%.6f\n",stats.planned_captures,stats.fallback_recaptures,stats.node_updates,stats.graph_updates,stats.mapping_fallbacks,stats.instantiations,stats.reinstantiations,stats.update_failures,stats.setparams_failures,stats.executed_steps,stats.accepted_steps,stats.speculative_steps,stats.capture_us,stats.update_us);
     return (int)stats.accepted_steps;
 }

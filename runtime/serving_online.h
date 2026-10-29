@@ -12,6 +12,7 @@
 //     generate_single로 S=1 생성 세션을 돌리고, 새 요청/CANCEL이 오면 그 스텝 뒤 배치 루프로 돌아온다.
 //     ★backend가 보장: fast-path 토큰·KV == 배치 W=1 경로(R14 게이트 2b·2c) → 전환 시점과 무관한 출력.
 //   ★샘플링은 서빙 옵션(호스트 로직·D2H는 원래 하던 것): 검증/게이트는 greedy 경로(SMPL 미주입)로 불변.
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -69,7 +70,7 @@ namespace serving_online_detail {
 // STOP_IDS 환경변수 파서(config 주도 — serve_api가 generation_config.eos_token_id를 콤마 목록으로 주입).
 //   예: STOP_IDS="1,106,50"(gemma) / "248046,248044"(qwen). 미설정 시 빈 집합(종료 감지 없음 = 기존 동작).
 inline std::vector<int> parse_stop_ids_env(){
-    std::vector<int> v; const char* e = getenv("STOP_IDS");
+    std::vector<int> v; const char* e = knob_raw("STOP_IDS");
     if(e){ std::stringstream ss(e); std::string t; while(std::getline(ss,t,',')) if(!t.empty()) v.push_back(atoi(t.c_str())); }
     return v;
 }
@@ -79,7 +80,7 @@ inline std::vector<int> parse_stop_ids_env(){
 //     ★계산 불변: argmax 값은 그대로 판정 — stop_id 만나기 전 토큰들은 stop 없을 때와 bit-identical(종료 조건만 추가).
 inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int>& stop_ids = {}){
     using namespace serving_online_detail;
-    const char* log_input_env = getenv("DGX_LOG_INPUT_IDS");
+    const char* log_input_env = knob_raw("DGX_LOG_INPUT_IDS");
     const bool log_input_ids = log_input_env && std::string(log_input_env) == "1";
     const int V = be.vocab(), maxlen = be.max_len();
     void* st = be.alloc_state(Bmax);
@@ -89,7 +90,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
     // 비동기 stdin reader(스레드 안전 큐). 메인 배치 루프가 스텝 경계에서 drain.
     std::deque<Req> queue; std::mutex mtx; std::condition_variable cv; std::atomic<bool> shutdown{false};
     std::vector<long> cancels;                                                      // mtx 보호(reader→루프)
-    const char* fast_env = getenv("G4_SERVE_FASTPATH");
+    const char* fast_env = knob_raw("G4_SERVE_FASTPATH");
     const bool fastpath = be.single_stream() && !(fast_env && std::string(fast_env) == "0");
     unsigned long long n_fast_req=0, n_batch_req=0, n_switch=0, n_tail=0;
     std::thread reader([&]{
@@ -133,7 +134,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
         //   REP_WINDOW(env·기본 128): 최근 W토큰만 대상. REP_WINDOW=0 → 전체 이력이되 dedup(복리 없음).
         //   각 고유 토큰 1회만 v/repp(양수)·v*repp(음수) = HF 관례(복리 아님). 측정 근거: 스칼라 rep↑=축퇴↑ 반증.
         if(s.repp!=1.f){
-            static const int REP_W = [](){ const char* e=getenv("REP_WINDOW"); return e ? std::max(0,atoi(e)) : 128; }();
+            static const int REP_W = [](){ const char* e=knob_raw("REP_WINDOW"); return e ? std::max(0,atoi(e)) : 128; }();
             const int hn=(int)s.hist.size(), lo=(REP_W>0 && hn>REP_W) ? hn-REP_W : 0;
             for(int i=lo;i<hn;++i){ int t=s.hist[i];
                 bool seen=false; for(int j=lo;j<i;++j) if(s.hist[j]==t){ seen=true; break; }

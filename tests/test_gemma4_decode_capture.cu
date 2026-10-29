@@ -1,5 +1,6 @@
 // Before/after allocation-only diagnostic; exit 0 means capture complete, not accuracy PASS.
 // Usage: <binary> <QAT weights> <golden directory> <frozen chat ids.bin> <NEW output directory>
+#include "runtime/knobs.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -85,7 +86,7 @@ int main(int argc,char** argv) try {
     printf("uq=2 model=%s P=%d max_len=%d; prefill1024 repeats golden prompt; teacher forcing uses independent frozen chat IDs (not HF golden continuation)\n",
            moe?"moe":"dense",P,ML);
     for (const char* name:{"G4_MMQ_PREFILL","G4_MMQ_MIN_S","G4_FLASH_PREFILL","G4_FLASH_MIN_S","BM16"})
-        printf("ENV %s=%s\n",name,getenv(name)?getenv(name):"<unset>");
+        printf("ENV %s=%s\n",name,knob_raw(name)?knob_raw(name):"<unset>");
     float *cf=alloc<float>((size_t)ML*hd_f),*sf=alloc<float>((size_t)ML*hd_f);
     float *cs=alloc<float>((size_t)ML*hd_s),*ss=alloc<float>((size_t)ML*hd_s);
     if (gemma4_gen_rope_tables(manifest.c_str(),ML,hd_f,cf,sf,hd_s,cs,ss))

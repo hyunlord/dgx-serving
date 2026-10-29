@@ -10,6 +10,7 @@
 //     gemma4_generate 측정 구간 = 호출 전체(스트림·버퍼 준비 포함, R13 하네스와 같은 회계).
 //     BENCH_G4_DUMP_LOGITS=<prefix>: 측정 스텝마다 전체 logits를 <prefix>.uq<N>.f32에 기록(정확성 게이트 전용 —
 //     D2H·파일 쓰기가 들어가므로 이 실행의 시간은 속도 결과에 쓰지 않는다).
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,8 +66,9 @@ static size_t per_seq_bytes(const ModelConfig&c,int ml){
 }
 
 int main(int argc,char**argv){
+    knobs_init("bench_gemma4");
     setvbuf(stdout,NULL,_IOLBF,0);
-    const char *min_sec_env=getenv("BENCH_G4_PREFILL_MIN_SEC");
+    const char *min_sec_env=knob_raw("BENCH_G4_PREFILL_MIN_SEC");
     double min_prefill_sec=0;
     if(min_sec_env){
         char *end=nullptr; errno=0; min_prefill_sec=strtod(min_sec_env,&end);
@@ -85,12 +87,12 @@ int main(int argc,char**argv){
     const int V=c.vocab_size;
     const int hd_s=c.head_dim, hd_f=c.global_head_dim?c.global_head_dim:hd_s;
     int Bmax=0; for(int b:Bs) if(b>Bmax)Bmax=b;
-    const char* input_env=getenv("BENCH_G4_DECODE_INPUT");
+    const char* input_env=knob_raw("BENCH_G4_DECODE_INPUT");
     const bool greedy_input=input_env && strcmp(input_env,"greedy")==0;
     if(input_env && !greedy_input && strcmp(input_env,"fixed")!=0){ fprintf(stderr,"BENCH_G4_DECODE_INPUT must be fixed or greedy\n"); return 1; }
-    const int depth=getenv("BENCH_G4_DEPTH")?atoi(getenv("BENCH_G4_DEPTH")):0;
-    const int single_uq=getenv("BENCH_G4_SINGLE_UQ")?atoi(getenv("BENCH_G4_SINGLE_UQ")):0;
-    const char* graph_env=getenv("G4_CUDA_GRAPH");
+    const int depth=knob_raw("BENCH_G4_DEPTH")?atoi(knob_raw("BENCH_G4_DEPTH")):0;
+    const int single_uq=knob_raw("BENCH_G4_SINGLE_UQ")?atoi(knob_raw("BENCH_G4_SINGLE_UQ")):0;
+    const char* graph_env=knob_raw("G4_CUDA_GRAPH");
     const int graph_mode=graph_env?atoi(graph_env):2;   // gemma4_generate 기본 = v2(G4_CUDA_GRAPH 미지정)
     if(depth<0){ fprintf(stderr,"BENCH_G4_DEPTH must be >= 0\n"); return 1; }
     int MAXLEN=(ctx>depth?ctx:depth)+ngen+8;
@@ -147,7 +149,7 @@ int main(int argc,char**argv){
     const double single_roof = moe_single_roofline_ts(c,255.8);
     printf("  ★%s roofline 상한: %.1f t/s (active-bytes÷255.8GB/s%s)\n",
            is_moe?"MoE":"dense", single_roof, is_moe?", 병렬 dense FFN 포함":"");
-    const char* decode_interval_env=getenv("BENCH_G4_DECODE_INTERVAL");
+    const char* decode_interval_env=knob_raw("BENCH_G4_DECODE_INTERVAL");
     const bool decode_interval=decode_interval_env && strcmp(decode_interval_env,"1")==0;
     auto decode_epoch=[](){ return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); };
     printf("SINGLE_DECODE_MODE input=%s depth=%d graph=%d ngen=%d\n",greedy_input?"greedy":"fixed",depth,graph_mode,ngen);
@@ -166,7 +168,7 @@ int main(int argc,char**argv){
                 CK(cudaDeviceSynchronize()); cudaFree(dp);
             }
         };
-        const char* dump_env=getenv("BENCH_G4_DUMP_LOGITS");
+        const char* dump_env=knob_raw("BENCH_G4_DUMP_LOGITS");
         FILE* dump=nullptr; std::vector<float> dump_row(V);
         if(dump_env){ std::string dp=std::string(dump_env)+".uq"+std::to_string(sq)+".f32";
             dump=fopen(dp.c_str(),"wbx"); if(!dump){ fprintf(stderr,"cannot create %s\n",dp.c_str()); return 1; } }
@@ -217,12 +219,12 @@ int main(int argc,char**argv){
 
     // 프리필 t/s (B=1 통짜) — 별도 G4DecodeState
     { G4DecodeState st=alloc_g4_decode_state(c,MAXLEN);
-      const char* amort_env=getenv("BENCH_G4_AMORT");
+      const char* amort_env=knob_raw("BENCH_G4_AMORT");
       const int amort=!amort_env || strcmp(amort_env,"0")!=0;
-      const char* mmq_env=getenv("G4_MMQ_PREFILL");
+      const char* mmq_env=knob_raw("G4_MMQ_PREFILL");
       const bool mmq_enabled=!mmq_env || strcmp(mmq_env,"0")!=0;
       int mmq_min_s=16;
-      if(const char* v=getenv("G4_MMQ_MIN_S")){
+      if(const char* v=knob_raw("G4_MMQ_MIN_S")){
           char* end=nullptr; errno=0;
           const long parsed=strtol(v,&end,10);
           if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)

@@ -1,3 +1,4 @@
+#include "runtime/knobs.h"
 #include "../runtime/decode_state_gemma4.h"
 #include <cstdio>
 #include <cstdlib>
@@ -50,7 +51,7 @@ void free_g4_batch_state(G4BatchState &s){
 //   use_q4!=2 (q4): gemm_batch_q4(B-무관 canonical, 기존 경로 무변경).
 // Dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel by default (R15);
 // G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
-static bool g4_attn_split(){ static const bool on=[](){ const char* v=getenv("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
+static bool g4_attn_split(){ static const bool on=[](){ const char* v=knob_raw("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
 static int gb_sdtype, gb_use_q4;
 static int8_t *gb_xq=nullptr; static float *gb_xs=nullptr; static int32_t *gb_xsum=nullptr; static size_t gb_xcap=0;
 static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT, int B){
@@ -59,7 +60,7 @@ static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT,
         if(gb_xcap<n){ if(gb_xq)cudaFree(gb_xq); if(gb_xs)cudaFree(gb_xs); if(gb_xsum)cudaFree(gb_xsum);
             BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; }
         launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,B);          // B행 X 양자화(1 launch)
-        static int USE_BM16 = getenv("BM16") ? atoi(getenv("BM16")) : 0;
+        static int USE_BM16 = knob_raw("BM16") ? atoi(knob_raw("BM16")) : 0;
         if(B<=8)                     launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);
         else if(USE_BM16 && B>=14)   launch_gemm_bm16_splitk(gb_xq,gb_xs,m.wq,m.sc,Y,B,OUT,IN,gb_sdtype);  // opt-in(스킴 변경)
         else if(B<=15)               launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);

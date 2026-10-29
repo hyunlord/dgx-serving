@@ -9,6 +9,7 @@
 //   apply_chat_template(add_generation_prompt)로 토큰화해 int32 덤프(HF accept와 대조 공정성).
 //   rope: tgt_golden/gen_rope_*(전 위치 테이블 — target·assistant 공용. ★bf16 정밀 캡처본 = HF bf16 운영과 동일 정밀.
 //   ②의 fp32 rope 행과 ~2e-3 차이는 draft 품질에만 영향 가능 — accept 실측이 판정, spec 불변식과 무관[verify가 기준]).
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -80,21 +81,21 @@ int main(int argc,char**argv){
     //   spec==greedy 불변(verify가 결정권자 — K는 추측량일 뿐), 판정 비용은 conf ms로 분리 계측.
     // CONF_LOG=path: 고정 K 스윕에서 draft별 (margin, softmax top-prob, 사이클 accept m) CSV — STEP 0
     //   상관 진단 전용(측정 run에 D2H+호스트 softmax 추가 = spec t/s 오염 — 순 곱은 CONF_LOG 없이).
-    const int adapt = getenv("ADAPT") ? atoi(getenv("ADAPT")) : 0;
-    int KMIN  = getenv("KMIN") ? atoi(getenv("KMIN")) : 1;
-    int KMAXe = getenv("KMAX") ? atoi(getenv("KMAX")) : 8;
+    const int adapt = knob_raw("ADAPT") ? atoi(knob_raw("ADAPT")) : 0;
+    int KMIN  = knob_raw("KMIN") ? atoi(knob_raw("KMIN")) : 1;
+    int KMAXe = knob_raw("KMAX") ? atoi(knob_raw("KMAX")) : 8;
     if(KMAXe>KMAX) KMAXe=KMAX;
     if(KMIN<1) KMIN=1;
     if(KMIN>KMAXe) KMIN=KMAXe;
     std::vector<float> taus;
-    if(const char* ts=getenv("TAUS")){
+    if(const char* ts=knob_raw("TAUS")){
         std::string s(ts); size_t p=0;
         while(p<=s.size()){ size_t q=s.find(',',p); if(q==std::string::npos)q=s.size();
             if(q>p) taus.push_back((float)atof(s.substr(p,q-p).c_str())); p=q+1; }
     }
     if(adapt && taus.empty()) taus={4.f};
     FILE* conf_f=nullptr;
-    if(const char* cp=getenv("CONF_LOG")){
+    if(const char* cp=knob_raw("CONF_LOG")){
         conf_f=fopen(cp,"w");
         if(conf_f) fprintf(conf_f,"wl,K,cycle,j,margin,prob,m\n");
         printf("[spec_e2e] CONF_LOG=%s — 진단 run(spec t/s 오염 — accept/상관 전용)\n",cp);
@@ -212,11 +213,11 @@ int main(int argc,char**argv){
         std::vector<int> ptoks, stoks; double pms, sms; int cyc; double md,mv,mc,ak;
         plain_run(ids,ptoks,pms);                                // warm-up
         plain_run(ids,ptoks,pms);                                // 측정
-        if(const char* dp=getenv("DUMP_PLAIN")){                 // 진단용: plain 궤적 덤프(HF 궤적-난이도 대조 실험)
+        if(const char* dp=knob_raw("DUMP_PLAIN")){                 // 진단용: plain 궤적 덤프(HF 궤적-난이도 대조 실험)
             char pp[512]; snprintf(pp,sizeof(pp),"%s/traj_%s.bin",dp,wls[wi]);
             FILE*f=fopen(pp,"wb"); if(f){ fwrite(ptoks.data(),4,ptoks.size(),f); fclose(f); }
         }
-        if(getenv("SKIP_SPEC")){ printf("%-6s plain %.2f t/s (SKIP_SPEC — 궤적 덤프 전용)\n",wls[wi],N/(pms/1e3)); continue; }  // 진단용
+        if(knob_raw("SKIP_SPEC")){ printf("%-6s plain %.2f t/s (SKIP_SPEC — 궤적 덤프 전용)\n",wls[wi],N/(pms/1e3)); continue; }  // 진단용
         double ptps=N/(pms/1e3);
         auto row=[&](const char* mode, int K, int kmin, float tau, int hfdyn, bool diag){
             spec_run(ids,K,kmin,tau,hfdyn,false,stoks,sms,cyc,md,mv,mc,ak);   // warm-up

@@ -1,4 +1,5 @@
 // Manual standalone gate: nvcc -arch=sm_120 -O2 -std=c++17 -I. this-file -o shape
+#include "runtime/knobs.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
@@ -116,7 +117,7 @@ int main(int argc,char**argv){
     setvbuf(stdout,nullptr,_IOLBF,0);
     try{
         if(argc!=3)throw std::runtime_error("usage: shape manifest12.json manifest31.json");
-        if(getenv("MMQ256")&&strcmp(getenv("MMQ256"),"0"))throw std::runtime_error("set MMQ256=0 for canonical MMQ");
+        if(knob_raw("MMQ256")&&strcmp(knob_raw("MMQ256"),"0"))throw std::runtime_error("set MMQ256=0 for canonical MMQ");
         printf("CONFIG MMQ256=0 launcher=launch_gemm_mmq_w4a8_auto threshold_strict=1e-5 dtype=0\n");
         std::set<std::pair<int,int>> shapes;
         for(int a=1;a<argc;++a){ModelConfig c=load_config_gemma4(argv[a]);

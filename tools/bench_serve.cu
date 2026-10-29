@@ -2,6 +2,7 @@
 //   측정: throughput(req/s·tok/s), p50/p95/p99 latency(e2e·TTFT·TPOT), avg active-B(활용 proxy), admission.
 //   [M4 라운드2] 스케줄링을 serving_core.h(모델 무지)로 이관, qwen 결합을 QwenBackend(ServingBackend 훅 5개)로 묶음.
 //   토큰 선택(argmax/sampling)·logit readout 제외 — GPU 병렬 op라 직교(forward가 지배). gen 길이는 trace로 사전결정.
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -57,12 +58,13 @@ struct QwenBackend : ServingBackend {
 };
 
 int main(int argc,char**argv){
+    knobs_init("bench_serve");
     setvbuf(stdout,NULL,_IONBF,0);
     WD=argc>1?argv[1]:"artifacts/qwen35-0.8b/weights"; GD=(argc>2?argv[2]:"artifacts/qwen35-0.8b/mtp_golden")+std::string("/");
     int uq=argc>3?atoi(argv[3]):2; int Bmax=argc>4?atoi(argv[4]):8; int nreq=argc>5?atoi(argv[5]):200; unsigned seed=argc>6?atoi(argv[6]):42;
     std::vector<double> lambdas; for(int i=7;i<argc;i++) lambdas.push_back(atof(argv[i]));
     if(lambdas.empty()) lambdas={0.5,1,2,4,8,16,32};
-    int pmax=32; if(getenv("PMAX")) pmax=atoi(getenv("PMAX"));
+    int pmax=32; if(knob_raw("PMAX")) pmax=atoi(knob_raw("PMAX"));
     QwenBackend be; be.uq=uq;
     be.c=load_config_qwen((WD+"/manifest.json").c_str());
     be.V=be.c.vocab_size; be.NKV=be.c.num_kv_heads; be.HD=be.c.head_dim; int rot=be.c.rotary_dim;
@@ -103,8 +105,8 @@ int main(int argc,char**argv){
     printf("  %s\n",std::string(96,'-').c_str());
     auto row=[&](const char*nm,double lam,Stats&s){ printf("  %-6s %-4g | %8.3f %8.1f | %7.3f %7.3f %7.3f | %7.3f %7.4f | %5.2f %5.0f\n",
            nm,lam,s.thru_req,s.thru_tok,s.e2e50,s.e2e95,s.e2e99,s.ttft95,s.tpot95,s.avgB,s.maxq); };
-    bool run1tok = !getenv("SKIP1TOK");
-    bool runstat = !getenv("SKIPSTAT");
+    bool run1tok = !knob_raw("SKIP1TOK");
+    bool runstat = !knob_raw("SKIPSTAT");
     for(double lam:lambdas){
         auto t2=sc_gen_trace(lam,nreq,seed,pmax); Stats Cc=sc_run_continuous(be,st,ids,t2,Bmax,maxlen,true);
         if(run1tok){ auto t1=sc_gen_trace(lam,nreq,seed,pmax); Stats C1=sc_run_continuous(be,st,ids,t1,Bmax,maxlen,false); row("c1tok",lam,C1); }

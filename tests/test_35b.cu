@@ -2,6 +2,7 @@
 //   engine_load(35B) → MK_QWEN3_5_MOE, 같은 백본 커널 + MoE MLP 분기(graph) + router_topk 1개.
 //   golden = bf16(35B fp32 140GB OOM 회피) → MEAN-rel tol 완화(bf16 노이즈). 핵심 = argmax + next-token.
 //   DBG0 설정 시 layer0 moe_in/moe_out 덤프(③ MoE 블록 in-context 격리).
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -47,7 +48,7 @@ int main(int argc,char**argv){
         std::vector<float> ee(hidden.begin()+(size_t)l*SH,hidden.begin()+(size_t)(l+1)*SH);
         double mx=maxabs(ee,g), me=meanabs(ee,g), mrel=me/(rms(g)+1e-9);
         if(mx>worstmax)worstmax=mx; if(mrel>worstmrel){worstmrel=mrel;wl=l;}
-        if(getenv("V35")) printf("    L%-2d MAX=%.3e MEAN=%.3e mean-rel=%.2e\n",l,mx,me,mrel);}
+        if(knob_raw("V35")) printf("    L%-2d MAX=%.3e MEAN=%.3e mean-rel=%.2e\n",l,mx,me,mrel);}
     auto gl=rf("q4_logits.bin",(size_t)S*V);
     bool amok=true; for(int p=0;p<S;p++) if(am(logits,p)!=am(gl,p)) amok=false;
     int lastE=am(logits,S-1), lastG=am(gl,S-1);

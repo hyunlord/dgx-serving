@@ -1,5 +1,6 @@
 #ifndef DGX_ATTENTION_CUH
 #define DGX_ATTENTION_CUH
+#include "runtime/knobs.h"
 #include <float.h>
 #include <cstdio>
 #include <cstdlib>
@@ -88,7 +89,7 @@ static inline void launch_attn(const float *Q, const float *K, const float *V, f
 static __device__ int g_attn_diag_reverse = 0;
 static inline void attn_diag_init() {
     static const bool done = []() {
-        const char *v = getenv("G4_ATTN_DIAG_REVERSE");
+        const char *v = knob_raw("G4_ATTN_DIAG_REVERSE");
         int on = (v && v[0] == '1') ? 1 : 0;
         if (on) { cudaMemcpyToSymbol(g_attn_diag_reverse, &on, sizeof(int)); fprintf(stderr, "G4_ATTN_DIAG_REVERSE=1\n"); }
         return true; }();

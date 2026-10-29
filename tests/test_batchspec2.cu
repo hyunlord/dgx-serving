@@ -5,6 +5,7 @@
 //     (block-diagonal 슬롯 격리 정확성). fp32(uq=0) → W4A8(uq=2) 순.
 //   상태는 슬롯별 독립 DecodeState(single spec의 KV/GDN/convctx + promote_tree_path 자산 그대로). verify만 batch.
 //   사용법: ./tests/test_batchspec2 [weights] [mtp_golden] [N] [K] [W] [uq]
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -314,7 +315,7 @@ int main(int argc,char**argv){
     N=argc>3?atoi(argv[3]):24, K=argc>4?atoi(argv[4]):4, W=argc>5?atoi(argv[5]):3;
     int uq=argc>6?atoi(argv[6]):0;
     K2=argc>7?atoi(argv[7]):K; W2=argc>8?atoi(argv[8]):W;   // ragged: 슬롯 B 트리 형상(기본=A와 동일=uniform)
-    g_time=(getenv("TIME")&&atoi(getenv("TIME"))>0)?1:0;   // 곱 측정 모드
+    g_time=(knob_raw("TIME")&&atoi(knob_raw("TIME"))>0)?1:0;   // 곱 측정 모드
     bq4=uq; dq4=0; int mq4=0;             // body precision=uq(0 fp32/2 W4A8). draft/mtp fp32(정확성 게이트 목적).
     c=load_config_qwen((WD+"/manifest.json").c_str());
     H=c.hidden_size; V=c.vocab_size; rot=c.rotary_dim; NKV=c.num_kv_heads; HD=c.head_dim;

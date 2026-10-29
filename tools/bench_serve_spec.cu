@@ -8,6 +8,7 @@
 //         ISO=1: 서빙 각 요청 출력 == 단독 spec(같은 프롬프트/gen/K/W) bit-identical 게이트(iso mism=0).
 //         TIME=1: verify forward를 B_act별 버킷 계측(곱 B-scaling: 곱(B)=B·t(1)/t(B), STEP C).
 //   사용법: ./tools/bench_serve_spec [weights] [mtp_golden] [uq=2] [Bmax=8] [nreq=200] [seed=42] [K=6] [W=4] [λ...]
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -50,7 +51,7 @@ struct MtpW { float *fc,*enorm,*hnorm,*norm,*iln,*pln,*qn,*kn,*Wq,*Wk,*Wv,*Wo,*W
 //   q=clip(round(w/s)+8,0,15), 2/byte low=even). act는 fp32 유지(gemm_batch_q4 — weight bytes 4×↓는
 //   동일, act 양자화 오차 없음 = accept 위험 최소). MTP_Q4=1로 켬(기본 fp32 — 단계 실측).
 static int g_mtp_q4=-1;
-static inline int mtp_q4_on(){ if(g_mtp_q4<0) g_mtp_q4=(getenv("MTP_Q4")&&atoi(getenv("MTP_Q4"))>0)?1:0; return g_mtp_q4; }
+static inline int mtp_q4_on(){ if(g_mtp_q4<0) g_mtp_q4=(knob_raw("MTP_Q4")&&atoi(knob_raw("MTP_Q4"))>0)?1:0; return g_mtp_q4; }
 static MQ4 quant_q4_host(const std::vector<float>&w, size_t OUT, size_t IN){
     if(IN%QBLK){ fprintf(stderr,"quant_q4_host: IN %zu %% QBLK\n",IN); abort(); }
     size_t nb=IN/QBLK;
@@ -101,7 +102,7 @@ struct MtpKV { float *Kc,*Vc; int n; };
 //   DRAFT_GEMV=1: 기존 gemv 경로 폴백(P4 재현·A/B). gemm_batch 템플릿은 B∈{1,2,4,8,16} → Mr=round-up
 //   패딩(gemm만 Mr, 나머지 커널은 M — row-독립이라 패딩 행 쓰레기 무해).
 static int g_draft_gemv=-1;
-static inline int draft_gemv_on(){ if(g_draft_gemv<0) g_draft_gemv=(getenv("DRAFT_GEMV")&&atoi(getenv("DRAFT_GEMV"))>0)?1:0; return g_draft_gemv; }
+static inline int draft_gemv_on(){ if(g_draft_gemv<0) g_draft_gemv=(knob_raw("DRAFT_GEMV")&&atoi(knob_raw("DRAFT_GEMV"))>0)?1:0; return g_draft_gemv; }
 static inline int mroundup(int M){ return M<=1?1:M<=2?2:M<=4?4:M<=8?8:16; }
 static inline void draft_mm_f32(const float*X,const float*W,float*Y,int IN,int OUT,int M){
     if(draft_gemv_on()) launch_gemv_f32(X,W,Y,IN,OUT,M);
@@ -110,7 +111,7 @@ static inline void draft_mm_f32(const float*X,const float*W,float*Y,int IN,int O
 // P2b variant dispatch: DRAFT_MW{0=gemm_batch(기존),1=mw 타일1(NW↑행2),2=mw 타일2(행4)} — draft q4 matmul만.
 // draft 스킴 변경은 제안 토큰만 바꿀 수 있고(accept 변동 가능) 출력은 verify가 보증(spec==greedy) → ISO 게이트 그대로 유효.
 static int g_draft_mw=-1;
-static inline int draft_mw_on(){ if(g_draft_mw<0) g_draft_mw=getenv("DRAFT_MW")?atoi(getenv("DRAFT_MW")):0; return g_draft_mw; }
+static inline int draft_mw_on(){ if(g_draft_mw<0) g_draft_mw=knob_raw("DRAFT_MW")?atoi(knob_raw("DRAFT_MW")):0; return g_draft_mw; }
 static inline void draft_mm_q4(const float*X,const uint8_t*wq,const void*sc,float*Y,int IN,int OUT,int M,int sdt){
     if(draft_gemv_on()) launch_gemv_q4(X,wq,sc,Y,IN,OUT,M,sdt);
     else if(draft_mw_on() && launch_gemm_mw_q4(X,wq,sc,Y,IN,OUT,M,sdt,0,draft_mw_on())) {}
@@ -363,7 +364,7 @@ static void slot_prefill(SpecSlot&s, const std::vector<int>&prompt){
 //   출력은 spec==greedy 성질로 형상 무관 불변 → 기존 ISO 게이트가 전환 하에서도 유효.
 static int hs_on=0; static int hsK[2],hsW[2]; static double hs_thr=0;
 static inline void hs_init(){ static int done=0; if(done)return; done=1;
-    const char*h=getenv("HOTSWITCH");
+    const char*h=knob_raw("HOTSWITCH");
     if(h&&sscanf(h,"%d,%d,%d,%d,%lf",&hsK[0],&hsW[0],&hsK[1],&hsW[1],&hs_thr)==5) hs_on=1; }
 static Stats run_spec_continuous(std::vector<Req> reqs,int Bmax,std::vector<std::vector<int>>*iso_out=nullptr){
     int R=reqs.size();
@@ -415,7 +416,7 @@ static Stats run_spec_continuous(std::vector<Req> reqs,int Bmax,std::vector<std:
         // ── spec 사이클(활성 슬롯) ──
         auto t0=clk::now();
         // 1) MTP draft — P4: 슬롯 배치(1 forward=M행, sync K회). DRAFT_SEQ=1이면 순차(A/B·게이트용).
-        static int g_draft_seq=(getenv("DRAFT_SEQ")&&atoi(getenv("DRAFT_SEQ"))>0)?1:0;
+        static int g_draft_seq=(knob_raw("DRAFT_SEQ")&&atoi(knob_raw("DRAFT_SEQ"))>0)?1:0;
         if(g_draft_seq){
             for(int a=0;a<Ba;a++){ int b=act[a]; SpecSlot&s=slot[b];
                 mnS[b]=s.kv.n; baseS[b]=s.st.n_past;
@@ -581,28 +582,29 @@ static std::vector<Req> gen_trace(double lambda,int nreq,unsigned seed,int pmax)
     std::mt19937 rng(seed); std::exponential_distribution<double> ia(lambda);
     std::uniform_int_distribution<int> pP(8,pmax), gS(16,48), gL(96,192); std::uniform_real_distribution<double> u(0,1);
     // P2b regime 축: SHORTP=short 요청 비율(기본 0.7). short-heavy 0.9 / long-heavy 0.3 등 — trace 형상만 바꿈(스킴 불변).
-    static double shortp=-1; if(shortp<0){ shortp=getenv("SHORTP")?atof(getenv("SHORTP")):0.7; }
+    static double shortp=-1; if(shortp<0){ shortp=knob_raw("SHORTP")?atof(knob_raw("SHORTP")):0.7; }
     std::vector<Req> v(nreq); double t=0;
     for(int i=0;i<nreq;i++){ t+=ia(rng); v[i].arrival=t; v[i].P=pP(rng); v[i].gen=(u(rng)<shortp)?gS(rng):gL(rng); }
     return v;
 }
 
 int main(int argc,char**argv){
+    knobs_init("bench_serve_spec");
     setvbuf(stdout,NULL,_IONBF,0);
     WD=argc>1?argv[1]:"artifacts/qwen35-0.8b/weights"; GD=(argc>2?argv[2]:"artifacts/qwen35-0.8b/mtp_golden")+std::string("/");
     uq=argc>3?atoi(argv[3]):2; int Bmax=argc>4?atoi(argv[4]):8; int nreq=argc>5?atoi(argv[5]):200; unsigned seed=argc>6?atoi(argv[6]):42;
     K=argc>7?atoi(argv[7]):6; W=argc>8?atoi(argv[8]):4; Nn=K+W;
     std::vector<double> lambdas; for(int i=9;i<argc;i++) lambdas.push_back(atof(argv[i]));
     if(lambdas.empty()) lambdas={1,2,4,8};
-    g_time=(getenv("TIME")&&atoi(getenv("TIME"))>0)?1:0;
-    g_cyc=(getenv("CYC")&&atoi(getenv("CYC"))>0)?1:0;
-    int iso=(getenv("ISO")&&atoi(getenv("ISO"))>0)?1:0;
-    dq4=(uq!=0)?1:0; if(getenv("DQ4")) dq4=atoi(getenv("DQ4"));   // draft lm_head=q4 기본(uq!=0) — 27b untied embed서 필수(E-as-lmhead=accept 붕괴)
-    int pmax=getenv("PMAX")?atoi(getenv("PMAX")):32;
-    int trials=(getenv("TRIALS")&&atoi(getenv("TRIALS"))>0)?1:0;   // warm 서버 모드(오토튜닝): 모델 1회 로드, stdin에서 trial 반복
+    g_time=(knob_raw("TIME")&&atoi(knob_raw("TIME"))>0)?1:0;
+    g_cyc=(knob_raw("CYC")&&atoi(knob_raw("CYC"))>0)?1:0;
+    int iso=(knob_raw("ISO")&&atoi(knob_raw("ISO"))>0)?1:0;
+    dq4=(uq!=0)?1:0; if(knob_raw("DQ4")) dq4=atoi(knob_raw("DQ4"));   // draft lm_head=q4 기본(uq!=0) — 27b untied embed서 필수(E-as-lmhead=accept 붕괴)
+    int pmax=knob_raw("PMAX")?atoi(knob_raw("PMAX")):32;
+    int trials=(knob_raw("TRIALS")&&atoi(knob_raw("TRIALS"))>0)?1:0;   // warm 서버 모드(오토튜닝): 모델 1회 로드, stdin에서 trial 반복
     c=load_config_qwen((WD+"/manifest.json").c_str());
     H=c.hidden_size; V=c.vocab_size; rot=c.rotary_dim; NKV=c.num_kv_heads; HD=c.head_dim;
-    maxlen=pmax+192+((trials||getenv("HOTSWITCH"))?8+13:K+Nn)+16; if(maxlen<288) maxlen=288;   // TRIALS/HOTSWITCH: 최악 형상(K8,Nn13) 기준 고정(형상 갱신에도 rope/KV 안전)
+    maxlen=pmax+192+((trials||knob_raw("HOTSWITCH"))?8+13:K+Nn)+16; if(maxlen<288) maxlen=288;   // TRIALS/HOTSWITCH: 최악 형상(K8,Nn13) 기준 고정(형상 갱신에도 rope/KV 안전)
     static std::vector<int> ids=ri("token_ids.bin"); IDS=&ids;
     // rope: ext 테이블 우선(bench_serve와 동일)
     std::vector<float> cl,sl;

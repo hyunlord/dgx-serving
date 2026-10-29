@@ -3,6 +3,7 @@
 //   router top-k → 선택 expert SwiGLU 가중합 + shared expert(sigmoid 게이트). 백본/MLP 커널 재사용,
 //   신규는 graph 배선 + router_topk 1개. 정확성-우선 naive(토큰×expert 루프). expert q4 = 배치 offset 인덱싱.
 //   n2[S,H] (post_attention_layernorm 출력) → out[S,H].
+#include "runtime/knobs.h"
 #include <vector>
 #include <cuda_runtime.h>
 #include "../runtime/config.h"
@@ -40,7 +41,7 @@ static inline void moe_mlp_block(const ModelConfig &c, const QLayer &L, const fl
     // router: gemv_f32(fp32 weight) → top-k (didx/dw device 상주 — fused는 D2H 안 함)
     launch_gemv_f32(n2, L.router, rlog, H, E, S);
     launch_router_topk(rlog, didx, dw, S, E, K);
-    static int g_fused = getenv("MOE_FUSED") ? atoi(getenv("MOE_FUSED")) : 1;   // ★default fused(bit-id+전축 개선). MOE_FUSED=0=naive 폴백
+    static int g_fused = knob_raw("MOE_FUSED") ? atoi(knob_raw("MOE_FUSED")) : 1;   // ★default fused(bit-id+전축 개선). MOE_FUSED=0=naive 폴백
     if (g_fused) {
         // #2 device-fused: grouped gemv 4커널(D2H·host loop 제거). reduce가 out을 덮어씀(memset 불요).
         long nslot=(long)S*K;

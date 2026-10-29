@@ -1,4 +1,5 @@
 // Capture and timing evidence; equivalence requires comparing separate runs.
+#include "runtime/knobs.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -113,7 +114,7 @@ int main(int argc,char** argv) try {
     if(eos_mode) { auto f=output(prefix+".second_pattern.i32"); save_ids(f.get(),second); close_file(f); }
     setvbuf(stdout,nullptr,_IOLBF,0);
     printf("R13 mode=%s capacity=%d uq=2 scale_dtype=%d graph=%s overlap=%s node_update=%s\n",mode.c_str(),capacity,c.scale_dtype,
-           getenv("G4_CUDA_GRAPH")?getenv("G4_CUDA_GRAPH"):"0",getenv("G4_GRAPH_OVERLAP")?getenv("G4_GRAPH_OVERLAP"):"default",getenv("G4_GRAPH_NODE_UPDATE")?getenv("G4_GRAPH_NODE_UPDATE"):"default");
+           knob_raw("G4_CUDA_GRAPH")?knob_raw("G4_CUDA_GRAPH"):"0",knob_raw("G4_GRAPH_OVERLAP")?knob_raw("G4_GRAPH_OVERLAP"):"default",knob_raw("G4_GRAPH_NODE_UPDATE")?knob_raw("G4_GRAPH_NODE_UPDATE"):"default");
     float *cf=alloc<float>(static_cast<size_t>(capacity)*hf),*sf=alloc<float>(static_cast<size_t>(capacity)*hf);
     float *cs=alloc<float>(static_cast<size_t>(capacity)*hs),*ss=alloc<float>(static_cast<size_t>(capacity)*hs);
     if(gemma4_gen_rope_tables(manifest.c_str(),capacity,hf,cf,sf,hs,cs,ss)) throw std::runtime_error("RoPE generation failed");

@@ -3,6 +3,7 @@
 //   측정: regime(λ) × Bmax → throughput(tok/s)·tpot95·avgB. 메모리 사전 필터(MemAvailable + KV 선형 캡).
 //   ★타이밍이라 rope=엔진 생성 dummy(값 무관, golden 17행 우회 — 현실 gen 길이 U[16,192]). warm 프로토콜.
 //   사용법: ./bench_serve_gemma4 <weights> [uq=2] [nreq=48] [seed=42] [pmax=32] [maxlen=384] [Bmax,...] -- [λ,...]
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -58,6 +59,7 @@ struct Gemma4Backend : ServingBackend {
 };
 
 int main(int argc,char**argv){
+    knobs_init("bench_serve_gemma4");
     setvbuf(stdout,NULL,_IONBF,0);
     std::string WD=argc>1?argv[1]:"artifacts/gemma4-31b/weights";
     int uq=argc>2?atoi(argv[2]):2; int nreq=argc>3?atoi(argv[3]):48; unsigned seed=argc>4?atoi(argv[4]):42;

@@ -1,3 +1,4 @@
+#include "runtime/knobs.h"
 #include "qwen35_batch.h"
 #include <cstdio>
 #include <cstdlib>
@@ -128,7 +129,7 @@ void qwen35_decode_batch(const ModelConfig &c, const QwenWeights &w, BatchDecode
             // 챕터9 stream-K BM=16 split-K(few-blocks 해결): in-engine WIN(27B +13.9% tok/s·TPOT −34%, 0.8b +4.6%, argmax==single).
             //   단 opt-in(기본 off): split-K(MMA)는 sb(DP4A)와 다른 커널 → W4A8 borderline flip으로 SB 계열의 bit-identical-across-B
             //   속성 깸(test_cbatch_prod got==iso). argmax는 정확. env BM16=1로 켜서 throughput↑(borderline flip trade 감수). B≤8 sb8.
-            static int USE_BM16 = getenv("BM16") ? atoi(getenv("BM16")) : 0;
+            static int USE_BM16 = knob_raw("BM16") ? atoi(knob_raw("BM16")) : 0;
             if(B<=8)                       launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);
             else if(USE_BM16 && B>=14)     launch_gemm_bm16_splitk(g_bxq,g_bxs,m.wq,m.sc,Y,B,OUT,IN,sdtype);  // B14-16만: BM=16 타일 낭비(16−B)/16 < few-blocks 이득(측정: B≤13 SB가 빠름, B14 +4.7%/B16 +3.5%). M=B rows, split-K
             else if(B<=15)                 launch_gemv_w4a8_sb(g_bxq,g_bxs,m.wq,m.sc,Y,IN,OUT,B,sdtype);

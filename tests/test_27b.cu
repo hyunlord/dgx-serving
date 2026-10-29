@@ -1,6 +1,7 @@
 // 챕터5 STEP 2.3: Qwen3.5-27B q4 == golden_q4 (커널/graph 불변 = 보편화 첫 증명).
 //   engine_load(27B, load_fp32=0) → 같은 qwen3_5 kind, config만 27B 값. qwen35_forward(use_q4=1) → golden_q4 대조.
 //   fp32 경로는 27B서 108GB OOM이라 미사용(메모리 물리학). q4가 실제 서빙 정밀도 + golden_q4가 graph 정확성 커버.
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -39,7 +40,7 @@ int main(int argc,char**argv){
     TCK(cudaMemcpy(logits.data(),d_logits,logits.size()*4,cudaMemcpyDeviceToHost));
     TCK(cudaMemcpy(prenorm.data(),d_prenorm,SH*4,cudaMemcpyDeviceToHost));
 
-    if(getenv("DUMP")){ const char*od=getenv("DUMP");
+    if(knob_raw("DUMP")){ const char*od=knob_raw("DUMP");
         FILE*fh=fopen((std::string(od)+"/eng_hidden.bin").c_str(),"wb"); fwrite(hidden.data(),4,hidden.size(),fh); fclose(fh);
         FILE*fl=fopen((std::string(od)+"/eng_logits.bin").c_str(),"wb"); fwrite(logits.data(),4,logits.size(),fl); fclose(fl);
         printf("  [DUMP] eng_hidden/eng_logits → %s\n",od); }
@@ -55,7 +56,7 @@ int main(int argc,char**argv){
         std::vector<float> ee(hidden.begin()+(size_t)l*SH,hidden.begin()+(size_t)(l+1)*SH);
         double mx=mae(ee,g), me=meanabs(ee,g), gr=rms(g), mrel=me/(gr+1e-9);
         if(mx>worstmax)worstmax=mx; if(mrel>worstmrel){worstmrel=mrel;wl=l;}
-        if(getenv("V27")) printf("    L%-2d MAX=%.3e MEAN=%.3e |g|rms=%.3e mean-rel=%.2e\n",l,mx,me,gr,mrel);}
+        if(knob_raw("V27")) printf("    L%-2d MAX=%.3e MEAN=%.3e |g|rms=%.3e mean-rel=%.2e\n",l,mx,me,gr,mrel);}
     auto gl=rf("q4_logits.bin",(size_t)S*V);
     bool amok=true; for(int p=0;p<S;p++) if(am(logits,p)!=am(gl,p)) amok=false;
     int lastE=am(logits,S-1), lastG=am(gl,S-1);

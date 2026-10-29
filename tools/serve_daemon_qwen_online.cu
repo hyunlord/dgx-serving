@@ -4,6 +4,7 @@
 //   ★qwen은 GDN state 보유 → reset_slot(슬롯 재사용 시 GDN clear) override 필수(gemma4는 no-op).
 //   rope: 실제 golden 테이블(ext=pos정확 / long=128타일 근사) — bench_serve.cu와 동일. bit-id 게이트는 계산 일관성(API==단독).
 //   사용법: serve_daemon_qwen_online <weights_dir> <golden_dir(rope)> [uq=2] [maxlen=384] [Bmax=8]
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -51,6 +52,7 @@ static std::vector<float> rf(const std::string& p, size_t n){
 }
 
 int main(int argc,char**argv){
+    knobs_init("serve_daemon_qwen_online");
     std::string WD = argc>1?argv[1]:"artifacts/qwen35-35b-a3b/weights";
     std::string GD = (argc>2?argv[2]:"artifacts/qwen35-35b-a3b/golden") + std::string("/");
     int uq = argc>3?atoi(argv[3]):2, maxlen = argc>4?atoi(argv[4]):384, Bmax = argc>5?atoi(argv[5]):8;

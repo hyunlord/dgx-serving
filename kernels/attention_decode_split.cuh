@@ -13,6 +13,7 @@
 // Rows: row r has position pos_arr ? pos_arr[r] : base + r*pos_step and KV at Kc + r*kv_stride
 //   (kv_stride = 0 when all rows share one sequence's KV, e.g. verify).
 // Layout: Q/O [rows, NQ, HD]; K/V cache [len, NKV, HD] per sequence; scratch index (r*NQ + h)*ns_cap + c.
+#include "runtime/knobs.h"
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +26,7 @@
 static inline int attn_split_chunk() {
     static const int chunk = []() {
         int c = 64;
-        if (const char *v = getenv("G4_ATTN_CHUNK")) {
+        if (const char *v = knob_raw("G4_ATTN_CHUNK")) {
             c = atoi(v);
             if (c != 32 && c != 64 && c != 128 && c != 256) {
                 fprintf(stderr, "Invalid G4_ATTN_CHUNK=%s (32, 64, 128 or 256)\n", v); exit(1);

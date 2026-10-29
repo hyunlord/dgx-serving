@@ -1,4 +1,5 @@
 // Separate gates for the opt-in dense Gemma MMQ path; no changes to legacy tests.
+#include "runtime/knobs.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -56,10 +57,10 @@ int main(int argc,char **argv) {
     const std::string wd=argv[1], gd=std::string(argv[2])+"/", mode=argv[3];
     require(mode=="golden" || mode=="determinism" || mode=="chunk" || mode=="dump","unknown mode");
     require(argc==(mode=="dump"?5:4),"only dump requires NEW_OUTDIR");
-    const char *env=getenv("G4_MMQ_PREFILL");
+    const char *env=knob_raw("G4_MMQ_PREFILL");
     const bool mmq=!env || strcmp(env,"0")!=0;
     const std::string out=mode=="dump"?argv[4]:"";
-    require(getenv("MMQ256") && strcmp(getenv("MMQ256"),"0")==0,"MMQ256 must equal 0");
+    require(knob_raw("MMQ256") && strcmp(knob_raw("MMQ256"),"0")==0,"MMQ256 must equal 0");
     ModelConfig c=load_config_gemma4((wd+"/manifest.json").c_str());
     require(c.num_experts==0 && c.num_layers>=8 && (c.scale_dtype==0 || c.scale_dtype==1),"dense scale_dtype 0/1 model only");
     printf("PATH=%s G4_MMQ_PREFILL=%s SCALE_DTYPE=%d uq=2 amort=1 MMQ256=0 coverage=dispatch_request_not_kernel_trace\n",mmq?"MMQ":"SB",env?env:"<unset>",c.scale_dtype);

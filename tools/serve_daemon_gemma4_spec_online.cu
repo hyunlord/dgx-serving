@@ -7,6 +7,7 @@
 //   동시성 = 슬롯별 라운드로빈 사이클(per-slot 순차 = 단독과 동일 계산 = 격리 구성적 — 배칭 이득은 후속 perf).
 //   rope = 온디바이스 생성(plain daemon 동일 — target/assistant 같은 테이블 = 내적 일관·spec 불변식 성립).
 //   사용법: serve_daemon_gemma4_spec_online <tgt_weights> <ast_weights> [uq=2] [maxlen=384] [Bmax=4] [K=4] [ast_uq=2]
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +46,7 @@ static double mem_avail_gb(){
 struct SpecSlot { long req=-1; int pos=0; int gen=0; int max_tokens=0; int cur=0; };  // pos=KV 확정 길이(=anchor 위치)
 
 int main(int argc,char**argv){
+    knobs_init("serve_daemon_gemma4_spec_online");
     std::string TW = argc>1?argv[1]:"artifacts/gemma4-12b/weights";
     std::string AW = argc>2?argv[2]:"artifacts/gemma4-12b-assistant/weights";
     const int uq     = argc>3?atoi(argv[3]):2;

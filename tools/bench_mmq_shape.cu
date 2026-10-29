@@ -1,6 +1,7 @@
 // (BM/BN POC) 형상 스윕 벤치 — tmpl<BM,BN,KT,WM,WN> 형상별 컴파일→게이트→warm 실측.
 //   컴파일: nvcc ... -DSB_BM=64 -DSB_BN=64 -DSB_KT=128 -DSB_WM=2 -DSB_WN=2
 //   ★게이트: tmpl vs gemv_w4a8 rel<1e-5 + 결정성(빠른데 틀림 차단). warm 50 rep 자체워밍. 출력 파싱형.
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -27,6 +28,7 @@ static void quantW(const std::vector<float>&w,int N,int K,std::vector<uint8_t>&p
             size_t gi=(size_t)n*K+b*QBLK+k; if(gi&1)pk[gi/2]|=(q<<4); else pk[gi/2]|=q;}}
 }
 int main(int argc,char**argv){
+    knobs_init("bench_mmq_shape");
     int M=argc>1?atoi(argv[1]):512, N=argc>2?atoi(argv[2]):17408, K=argc>3?atoi(argv[3]):5120, R=argc>4?atoi(argv[4]):100;
     int nblk=K/QBLK; unsigned seed=7;
     std::vector<float> Xf((size_t)M*K),Wf((size_t)N*K); for(auto&v:Xf)v=frand(seed); for(auto&v:Wf)v=frand(seed)*0.3f;

@@ -6,6 +6,7 @@
 //   Phase 0 스코프: gemma4 plain 1모델·greedy만(샘플링 없음)·dummy rope(실-rope 정확성은 별도 트랙 — bit-id는 같은 rope라 불변).
 //   프로토콜(라인 기반): stdin "<max_tokens> <id0> <id1> ... <idP-1>" → stdout 생성 토큰 "<id>\n"(토큰마다 flush) + "###END\n".
 //   사용법: serve_daemon_gemma4 <weights_dir> [uq=2] [maxlen=384]   (uq/config는 front이 recipe에서 읽어 전달)
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -22,6 +23,7 @@
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"[daemon] CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 
 int main(int argc, char** argv){
+    knobs_init("serve_daemon_gemma4");
     std::string WD = argc>1 ? argv[1] : "artifacts/gemma4-31b/weights";
     int uq = argc>2 ? atoi(argv[2]) : 2;
     int maxlen = argc>3 ? atoi(argv[3]) : 384;

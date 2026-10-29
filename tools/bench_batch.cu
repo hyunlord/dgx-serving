@@ -1,6 +1,7 @@
 // 챕터9 batch serving STEP A: batch decode throughput 곡선 (B 곡선 + odd-batch 붕괴 + plateau measure).
 //   각 B: 짧은 prefill 후 N decode step 타이밍(cudaEvent) → throughput=B*N/t, per-req t/s. unified 메모리 가드.
 //   args: weights, [use_q4=2], [N=32]. gemm_batch_w4a8 경로(현). odd(3,5,6,7)는 default 루프(B× 재적재) 예상.
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -14,6 +15,7 @@
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"%s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 static float ev(cudaEvent_t a,cudaEvent_t b){float ms;cudaEventElapsedTime(&ms,a,b);return ms;}
 int main(int argc,char**argv){
+    knobs_init("bench_batch");
     std::string WD=argc>1?argv[1]:"artifacts/qwen35-27b-fp16s/weights";
     int use_q4=argc>2?atoi(argv[2]):2, N=argc>3?atoi(argv[3]):32;
     ModelConfig c=load_config_qwen((WD+"/manifest.json").c_str());
@@ -26,8 +28,8 @@ int main(int argc,char**argv){
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     printf("  %-4s %-12s %-14s %-12s %s\n","B","decode ms/step","throughput t/s","per-req t/s","vs B=1");
     double base1=0;
-    int bonly = getenv("BONLY") ? atoi(getenv("BONLY")) : 0;   // 튜닝 스윕: 특정 B만(모델 1회 로드, 임의 B 허용). 0=전체
-    int reps  = getenv("REPS")  ? atoi(getenv("REPS"))  : 1;   // 결정성: timed 루프 반복(min ms 채택)
+    int bonly = knob_raw("BONLY") ? atoi(knob_raw("BONLY")) : 0;   // 튜닝 스윕: 특정 B만(모델 1회 로드, 임의 B 허용). 0=전체
+    int reps  = knob_raw("REPS")  ? atoi(knob_raw("REPS"))  : 1;   // 결정성: timed 루프 반복(min ms 채택)
     std::vector<int> blist = bonly ? std::vector<int>{bonly} : std::vector<int>{1,2,3,4,5,6,7,8,16};
     for(int B : blist){    // SB는 B≤8 수정(odd 3,5,6,7); 16은 gemm_batch 특수화. (12/24/32 default-collapse는 별도)
         size_t freeB=0,totB=0; cudaMemGetInfo(&freeB,&totB);

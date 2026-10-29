@@ -2,6 +2,7 @@
 //   cudaEvent 타이밍(clock() 아님). rope 엔진 생성(32K native). 합성 토큰(속도만, 정확성은 별도 증명됨).
 //   B=1: qwen35_decode (prefill Sq=C 1콜 + decode 루프). B>1: qwen35_decode_batch (dense만; MoE batch 미구현).
 //   사용법: ./bench <weights_dir> [use_q4=1] [ctx,...] [ngen,...] [B,...]
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,7 @@ static size_t est_kv_bytes(const ModelConfig &c, int len){
 }
 
 int main(int argc,char**argv){
+    knobs_init("bench");
     setvbuf(stdout, NULL, _IOLBF, 0);   // line-buffered: 행별 즉시 flush (백그라운드 로그 가시화)
     if(argc<2){ fprintf(stderr,"usage: %s <weights_dir> [use_q4=1]\n",argv[0]); return 1; }
     std::string WD=argv[1];

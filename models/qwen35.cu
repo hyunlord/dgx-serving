@@ -1,3 +1,4 @@
+#include "runtime/knobs.h"
 #include "qwen35.h"
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +26,7 @@ static float *dmalloc(size_t n) { float *p; QK(cudaMalloc(&p, n * 4)); return p;
 
 // 디버그: device 버퍼를 $DBG0/<name>.bin 으로 (env DBG0 설정 시, layer 0 GDN 단계 격리용)
 static void dbg_dump(const char *name, const float *d, size_t n) {
-    const char *od = getenv("DBG0"); if (!od) return;
+    const char *od = knob_raw("DBG0"); if (!od) return;
     std::vector<float> h(n); QK(cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost));
     char path[512]; snprintf(path, sizeof(path), "%s/%s.bin", od, name);
     FILE *f = fopen(path, "wb"); if (f) { fwrite(h.data(), 4, n, f); fclose(f); }

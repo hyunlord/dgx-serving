@@ -1,4 +1,5 @@
 // Full-logit capture for R12; successful capture alone does not establish equivalence.
+#include "runtime/knobs.h"
 #include <algorithm>
 #include <cerrno>
 #include <climits>
@@ -89,7 +90,7 @@ int main(int argc,char** argv) try {
     if (fprintf(rows_file.get(),"step,position,input_token,argmax\n")<0) throw std::runtime_error("CSV write failed");
     const int capacity=start+steps;
     printf("R12_CAPTURE start=%d steps=%d capacity=%d vocab=%d mode=%s uq=2 scale_dtype=%d graph_env=%s\n",
-           start,steps,capacity,V,mode.c_str(),c.scale_dtype,getenv("G4_CUDA_GRAPH")?getenv("G4_CUDA_GRAPH"):"<unset>");
+           start,steps,capacity,V,mode.c_str(),c.scale_dtype,knob_raw("G4_CUDA_GRAPH")?knob_raw("G4_CUDA_GRAPH"):"<unset>");
     printf("R12_CAPTURE logits_bytes=%zu host_logits_bytes=%zu prefix_rule=repeat_input_pattern\n",
            static_cast<size_t>(steps)*V*sizeof(float),static_cast<size_t>(V)*sizeof(float));
     float *cf=device_alloc<float>(static_cast<size_t>(capacity)*hd_f),*sf=device_alloc<float>(static_cast<size_t>(capacity)*hd_f);

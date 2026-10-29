@@ -1,6 +1,7 @@
 // chunked prefill de-risk: P토큰 프롬프트를 청크 크기별(1=현행/64/128/256/512=full) prefill → 시간 + mism.
 //   기존 qwen35_decode(Sq>1 = full-MMQ 병렬 prefill 커널) 재사용. 청크 크기 무관 last-pos logit 동일해야(causal).
 //   판정: ① 청크화 win(1-tok 대비 몇 배 빠른가) ② mism=0(fp32 bit-identical / W4A8 argmax=토큰 동일).
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -61,7 +62,7 @@ int main(int argc,char**argv){
         lastlog.assign(all.begin()+(size_t)(rows-1)*V, all.end());
         return best;
     };
-    std::vector<int> chunks = getenv("FULLONLY")? std::vector<int>{512} : std::vector<int>{1,64,128,256,512};
+    std::vector<int> chunks = knob_raw("FULLONLY")? std::vector<int>{512} : std::vector<int>{1,64,128,256,512};
     std::vector<std::vector<float>> logs(chunks.size()); std::vector<double> times(chunks.size());
     for(size_t i=0;i<chunks.size();i++){ if(chunks[i]>P)continue; times[i]=run(chunks[i],logs[i]); }
     // mism: chunk=1(현행) 기준 argmax + max-abs

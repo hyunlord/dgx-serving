@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/knobs.h"
 #include <cstdint>
 #include "qscale.cuh"
 #include "../runtime/config.h"   // QBLK
@@ -206,7 +207,7 @@ static float* g_skwksp=nullptr; static size_t g_skwcap=0;
 static inline void launch_gemm_bm16_splitk(const int8_t*X,const float*xs,const uint8_t*Wq,
                                            const void*sw,float*Y,int M,int N,int K,int scale_dtype=0,cudaStream_t st=0){
     int ntile=(N+MMQ_BN-1)/MMQ_BN;
-    static int ENV_SK = getenv("SPLITK") ? atoi(getenv("SPLITK")) : 0;
+    static int ENV_SK = knob_raw("SPLITK") ? atoi(knob_raw("SPLITK")) : 0;
     int SK = ENV_SK>0 ? ENV_SK : (96/ntile>1 ? (96/ntile<8?96/ntile:8) : 1);   // ~96 blocks 목표(2 blk/SM), clamp 1..8
     long MN=(long)M*N; dim3 grid(ntile,(M+15)/16,SK);
     if(SK==1){ if(scale_dtype==1) gemm_bm16_splitk_kernel<MMQ_KT,__half><<<grid,256,0,st>>>(X,xs,Wq,(const __half*)sw,Y,M,N,K,1,MN);

@@ -2,6 +2,7 @@
 //   ★헌법: 배치 루프(reader 스레드·slot·argmax·태그드 I/O)는 serving_online.h에 모델-중립으로 추출됨.
 //   이 파일 = Gemma4OnlineBackend(gemma4 primitive 배선) + setup + run_online_daemon 호출. qwen daemon과 루프 공유.
 //   dummy rope(gemma4 서빙 bit-id 게이트는 계산 일관성 — API==단독). 사용법: serve_daemon_gemma4_online <w> [uq=2] [maxlen=384] [Bmax=8]
+#include "runtime/knobs.h"
 #include <cuda_runtime.h>
 #include "../runtime/config.h"
 #include "../runtime/manifest_gemma4.h"
@@ -68,6 +69,7 @@ struct Gemma4OnlineBackend : OnlineBackend {
 };
 
 int main(int argc,char**argv){
+    knobs_init("serve_daemon_gemma4_online");
     std::string WD = argc>1?argv[1]:"artifacts/gemma4-31b/weights";
     int uq = argc>2?atoi(argv[2]):2, maxlen = argc>3?atoi(argv[3]):384, Bmax = argc>4?atoi(argv[4]):8;
     Gemma4OnlineBackend be; be.uq=uq; be.maxlen_=maxlen;

@@ -4,6 +4,7 @@
 //   3-way 비교: naive-gemv(launch_gemv_w4a8, S× weight 재적재) vs MMQ(현 경로) vs SB(신규).
 //   정확성: SB == naive-gemv (같은 누적 순서 → bit-동일 기대).
 //   사용: ./bench_w4a8_sb [IN] [OUT] [scale_dtype=1]   (S=1..8 스윕)
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -24,6 +25,7 @@ static float ev(cudaEvent_t a, cudaEvent_t b){ float ms; cudaEventElapsedTime(&m
 static uint32_t rs=12345; static uint32_t rnd(){ rs=rs*1664525u+1013904223u; return rs; }
 
 int main(int argc,char**argv){
+    knobs_init("bench_w4a8_sb");
     setvbuf(stdout,NULL,_IOLBF,0);
     int IN  = argc>1?atoi(argv[1]):5120;     // 27B FFN gate: H=5120 → FFN=17408
     int OUT = argc>2?atoi(argv[2]):17408;

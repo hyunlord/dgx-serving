@@ -2,6 +2,7 @@
 //   컴파일: nvcc ... -DBENCH_KT=64 -DMMQ_AP=0 -DMMQ_BPAD=4  (파라미터 조합마다 재컴파일)
 //   ★정확성 게이트: mmq(params) vs gemv_w4a8 rel<1e-5 + 결정성 → "빠른데 틀림" 방지. 성능만 변·답 불변 검증.
 //   ★warm: 워밍 20 rep 후 타이밍(GB10 cold-클럭 방지). 출력: KT AP BPAD time_us GFLOPs rel det.
+#include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -25,6 +26,7 @@ static void quantW(const std::vector<float>&w,int N,int K,std::vector<uint8_t>&p
 }
 static int sm_clock(){ int c=0; cudaDeviceGetAttribute(&c,cudaDevAttrClockRate,0); return c/1000; }
 int main(int argc,char**argv){
+    knobs_init("bench_mmq_tune");
     int M=argc>1?atoi(argv[1]):512, N=argc>2?atoi(argv[2]):17408, K=argc>3?atoi(argv[3]):5120; // 27B MLP up prefill
     int R=argc>4?atoi(argv[4]):100;
     int nblk=K/QBLK; unsigned seed=7;
