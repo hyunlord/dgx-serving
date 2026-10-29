@@ -9,6 +9,8 @@
 #include "../kernels/gemm_batch.cuh"
 #include "../kernels/attention_decode_split.cuh"
 #include "../kernels/kv_store.cuh"
+#include "../kernels/norm_fused.cuh"
+bool g4_norm_fused();   // gemma4_decode.cu (G4_NORM_FUSED)
 #include "../kernels/gemv_w4a8.cuh"   // W4A8 batch: B≤8 SB 커널(27b 축1 이식)
 #include "../kernels/gemm_mmq.cuh"    // W4A8 batch: BM=16 split-K(B≥14 opt-in)
 #include "../kernels/quantize_x.cuh"  // W4A8: 활성화 int8 양자화
@@ -81,6 +83,7 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
                          const float *d_cos_s, const float *d_sin_s,
                          float *d_logits, int commit, int use_q4,
                          const int *d_pos_b, const int *h_pos_b) {
+    const bool nf=g4_norm_fused();   // dense only; the MoE batch path keeps its kernels
     gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
     const int B=st.B, H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
@@ -129,18 +132,30 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
         const int window=full?0:c.sliding_window;
         const long kv_stride=(long)st.max_len*kvdim;
 
-        launch_rmsnorm(x, L.input_ln, norm, B, H, eps);
+        // G4_NORM_FUSED: same row function and fusions as gemma4_decode (layer l>0 input norm comes from
+        // the previous layer). Positions: ragged = d_pos_b[slot], same-length = base for every slot.
+        if(!nf) launch_rmsnorm(x, L.input_ln, norm, B, H, eps);
+        else if(l==0) launch_rmsnorm_par(x, L.input_ln, norm, B, H, eps);
         mmB(L.q, norm, qb, H, qdim, B);
+        if(nf) launch_norm_rope_store<float>(qb, L.q_norm, qn, B*NQ, NQ, hd, eps, cosT, sinT, base, 0, ragged?d_pos_b:nullptr, (long)qdim, 0, true);
+        else {
         launch_rmsnorm(qb, L.q_norm, qn, B*NQ, hd, eps);
         // rope: ragged=슬롯별 위치(rope_partial_pos, 전체 테이블), same-length=공통 base(rope_partial_batch). rot=hd(full).
         if(ragged) launch_rope_partial_pos(qn, cosT, sinT, d_pos_b, B, NQ, hd, hd);
         else       launch_rope_partial_batch(qn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, B, NQ, hd, hd);
+        }
         mmB(L.k, norm, kb, H, kvdim, B);
+        if(nf){
+            if(full && c.attention_k_eq_v) launch_rmsnorm_par(kb, nullptr, vn, B*nkv, hd, eps);
+            else { mmB(L.v, norm, vb, H, kvdim, B); launch_rmsnorm_par(vb, nullptr, vn, B*nkv, hd, eps); }
+            launch_norm_rope_store<float>(kb, L.k_norm, kn, B*nkv, nkv, hd, eps, cosT, sinT, base, 0, ragged?d_pos_b:nullptr, (long)kvdim, 0, true);
+        } else {
         if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn, B*nkv, hd, eps);   // V=v_norm(k_proj)
         else { mmB(L.v, norm, vb, H, kvdim, B); launch_rmsnorm_noscale(vb, vn, B*nkv, hd, eps); }
         launch_rmsnorm(kb, L.k_norm, kn, B*nkv, hd, eps);
         if(ragged) launch_rope_partial_pos(kn, cosT, sinT, d_pos_b, B, nkv, hd, hd);
         else       launch_rope_partial_batch(kn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, B, nkv, hd, hd);
+        }
         // KV append: 슬롯 b의 위치(ragged=h_pos_b[b], same=base). Kc[l] 레이아웃 [B, max_len, NKV, hd].
         for(int b=0;b<B;b++){
             size_t pos = ragged ? (size_t)h_pos_b[b] : (size_t)base;
@@ -160,20 +175,27 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
             launch_attn_decode_batch(qn, st.Kc[l], st.Vc[l], attn, B, NQ, nkv, hd, base_max, kv_stride, 0, ascale, window, ragged?d_pos_b:nullptr);
         }
         mmB(L.o, attn, ob, qdim, H, B);
+        if(nf) launch_post_norm_residual(ob, L.post_attn_ln, x, after, 1.0f, L.pre_ffn_ln, norm, B, H, eps);
+        else {
         launch_rmsnorm(ob, L.post_attn_ln, tmp, B, H, eps);
         launch_add(after, x, tmp, (int)BH);
 
         launch_rmsnorm(after, L.pre_ffn_ln, norm, B, H, eps);
+        }
         mmB(L.gate, norm, g, H, FFN, B);
         mmB(L.up,   norm, u, H, FFN, B);
         launch_geglu(g, u, act, (size_t)B*FFN);
         mmB(L.down, act, dn, FFN, H, B);
+        if(nf) launch_post_norm_residual(dn, L.post_ffn_ln, after, x, L.layer_scalar,
+                                         l+1<c.num_layers?w.layers[l+1].input_ln:w.final_norm, norm, B, H, eps);
+        else {
         launch_rmsnorm(dn, L.post_ffn_ln, tmp, B, H, eps);
         launch_add(x, after, tmp, (int)BH);
         if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, BH);
+        }
     }
 
-    launch_rmsnorm(x, w.final_norm, norm, B, H, eps);
+    if(!nf || c.num_layers==0) launch_rmsnorm(x, w.final_norm, norm, B, H, eps);
     mmB(w.lm_head, norm, d_logits, H, V, B);
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)B*V);
     if(commit && !ragged) st.n_past += 1;   // ragged면 per-slot 위치는 호출자(scheduler) 관리
@@ -390,6 +412,7 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
                           const float *d_cos_f, const float *d_sin_f,
                           const float *d_cos_s, const float *d_sin_s,
                           float *d_logits_cat, int use_q4, float *d_prenorm_cat){
+    const bool nf=g4_norm_fused();   // dense only; the MoE batch path keeps its kernels
     gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
@@ -446,15 +469,25 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
         const int window=full?0:c.sliding_window;
         const long kv_stride=(long)st.max_len*kvdim;
 
-        launch_rmsnorm(x, L.input_ln, norm, M, H, eps);
+        if(!nf) launch_rmsnorm(x, L.input_ln, norm, M, H, eps);
+        else if(l==0) launch_rmsnorm_par(x, L.input_ln, norm, M, H, eps);
         mmM(L.q, norm, qb, H, qdim, M);
+        if(nf) launch_norm_rope_store<float>(qb, L.q_norm, qn, M*NQ, NQ, hd, eps, cosT, sinT, 0, 0, d_pos_row, (long)qdim, 0, true);
+        else {
         launch_rmsnorm(qb, L.q_norm, qn, M*NQ, hd, eps);
         launch_rope_partial_pos(qn, cosT, sinT, d_pos_row, M, NQ, hd, hd);   // 행별 절대 위치(ragged 기게이트)
+        }
         mmM(L.k, norm, kb, H, kvdim, M);
+        if(nf){
+            if(full && c.attention_k_eq_v) launch_rmsnorm_par(kb, nullptr, vn, M*nkv, hd, eps);
+            else { mmM(L.v, norm, vb, H, kvdim, M); launch_rmsnorm_par(vb, nullptr, vn, M*nkv, hd, eps); }
+            launch_norm_rope_store<float>(kb, L.k_norm, kn, M*nkv, nkv, hd, eps, cosT, sinT, 0, 0, d_pos_row, (long)kvdim, 0, true);
+        } else {
         if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn, M*nkv, hd, eps);   // V=v_norm(k_proj), rope 전
         else { mmM(L.v, norm, vb, H, kvdim, M); launch_rmsnorm_noscale(vb, vn, M*nkv, hd, eps); }
         launch_rmsnorm(kb, L.k_norm, kn, M*nkv, hd, eps);
         launch_rope_partial_pos(kn, cosT, sinT, d_pos_row, M, nkv, hd, hd);
+        }
         // KV append + attention: 슬롯별(각자 KV 서브영역·위치) — 단독 verify와 문자 그대로 동일 커널/수학
         for(int a=0;a<B_act;a++){
             const int b=slot_ids[a];
@@ -478,21 +511,28 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
                                    attn+(size_t)off[a]*qdim, Nb[a], NQ, nkv, hd, pos_b[a], 0, ascale, window);
         }
         mmM(L.o, attn, ob, qdim, H, M);
+        if(nf) launch_post_norm_residual(ob, L.post_attn_ln, x, after, 1.0f, L.pre_ffn_ln, norm, M, H, eps);
+        else {
         launch_rmsnorm(ob, L.post_attn_ln, tmp, M, H, eps);
         launch_add(after, x, tmp, (int)MH);
 
         launch_rmsnorm(after, L.pre_ffn_ln, norm, M, H, eps);
+        }
         mmM(L.gate, norm, g, H, FFN, M);
         mmM(L.up,   norm, u, H, FFN, M);
         launch_geglu(g, u, act, (size_t)M*FFN);
         mmM(L.down, act, dn, FFN, H, M);
+        if(nf) launch_post_norm_residual(dn, L.post_ffn_ln, after, x, L.layer_scalar,
+                                         l+1<c.num_layers?w.layers[l+1].input_ln:w.final_norm, norm, M, H, eps);
+        else {
         launch_rmsnorm(dn, L.post_ffn_ln, tmp, M, H, eps);
         launch_add(x, after, tmp, (int)MH);
         if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, MH);
+        }
     }
 
     if(d_prenorm_cat) BK(cudaMemcpy(d_prenorm_cat, x, MH*4, cudaMemcpyDeviceToDevice));   // EAGLE h 재귀용(행 off[a]+m)
-    launch_rmsnorm(x, w.final_norm, norm, M, H, eps);
+    if(!nf || c.num_layers==0) launch_rmsnorm(x, w.final_norm, norm, M, H, eps);
     mmM(w.lm_head, norm, d_logits_cat, H, V, M);
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits_cat, d_logits_cat, c.final_logit_softcapping, (size_t)M*V);
     BK(cudaDeviceSynchronize());

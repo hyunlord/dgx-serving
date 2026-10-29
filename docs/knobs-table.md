@@ -28,6 +28,7 @@
 | `G4_MMQ_MIN_S` | int | `16` | `16..` | gemma4 prefill linear layers | golden, ppl, prefill_slot | smallest prefill row count that uses MMQ (values below 16 were clamped to 16 before v1) |
 | `G4_FLASH_PREFILL` | enum | `1` | `0\|1` | gemma4 prefill attention | golden, ppl, prefill_slot | 1 = tensor-core flash attention for prefill chunks with S >= G4_FLASH_MIN_S |
 | `G4_FLASH_MIN_S` | int | `16` | `16..` | gemma4 prefill attention | golden, ppl, prefill_slot | smallest prefill row count that uses flash attention |
+| `G4_NORM_FUSED` | enum | `0` | `0\|1` | gemma4 dense decode/verify/batch/concat/prefill norms | golden, ppl, spec==greedy, batch==single, fastpath==batch, graph_on==off | parallel RMSNorm row function + q/k norm+RoPE(+KV store) and post-norm+residual fusions (R16) |
 | `BM16` | enum | `0` | `0\|1` | gemma4/qwen batch decode B >= 14 | golden, ppl, batch==single | opt-in BM16 split-K GEMM for large batches (scheme change) |
 | `SPLITK` | int | `0` | `0..` | BM16 split-K GEMM (only with BM16=1) | golden, ppl, batch==single | split-K factor; 0 = automatic (about 96 blocks) |
 | `HOTSWITCH` | string | (unset) | `K1,W1,K2,W2,thr` | qwen spec serving | per-request ISO is not preserved (autotune-harness STEP A') | cycle-level K/W switch on batch occupancy |

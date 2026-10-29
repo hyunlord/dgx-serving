@@ -25,6 +25,7 @@
 #include "../kernels/attention_flash.cuh"
 #include "../kernels/attention_decode_split.cuh"
 #include "../kernels/kv_store.cuh"
+#include "../kernels/norm_fused.cuh"
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
 
@@ -103,6 +104,10 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
 // Dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel by default (R15);
 // G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
 static bool g4_attn_split(){ static const bool on=[](){ const char* v=knob_raw("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
+// G4_NORM_FUSED=1 (R16, opt-in): every norm of the dense graph uses the parallel row function
+// (norm_fused.cuh), with q/k norm+RoPE(+KV store) and post-norm+residual(+next pre-norm) fused.
+// Shared with gemma4_batch.cu so decode, verify, batch, concat and prefill rows stay bit-identical.
+bool g4_norm_fused(){ static const bool on=[](){ const char* v=knob_raw("G4_NORM_FUSED"); return v && strcmp(v,"1")==0; }(); return on; }
 
 struct G4DecodeGraph {
     cudaStream_t stream=nullptr;
@@ -259,6 +264,10 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         (void)g4d_mmq_min_s();
     }
     const bool attn_split=g4_attn_split() && !(flash_prefill && Sq>=flash_min_s);
+    const bool nf=g4_norm_fused();
+    if(nf && !(norm_par_supported(H) && norm_par_supported(hd_s) && norm_par_supported(hd_f) && hd_max<=512)){
+        fprintf(stderr,"G4_NORM_FUSED=1 needs hidden and head sizes divisible by 4 (head <= 512)\n"); exit(1); }
+    const bool nf_store=nf && !g4_kv_stats_enabled();   // KV statistics keep the separate kv_store kernel
     if(attn_split) attn_split_reserve(Sq,NQ,st.max_len,hd_max);   // before any capture; max_len bound
     if(Sq==1 && c.num_layers>0 && !attn_split)
         attn_smem_guard((const void *)attn_decode_kernel,
@@ -277,19 +286,36 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         const float *cosT=full?d_cos_f:d_cos_s, *sinT=full?d_sin_f:d_sin_s;
         const int window=full?0:c.sliding_window;
 
-        launch_rmsnorm(x, L.input_ln, norm, Sq, H, eps, stream);
+        // With G4_NORM_FUSED the input norm of layer l>0 comes from the previous layer's fused kernel.
+        if(!nf) launch_rmsnorm(x, L.input_ln, norm, Sq, H, eps, stream);
+        else if(l==0) launch_rmsnorm_par(x, L.input_ln, norm, Sq, H, eps, stream);
         mm(L.q, norm, qb, H, qdim, Sq, use_q4, stream);
+        if(nf) launch_norm_rope_store<float>(qb, L.q_norm, qn, Sq*NQ, NQ, hd, eps, cosT, sinT, base, 1, nullptr, (long)qdim, 0, true, stream);
+        else {
         launch_rmsnorm(qb, L.q_norm, qn, Sq*NQ, hd, eps, stream);
         launch_rope(qn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, NQ, hd, stream);
+        }
         mm(L.k, norm, kb, H, kvdim, Sq, use_q4, stream);
+        const bool kv32=g4_kv_dtype()==KV_FP32;
+        if(nf_store){
+            // k_norm+RoPE and v_norm written straight into the cache slice in the KV dtype.
+            const float *vsrc=kb;
+            if(!(full && c.attention_k_eq_v)){ mm(L.v, norm, vb, H, kvdim, Sq, use_q4, stream); vsrc=vb; }
+            const int kd=g4_kv_dtype();
+            #define G4_NF_KV(T) do{ \
+                launch_norm_rope_store<T>(vsrc, nullptr, (T*)st.Vc[l], Sq*nkv, nkv, hd, eps, cosT, sinT, base, 1, nullptr, 0, (long)kvdim, false, stream); \
+                launch_norm_rope_store<T>(kb, L.k_norm, (T*)st.Kc[l], Sq*nkv, nkv, hd, eps, cosT, sinT, base, 1, nullptr, 0, (long)kvdim, true, stream); }while(0)
+            if(kd==KV_FP32) G4_NF_KV(float); else if(kd==KV_F16) G4_NF_KV(__half); else G4_NF_KV(__nv_bfloat16);
+            #undef G4_NF_KV
+        } else {
         // One token writes its cache slice directly; kb remains raw for K-equals-V.
         // fp32 KV: one token writes its cache slice directly. 16-bit KV: scratch, then kv_store.
-        const bool kv32=g4_kv_dtype()==KV_FP32;
         float *kn_out=(Sq==1 && kv32)?st.Kc[l]+(size_t)base*kvdim:kn;
         float *vn_out=(Sq==1 && kv32)?st.Vc[l]+(size_t)base*kvdim:vn;
-        if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn_out, Sq*nkv, hd, eps, stream);  // V=v_norm(k_proj), rope 전
-        else { mm(L.v, norm, vb, H, kvdim, Sq, use_q4, stream); launch_rmsnorm_noscale(vb, vn_out, Sq*nkv, hd, eps, stream); }
-        launch_rmsnorm(kb, L.k_norm, kn_out, Sq*nkv, hd, eps, stream);
+        // G4_NORM_FUSED with G4_KV_STATS: same row function, separate RoPE and store kernels.
+        if(full && c.attention_k_eq_v){ if(nf) launch_rmsnorm_par(kb, nullptr, vn_out, Sq*nkv, hd, eps, stream); else launch_rmsnorm_noscale(kb, vn_out, Sq*nkv, hd, eps, stream); }  // V=v_norm(k_proj), rope 전
+        else { mm(L.v, norm, vb, H, kvdim, Sq, use_q4, stream); if(nf) launch_rmsnorm_par(vb, nullptr, vn_out, Sq*nkv, hd, eps, stream); else launch_rmsnorm_noscale(vb, vn_out, Sq*nkv, hd, eps, stream); }
+        if(nf) launch_rmsnorm_par(kb, L.k_norm, kn_out, Sq*nkv, hd, eps, stream); else launch_rmsnorm(kb, L.k_norm, kn_out, Sq*nkv, hd, eps, stream);
         launch_rope(kn_out, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, nkv, hd, stream);
         // Multi-token calls retain the scratch-to-cache append path.
         if(Sq!=1 && kv32){
@@ -298,6 +324,7 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         } else if(!kv32){
             kv_store(kn, kv_at(st.Kc[l],(size_t)base*kvdim), (size_t)Sq*kvdim, 0, stream);
             kv_store(vn, kv_at(st.Vc[l],(size_t)base*kvdim), (size_t)Sq*kvdim, 1, stream);
+        }
         }
         if(flash_prefill && Sq>=flash_min_s){
             if(kv32) launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
@@ -312,17 +339,25 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
             launch_attn_decode(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, ascale, window);
         }
         mm(L.o, attn, ob, qdim, H, Sq, use_q4, stream);
+        if(nf) launch_post_norm_residual(ob, L.post_attn_ln, x, after, 1.0f, L.pre_ffn_ln, norm, Sq, H, eps, stream);
+        else {
         launch_rmsnorm(ob, L.post_attn_ln, tmp, Sq, H, eps, stream);
         launch_add(after, x, tmp, (int)SH, stream);   // after = x + post_attn_ln(o_proj)
 
         launch_rmsnorm(after, L.pre_ffn_ln, norm, Sq, H, eps, stream);
+        }
         mm(L.gate, norm, g, H, FFN, Sq, use_q4, stream);
         mm(L.up,   norm, u, H, FFN, Sq, use_q4, stream);
         launch_geglu(g, u, act, (size_t)Sq*FFN, stream);
         mm(L.down, act, dn, FFN, H, Sq, use_q4, stream);
+        if(nf){   // x = (after + post_ffn_ln(down)) * layer_scalar; norm = next input_ln (final_norm after the last layer)
+            const float *next=l+1<c.num_layers?w.layers[l+1].input_ln:w.final_norm;
+            launch_post_norm_residual(dn, L.post_ffn_ln, after, x, L.layer_scalar, next, norm, Sq, H, eps, stream);
+        } else {
         launch_rmsnorm(dn, L.post_ffn_ln, tmp, Sq, H, eps, stream);
         launch_add(x, after, tmp, (int)SH, stream);
         if(L.layer_scalar!=1.0f) launch_scale(x, x, L.layer_scalar, SH, stream);
+        }
     }
 
     // pre-norm residual 노출(3관문 assistant hook): HF hidden_states[-1] == 마지막 층 출력(final-norm 전, 실측 확정)
@@ -333,7 +368,7 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         }
         else DK(cudaMemcpy(d_prenorm, x, SH*4, cudaMemcpyDeviceToDevice));
     }
-    launch_rmsnorm(x, w.final_norm, norm, Sq, H, eps, stream);
+    if(!nf || c.num_layers==0) launch_rmsnorm(x, w.final_norm, norm, Sq, H, eps, stream);
     const float *hn = last_only ? norm+(size_t)(Sq-1)*H : norm;
     int rows = last_only ? 1 : Sq;
     mm(w.lm_head, hn, d_logits, H, V, rows, use_q4, stream);
