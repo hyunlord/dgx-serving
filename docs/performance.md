@@ -106,6 +106,19 @@
   → [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured.md).
 - 프리필(2026-10 측정, 12B·fp32 scale·B1·P=512): MMQ **715.835029564~721.244315927 tok/s**(교차 5회) vs 최신 llama pp512 **1678.33 tok/s**. 같은 날 GB10, SM 2080~2093MHz 조건이며, MMQ 프리필 구간 중앙값은 5회 모두 2080MHz였다. 품질 조건 다름(llama Q4_K_M vs 엔진 W4A8). 프리필은 여전히 llama보다 느리다. 991토큰 요청의 client TTFT는 SB 약 **7.6초 → MMQ 2.47초**(각 3회, ComfyUI 상주·유휴). 반복 event 시간은 host gap을 포함한다. 7월 수치는 클럭 조건 미상이며 이 좌표와 직접 비교하지 않는다.
 
+### 3b-2. 깊이별 single decode — vs llama.cpp (Gemma4-12B QAT, 2026-10-29, R15)
+
+고정 토큰 128스텝, 시작 n_past = d(KV를 프리필로 채움), 같은 세션·교차 3회, 각 실행 가드(Xorg·gnome-shell만, 10초 warm), 구간 SM 클럭 중앙값 2405~2411 MHz. 엔진: Graph v2 overlap + split-KV decode attention + f16 KV(기본값). llama: `llama-bench -m <QAT Q4_0 GGUF> -ngl 99 -fa 1 -p 0 -n 128 -d <d> -r 1`(df9beac). 품질 조건 다름(엔진 W4A8 fp16 scale vs llama Q4_0, KV f16 양쪽).
+
+| 시작 n_past | 엔진 t/s (3회) | llama t/s (3회) | 엔진/llama | 참고: 이전 엔진(R14, fp32 KV·기존 attention)/llama |
+|---:|---|---|---:|---:|
+| 0 | 28.879 · 28.922 · 28.847 | 32.106 · 32.095 · 32.064 | **0.900** | 0.891 |
+| 2048 | 27.431 · 27.234 · 27.693 | 30.179 · 30.147 · 30.180 | **0.910** | 0.633 |
+| 8192 | 26.586 · 26.485 · 26.603 | 29.720 · 29.721 · 29.739 | **0.893** | 0.441 |
+| 32768 | 24.558 · 24.497 · 24.595 | 28.242 · 28.231 · 28.232 | **0.870** | 실행 불가(공유 메모리 한계) |
+
+d=2048에서 남은 격차는 주로 선형층·norm(attention은 대역폭 하한의 1.33배, R15 보고서 §4.4). `G4_ATTN_SPLIT=0`은 기존 attention(그리고 fp32 KV)으로 되돌린다.
+
 ### 3c. 품질 기준선 (Gemma4-12B, 2026-10-26)
 
 고정된 UltraChat `test_sft` 채팅 **36대화·assistant 응답 16,201토큰**을 채점했다. 대화마다 독립 실행하고 선두 BOS를 정확히 1개 유지했으며, 역할·턴 제어 토큰은 채점에서 제외했다. 모든 경로에 같은 토큰·길이·마스크를 사용했다. ComfyUI 상주(유휴) 조건이며, 클럭은 실제 forward 구간의 100ms 표본 중앙값이다.
