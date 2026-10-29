@@ -13,6 +13,11 @@
 | `MOE_FUSED` | enum | `1` | `0\|1` | MoE block (qwen 35B-A3B, gemma4 26B-A4B) | golden, batch==single (claimed bit-identical k-order) | 1 = device-fused grouped expert GEMV; 0 = naive host loop |
 | `G4_SPEC_K` | int | `4` | `1..8` | gemma4 spec daemon draft length | spec==greedy (K only changes speed) | draft tokens per cycle; overrides the daemon's K argument (serve_api --spec-k) |
 | `G4_SPEC_DRAFT_UQ` | enum | `2` | `0\|2` | gemma4 spec daemon drafter precision | spec==greedy (drafter only changes proposals) | assistant drafter weights: 2 = W4A8, 0 = fp32; overrides the daemon's ast_uq argument |
+| `G4_SPEC_SERVE` | enum | `0` | `0\|1` | gemma4 online daemon with a drafter (serve_api --model gemma4 --assistant) | spec==greedy, fastpath==batch (switch at cycle boundaries) | serve a lone greedy request with speculative cycles (K = G4_SPEC_K) |
+| `G4_SPEC_ADAPT` | enum | `0` | `0\|1` | gemma4 online daemon spec path | spec==greedy | choose K per cycle from the estimated acceptance and the cycle-time table |
+| `G4_SPEC_ADAPT_EMA` | float | `0.3` | `0..1` | gemma4 online daemon adaptive K | spec==greedy | EMA weight of the newest cycle in the acceptance estimate |
+| `G4_SPEC_ADAPT_EXPLORE` | int | `32` | `1..` | gemma4 online daemon adaptive K | spec==greedy | tokens at K=0 before one cycle at G4_SPEC_K re-measures acceptance |
+| `G4_SPEC_ADAPT_TCYCLE` | float_list | `36.2,39.53,42.79,45.63,49.86` | `comma-separated ms for K=0,1,..` | gemma4 online daemon adaptive K | spec==greedy | cycle time per K (ms) used to rank K; default from R17 PART A (W4A8 drafter) |
 | `MTP_Q4` | enum | `0` | `0\|1` | qwen MTP draft head | spec==greedy (draft only changes proposals) | q4 MTP draft weights |
 | `DRAFT_GEMV` | enum | `0` | `0\|1` | qwen draft matmul | spec==greedy | GEMV draft matmul instead of gemm_batch |
 | `DRAFT_SEQ` | enum | `0` | `0\|1` | qwen draft scheduling | spec==greedy | sequential per-slot draft |
