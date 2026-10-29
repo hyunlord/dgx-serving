@@ -23,6 +23,7 @@
 #include "../kernels/attention.cuh"
 #include "../kernels/attention_flash.cuh"
 #include "../kernels/attention_decode_split.cuh"
+#include "../kernels/kv_store.cuh"
 #include "../kernels/swiglu.cuh"
 #include "../kernels/elementwise.cuh"
 
@@ -45,7 +46,8 @@ G4DecodeState alloc_g4_decode_state(const ModelConfig &c, int max_len) {
         // 현 append=선형 base offset → 캡은 반드시 max_len(안전). sliding 링버퍼(min(max_len,w) modulo)는
         // attn_decode 물리-슬롯 재작성 + >w golden 필요 → A-2 별도. 캡<max_len + 선형 append = OOB이므로 금지.
         s.kv_cap[l]=max_len;
-        s.Kc[l]=g4d_dm((size_t)max_len*nkv*hd); s.Vc[l]=g4d_dm((size_t)max_len*nkv*hd);
+        // Storage dtype G4_KV_DTYPE (kv_store.cuh): bytes = elements * g4_kv_elem(); handles stay float*.
+        DK(cudaMalloc(&s.Kc[l],(size_t)max_len*nkv*hd*g4_kv_elem())); DK(cudaMalloc(&s.Vc[l],(size_t)max_len*nkv*hd*g4_kv_elem()));
     }
     return s;
 }
@@ -278,24 +280,34 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         launch_rope(qn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, NQ, hd, stream);
         mm(L.k, norm, kb, H, kvdim, Sq, use_q4, stream);
         // One token writes its cache slice directly; kb remains raw for K-equals-V.
-        float *kn_out=Sq==1?st.Kc[l]+(size_t)base*kvdim:kn;
-        float *vn_out=Sq==1?st.Vc[l]+(size_t)base*kvdim:vn;
+        // fp32 KV: one token writes its cache slice directly. 16-bit KV: scratch, then kv_store.
+        const bool kv32=g4_kv_dtype()==KV_FP32;
+        float *kn_out=(Sq==1 && kv32)?st.Kc[l]+(size_t)base*kvdim:kn;
+        float *vn_out=(Sq==1 && kv32)?st.Vc[l]+(size_t)base*kvdim:vn;
         if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn_out, Sq*nkv, hd, eps, stream);  // V=v_norm(k_proj), rope 전
         else { mm(L.v, norm, vb, H, kvdim, Sq, use_q4, stream); launch_rmsnorm_noscale(vb, vn_out, Sq*nkv, hd, eps, stream); }
         launch_rmsnorm(kb, L.k_norm, kn_out, Sq*nkv, hd, eps, stream);
         launch_rope(kn_out, cosT+(size_t)base*hd, sinT+(size_t)base*hd, Sq, nkv, hd, stream);
         // Multi-token calls retain the scratch-to-cache append path.
-        if(Sq!=1){
+        if(Sq!=1 && kv32){
             DK(cudaMemcpy(st.Kc[l]+(size_t)base*kvdim, kn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
             DK(cudaMemcpy(st.Vc[l]+(size_t)base*kvdim, vn, (size_t)Sq*kvdim*4, cudaMemcpyDeviceToDevice));
+        } else if(!kv32){
+            kv_store(kn, kv_at(st.Kc[l],(size_t)base*kvdim), (size_t)Sq*kvdim, 0, stream);
+            kv_store(vn, kv_at(st.Vc[l],(size_t)base*kvdim), (size_t)Sq*kvdim, 1, stream);
         }
-        if(flash_prefill && Sq>=flash_min_s)
-            launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
+        if(flash_prefill && Sq>=flash_min_s){
+            if(kv32) launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
+            else if(g4_kv_dtype()==KV_F16) launch_flash_attn<__half>(qn, (const __half*)st.Kc[l], (const __half*)st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
+            else launch_flash_attn<__nv_bfloat16>(qn, (const __nv_bfloat16*)st.Kc[l], (const __nv_bfloat16*)st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
+        }
         else if(attn_split)
             launch_attn_decode_split(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, 1, nullptr, base+Sq-1, 0,
                                      attn_split_ns_cap(st.max_len), stream, ascale, window);
-        else
+        else {
+            if(!kv32){ fprintf(stderr,"G4_KV_DTYPE other than fp32 requires G4_ATTN_SPLIT=1 for decode attention\n"); exit(1); }
             launch_attn_decode(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, ascale, window);
+        }
         mm(L.o, attn, ob, qdim, H, Sq, use_q4, stream);
         launch_rmsnorm(ob, L.post_attn_ln, tmp, Sq, H, eps, stream);
         launch_add(after, x, tmp, (int)SH, stream);   // after = x + post_attn_ln(o_proj)

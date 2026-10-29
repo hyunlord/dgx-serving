@@ -20,6 +20,7 @@
 #include <iostream>
 #include <condition_variable>
 #include <cuda_runtime.h>
+#include "../kernels/kv_store.cuh"
 #include "../runtime/config.h"
 #include "../runtime/manifest_gemma4.h"
 #include "../runtime/weights_gemma4.h"
@@ -103,7 +104,7 @@ int main(int argc,char**argv){
             int full=c.layer_is_full?c.layer_is_full[l]:1;
             int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
             size_t stride=(size_t)maxlen*nkv*hd;
-            vK[b][l]=bs.Kc[l]+(size_t)b*stride; vV[b][l]=bs.Vc[l]+(size_t)b*stride;
+            vK[b][l]=kv_at(bs.Kc[l],(size_t)b*stride); vV[b][l]=kv_at(bs.Vc[l],(size_t)b*stride);
         }
     }
     auto view_of=[&](int b, int pos)->G4DecodeState{

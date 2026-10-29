@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
+#include "kv_store.cuh"
 
 #define ATTN_SPLIT_THREADS 256
 
@@ -38,9 +39,9 @@ __device__ __forceinline__ int attn_split_pos(int r, int base, int pos_step, con
     return pos_arr ? pos_arr[r] : base + r * pos_step;
 }
 
-template<int HD, int GRP>
+template<int HD, int GRP, typename KT = float>
 static __global__ void __launch_bounds__(ATTN_SPLIT_THREADS)
-attn_split_p1_kernel(const float *Q, const float *Kc, const float *Vc,
+attn_split_p1_kernel(const float *Q, const KT *Kc, const KT *Vc,
                      float *pm, float *pl, float *pacc,
                      int NQ, int NKV, int base, int pos_step, const int *pos_arr, long kv_stride,
                      float scale, int window, int C, int ns_cap) {
@@ -54,7 +55,7 @@ attn_split_p1_kernel(const float *Q, const float *Kc, const float *Vc,
     extern __shared__ __align__(16) float smem[];
     float *qs = smem;                                       // [GRP][HD]
     float *sc = smem + GRP * HD;                            // [GRP][C]
-    const float *K = Kc + (size_t)r * kv_stride, *V = Vc + (size_t)r * kv_stride;
+    const KT *K = Kc + (size_t)r * kv_stride, *V = Vc + (size_t)r * kv_stride;
     for (int i = tid; i < GRP * HD; i += ATTN_SPLIT_THREADS) {
         const int g = i / HD, d = i % HD;
         qs[i] = Q[((size_t)r * NQ + kvh * GRP + g) * HD + d];
@@ -67,14 +68,14 @@ attn_split_p1_kernel(const float *Q, const float *Kc, const float *Vc,
             if (lane < GRP) sc[lane * C + jj] = -FLT_MAX;
             continue;
         }
-        const float4 *kp = reinterpret_cast<const float4 *>(K + ((size_t)j * NKV + kvh) * HD);
+        const size_t krow = ((size_t)j * NKV + kvh) * HD;
         float part[GRP];
         #pragma unroll
         for (int g = 0; g < GRP; g++) part[g] = 0.f;
         #pragma unroll
         for (int i = 0; i < HD / 128; i++) {
-            const float4 k = kp[lane + 32 * i];
             const int d = 4 * (lane + 32 * i);
+            const float4 k = kv_load4(K, krow + d);
             #pragma unroll
             for (int g = 0; g < GRP; g++) {
                 const float *q = qs + g * HD + d;
@@ -123,10 +124,10 @@ attn_split_p1_kernel(const float *Q, const float *Kc, const float *Vc,
         #pragma unroll
         for (int i = 0; i < ND; i++) acc[g][i] = 0.f;
     for (int j = j0; j < j1; j++) {
-        const float *vp = V + ((size_t)j * NKV + kvh) * HD;
+        const size_t vrow = ((size_t)j * NKV + kvh) * HD;
         float v[ND];
         #pragma unroll
-        for (int i = 0; i < ND; i++) v[i] = vp[tid + ATTN_SPLIT_THREADS * i];
+        for (int i = 0; i < ND; i++) v[i] = kv_load(V, vrow + tid + ATTN_SPLIT_THREADS * i);
         #pragma unroll
         for (int g = 0; g < GRP; g++) {
             const float p = sc[g * C + (j - k0)];
@@ -185,14 +186,14 @@ static inline void attn_split_reserve(int rows, int NQ, int max_len, int hd_max)
     }
 }
 
-template<int HD, int GRP>
-static inline void attn_split_launch_typed(const float *Q, const float *Kc, const float *Vc, float *O, int rows,
+template<int HD, int GRP, typename KT>
+static inline void attn_split_launch_typed(const float *Q, const KT *Kc, const KT *Vc, float *O, int rows,
                                            int NQ, int NKV, int base, int pos_step, const int *pos_arr, int max_pos,
                                            long kv_stride, float scale, int window, int ns_cap, cudaStream_t st) {
     const int C = attn_split_chunk();
     const size_t shmem = (size_t)(GRP * HD + GRP * C) * sizeof(float);
     dim3 g1((max_pos + C) / C, NKV, rows);   // chunks 0..max_pos/C
-    attn_split_p1_kernel<HD, GRP><<<g1, ATTN_SPLIT_THREADS, shmem, st>>>(
+    attn_split_p1_kernel<HD, GRP, KT><<<g1, ATTN_SPLIT_THREADS, shmem, st>>>(
         Q, Kc, Vc, g_as_m, g_as_l, g_as_acc, NQ, NKV, base, pos_step, pos_arr, kv_stride, scale, window, C, ns_cap);
     attn_split_combine_kernel<HD><<<dim3(rows, NQ), HD, 0, st>>>(
         g_as_m, g_as_l, g_as_acc, O, NQ, base, pos_step, pos_arr, window, C, ns_cap);
@@ -211,12 +212,21 @@ static inline void launch_attn_decode_split(const float *Q, const float *Kc, con
     }
     const float sc = (scale > 0.f) ? scale : rsqrtf((float)HD);
     const int GRP = NQ / NKV;
-    if (HD == 256 && GRP == 2) attn_split_launch_typed<256, 2>(Q, Kc, Vc, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
-    else if (HD == 512 && GRP == 16) attn_split_launch_typed<512, 16>(Q, Kc, Vc, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
-    else if (HD == 256 && GRP == 1) attn_split_launch_typed<256, 1>(Q, Kc, Vc, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
-    else if (HD == 256 && GRP == 4) attn_split_launch_typed<256, 4>(Q, Kc, Vc, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
-    else if (HD == 512 && GRP == 2) attn_split_launch_typed<512, 2>(Q, Kc, Vc, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
-    else { fprintf(stderr, "[attn_split] unsupported HD=%d GRP=%d\n", HD, GRP); abort(); }
+    // Kc/Vc point at storage of g4_kv_dtype() (fp32 handles, see kv_store.cuh).
+    auto go = [&](auto tag) {
+        using KT = decltype(tag);
+        const KT *K = reinterpret_cast<const KT *>(Kc), *V = reinterpret_cast<const KT *>(Vc);
+        if (HD == 256 && GRP == 2) attn_split_launch_typed<256, 2, KT>(Q, K, V, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
+        else if (HD == 512 && GRP == 16) attn_split_launch_typed<512, 16, KT>(Q, K, V, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
+        else if (HD == 256 && GRP == 1) attn_split_launch_typed<256, 1, KT>(Q, K, V, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
+        else if (HD == 256 && GRP == 4) attn_split_launch_typed<256, 4, KT>(Q, K, V, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
+        else if (HD == 512 && GRP == 2) attn_split_launch_typed<512, 2, KT>(Q, K, V, O, rows, NQ, NKV, base, pos_step, pos_arr, max_pos, kv_stride, sc, window, ns_cap, st);
+        else { fprintf(stderr, "[attn_split] unsupported HD=%d GRP=%d\n", HD, GRP); abort(); }
+    };
+    const int dt = g4_kv_dtype();
+    if (dt == KV_FP32) go(float{});
+    else if (dt == KV_F16) go(__half{});
+    else go(__nv_bfloat16{});
 }
 
 #endif // DGX_ATTENTION_DECODE_SPLIT_CUH

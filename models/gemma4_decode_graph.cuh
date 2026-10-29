@@ -122,8 +122,8 @@ static std::vector<G4GraphPatch> g4g_map(cudaGraph_t graph,const ModelConfig &c,
             for(int k=0;k<c.num_layers;++k){
                 int hd=w.layers[k].is_full?(c.global_head_dim?c.global_head_dim:c.head_dim):c.head_dim;
                 int nkv=w.layers[k].is_full?(c.num_global_kv_heads?c.num_global_kv_heads:c.num_kv_heads):c.num_kv_heads;
-                const float *expected=patch.kind==3?st.Vc[k]+(size_t)base*hd*nkv:
-                    patch.kind==4?st.Kc[k]:st.Kc[k]+(size_t)base*hd*nkv;
+                const float *expected=patch.kind==3?kv_at(st.Vc[k],(size_t)base*hd*nkv):
+                    patch.kind==4?st.Kc[k]:kv_at(st.Kc[k],(size_t)base*hd*nkv);
                 if(ptr==expected){G4_MAP_REQUIRE(l==-1,"ambiguous KV node");l=k;}
             }
             if(l<0){G4_MAP_REQUIRE(patch.kind!=4,"unmapped attention");continue;}
@@ -140,7 +140,7 @@ static std::vector<G4GraphPatch> g4g_map(cudaGraph_t graph,const ModelConfig &c,
                 bool key=(rope_count%2)==0;
                 G4_MAP_REQUIRE(patch.get<int>(3)==1 && patch.get<int>(4)==(key?nkv:c.num_q_heads) &&
                     patch.get<int>(5)==patch.hd,"rope signature mismatch");
-                if(key){G4_MAP_REQUIRE(patch.get<float*>(0)==st.Kc[l]+(size_t)base*patch.kvdim,"K rope output");patch.kind=7;}
+                if(key){G4_MAP_REQUIRE(patch.get<float*>(0)==kv_at(st.Kc[l],(size_t)base*patch.kvdim),"K rope output");patch.kind=7;}
                 ++roles[l][key?1:0];slots+=key?3:2;
             } else {
                 if(patch.kind==4 && patch.split){

@@ -7,6 +7,7 @@
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemm_batch.cuh"
 #include "../kernels/attention_decode_split.cuh"
+#include "../kernels/kv_store.cuh"
 #include "../kernels/gemv_w4a8.cuh"   // W4A8 batch: B≤8 SB 커널(27b 축1 이식)
 #include "../kernels/gemm_mmq.cuh"    // W4A8 batch: BM=16 split-K(B≥14 opt-in)
 #include "../kernels/quantize_x.cuh"  // W4A8: 활성화 int8 양자화
@@ -32,7 +33,7 @@ G4BatchState alloc_g4_batch_state(const ModelConfig &c, int B, int max_len){
         int full=c.layer_is_full?c.layer_is_full[l]:1;
         int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
         s.kv_cap[l]=max_len;   // 선형 캡(A-2 안전판). 링버퍼는 별도.
-        s.Kc[l]=bdm((size_t)B*max_len*nkv*hd); s.Vc[l]=bdm((size_t)B*max_len*nkv*hd);
+        BK(cudaMalloc(&s.Kc[l],(size_t)B*max_len*nkv*hd*g4_kv_elem())); BK(cudaMalloc(&s.Vc[l],(size_t)B*max_len*nkv*hd*g4_kv_elem()));   // G4_KV_DTYPE bytes
     }
     return s;
 }
@@ -140,14 +141,21 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
         // KV append: 슬롯 b의 위치(ragged=h_pos_b[b], same=base). Kc[l] 레이아웃 [B, max_len, NKV, hd].
         for(int b=0;b<B;b++){
             size_t pos = ragged ? (size_t)h_pos_b[b] : (size_t)base;
+            if(g4_kv_dtype()==KV_FP32){
             BK(cudaMemcpy(st.Kc[l]+(size_t)b*kv_stride+pos*kvdim, kn+(size_t)b*kvdim, (size_t)kvdim*4, cudaMemcpyDeviceToDevice));
             BK(cudaMemcpy(st.Vc[l]+(size_t)b*kv_stride+pos*kvdim, vn+(size_t)b*kvdim, (size_t)kvdim*4, cudaMemcpyDeviceToDevice));
+            } else {
+            kv_store(kn+(size_t)b*kvdim, kv_at(st.Kc[l],(size_t)b*kv_stride+pos*kvdim), (size_t)kvdim, 0);
+            kv_store(vn+(size_t)b*kvdim, kv_at(st.Vc[l],(size_t)b*kv_stride+pos*kvdim), (size_t)kvdim, 1);
+            }
         }
         if(g4_attn_split())
             launch_attn_decode_split(qn, st.Kc[l], st.Vc[l], attn, B, NQ, nkv, hd, base, 0, ragged?d_pos_b:nullptr, base_max,
                                      kv_stride, attn_split_ns_cap(st.max_len), 0, ascale, window);
-        else
+        else {
+            if(g4_kv_dtype()!=KV_FP32){ fprintf(stderr,"G4_KV_DTYPE other than fp32 requires G4_ATTN_SPLIT=1\n"); exit(1); }
             launch_attn_decode_batch(qn, st.Kc[l], st.Vc[l], attn, B, NQ, nkv, hd, base_max, kv_stride, 0, ascale, window, ragged?d_pos_b:nullptr);
+        }
         mmB(L.o, attn, ob, qdim, H, B);
         launch_rmsnorm(ob, L.post_attn_ln, tmp, B, H, eps);
         launch_add(after, x, tmp, (int)BH);
@@ -177,6 +185,7 @@ void gemma4_moe_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchSt
                              const float *d_cos_s, const float *d_sin_s,
                              float *d_logits, int commit, int use_q4,
                              const int *d_pos_b, const int *h_pos_b) {
+    if(g4_kv_dtype()!=KV_FP32){ fprintf(stderr,"[gemma4_moe_decode_batch] G4_KV_DTYPE must be fp32 (MoE path unchanged)\n"); exit(1); }
     gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
     const int B=st.B, H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
@@ -316,7 +325,7 @@ void gemma4_prefill_batch_slot(const ModelConfig &c, const G4Weights &w, G4Batch
         int full=c.layer_is_full?c.layer_is_full[l]:1;
         int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
         size_t stride=(size_t)st.max_len*nkv*hd;
-        Kc[l]=st.Kc[l]+(size_t)b*stride; Vc[l]=st.Vc[l]+(size_t)b*stride;   // 슬롯 b 서브영역
+        Kc[l]=kv_at(st.Kc[l],(size_t)b*stride); Vc[l]=kv_at(st.Vc[l],(size_t)b*stride);   // 슬롯 b 서브영역
     }
     view.Kc=Kc.data(); view.Vc=Vc.data();
     // commit=0(뷰의 n_past 불필요 — 스케줄러가 위치 관리), last_only=1(마지막 로짓만; 서빙은 discard),
@@ -347,7 +356,7 @@ void gemma4_verify_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
             int full=c.layer_is_full?c.layer_is_full[l]:1;
             int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
             size_t stride=(size_t)st.max_len*nkv*hd;
-            Kc[l]=st.Kc[l]+(size_t)b*stride; Vc[l]=st.Vc[l]+(size_t)b*stride;   // 슬롯 b 서브영역
+            Kc[l]=kv_at(st.Kc[l],(size_t)b*stride); Vc[l]=kv_at(st.Vc[l],(size_t)b*stride);   // 슬롯 b 서브영역
         }
         view.Kc=Kc.data(); view.Vc=Vc.data();
         gemma4_decode(c,w,view,d_tokens_cat+off,Sq,d_cos_f,d_sin_f,d_cos_s,d_sin_s,
@@ -446,15 +455,21 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
         // KV append + attention: 슬롯별(각자 KV 서브영역·위치) — 단독 verify와 문자 그대로 동일 커널/수학
         for(int a=0;a<B_act;a++){
             const int b=slot_ids[a];
+            if(g4_kv_dtype()==KV_FP32){
             BK(cudaMemcpy(st.Kc[l]+(size_t)b*kv_stride+(size_t)pos_b[a]*kvdim, kn+(size_t)off[a]*kvdim, (size_t)Nb[a]*kvdim*4, cudaMemcpyDeviceToDevice));
             BK(cudaMemcpy(st.Vc[l]+(size_t)b*kv_stride+(size_t)pos_b[a]*kvdim, vn+(size_t)off[a]*kvdim, (size_t)Nb[a]*kvdim*4, cudaMemcpyDeviceToDevice));
+            } else {
+            kv_store(kn+(size_t)off[a]*kvdim, kv_at(st.Kc[l],(size_t)b*kv_stride+(size_t)pos_b[a]*kvdim), (size_t)Nb[a]*kvdim, 0);
+            kv_store(vn+(size_t)off[a]*kvdim, kv_at(st.Vc[l],(size_t)b*kv_stride+(size_t)pos_b[a]*kvdim), (size_t)Nb[a]*kvdim, 1);
+            }
         }
         for(int a=0;a<B_act;a++){
             const int b=slot_ids[a];
             if(g4_attn_split())
-                launch_attn_decode_split(qn+(size_t)off[a]*qdim, st.Kc[l]+(size_t)b*kv_stride, st.Vc[l]+(size_t)b*kv_stride,
+                launch_attn_decode_split(qn+(size_t)off[a]*qdim, kv_at(st.Kc[l],(size_t)b*kv_stride), kv_at(st.Vc[l],(size_t)b*kv_stride),
                                          attn+(size_t)off[a]*qdim, Nb[a], NQ, nkv, hd, pos_b[a], 1, nullptr, pos_b[a]+Nb[a]-1, 0,
                                          attn_split_ns_cap(st.max_len), 0, ascale, window);
+            else if(g4_kv_dtype()!=KV_FP32){ fprintf(stderr,"G4_KV_DTYPE other than fp32 requires G4_ATTN_SPLIT=1\n"); exit(1); }
             else
                 launch_attn_decode(qn+(size_t)off[a]*qdim, st.Kc[l]+(size_t)b*kv_stride, st.Vc[l]+(size_t)b*kv_stride,
                                    attn+(size_t)off[a]*qdim, Nb[a], NQ, nkv, hd, pos_b[a], 0, ascale, window);

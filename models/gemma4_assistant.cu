@@ -11,6 +11,7 @@
 #include "../kernels/rmsnorm.cuh"
 #include "../kernels/gemv_f32.cuh"
 #include "../kernels/quantize_x.cuh"  // W4A8: 활성화 int8 양자화(Lever1)
+#include "../kernels/attention_decode_split.cuh"   // target KV stored as 16-bit (G4_KV_DTYPE)
 #include "../kernels/gemv_w4a8.cuh"   // W4A8: q4 weight gemv(target 스킴 동일·신규 커널 0)
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
@@ -173,6 +174,10 @@ void gemma4_assistant_step(const AstConfig &c, const AstWeights &w,
         launch_rope(qn, cosR, sinR, 1, NQ, hd);                     // 고정 위치 행(호출자 준비)
         // ★cross-attn: target KV 직독. base=len-1 → attendlen=len(전체)·sliding lo=len-window
         //   (HF bidirectional-flip 마스크의 q_len=1 의미와 정확히 일치 — KV 끝 기준 마지막 w개).
+        if(g4_kv_dtype()!=KV_FP32){   // 16-bit target KV: dtype-aware split read (fp32 keeps the original kernel)
+            attn_split_reserve(1, NQ, len, hd);
+            launch_attn_decode_split(qn, K, Vv, attn, 1, NQ, NKV, hd, len-1, 1, nullptr, len-1, 0, attn_split_ns_cap(len), 0, c.attn_scaling, window);
+        } else
         launch_attn_decode(qn, K, Vv, attn, 1, NQ, NKV, hd, len-1, 0, c.attn_scaling, window);
         amm(L.o, attn, tmp, qdim, H, use_q4);
         launch_rmsnorm(tmp, L.post_attn_ln, norm, 1, H, eps);
@@ -239,6 +244,11 @@ void gemma4_assistant_step_batch(const AstConfig &c, const AstWeights &w, int B,
         launch_rope_partial_pos(qn, cosT, sinT, d_pos, B, NQ, hd, hd);     // 행별 위치(=len[b])
         for(int b=0;b<B;b++){                                              // ★cross-attn: 슬롯별 target KV 직독
             const float *K = L.is_full ? kf[b] : ks[b], *Vv = L.is_full ? vf[b] : vs[b];
+            if(g4_kv_dtype()!=KV_FP32){
+                attn_split_reserve(1, NQ, len_b[b], hd);
+                launch_attn_decode_split(qn+(size_t)b*qdim, K, Vv, attn+(size_t)b*qdim, 1, NQ, NKV, hd, len_b[b]-1, 1, nullptr, len_b[b]-1, 0,
+                                         attn_split_ns_cap(len_b[b]), 0, c.attn_scaling, window);
+            } else
             launch_attn_decode(qn+(size_t)b*qdim, K, Vv, attn+(size_t)b*qdim,
                                1, NQ, NKV, hd, len_b[b]-1, 0, c.attn_scaling, window);
         }

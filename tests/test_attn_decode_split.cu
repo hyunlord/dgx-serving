@@ -5,7 +5,9 @@
 //     and full (HD512, 16q/1kv, no window) layers; scale 1.0 (Gemma attn_scaling).
 //   Gate 2: verify rows (S=2..16, consecutive positions, shared KV) and batch rows (W=1..12, own KV per
 //     slot, ragged positions) must be bitwise equal to the S=1 result at the same position and KV.
-// Usage: test_attn_decode_split [G4_ATTN_CHUNK env selects the chunk size]
+//   With G4_KV_DTYPE=f16|bf16 the K/V are stored in that dtype and the fp64 reference uses the same
+//   rounded values (R15 PART C gate 1).
+// Usage: test_attn_decode_split [G4_ATTN_CHUNK selects the chunk size, G4_KV_DTYPE the storage dtype]
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +23,18 @@ struct Rng { uint64_t s; float next() { s ^= s >> 12; s ^= s << 25; s ^= s >> 27
 struct Layer { const char *name; int HD, NQ, NKV, window; };
 static const Layer LAYERS[2] = {{"sliding", 256, 16, 8, 1024}, {"full", 512, 16, 1, 0}};
 
+// Round host K/V to the storage dtype in place and upload in that dtype (float* handle).
+static float *dev_kv(std::vector<float> &h) {
+    const int dt = g4_kv_dtype();
+    if (dt == KV_FP32) { float *p; ck(cudaMalloc(&p, h.size() * 4)); ck(cudaMemcpy(p, h.data(), h.size() * 4, cudaMemcpyHostToDevice)); return p; }
+    std::vector<uint16_t> raw(h.size());
+    for (size_t i = 0; i < h.size(); i++) {
+        if (dt == KV_F16) { __half v = __float2half_rn(h[i]); h[i] = __half2float(v); memcpy(&raw[i], &v, 2); }
+        else { __nv_bfloat16 v = __float2bfloat16_rn(h[i]); h[i] = __bfloat162float(v); memcpy(&raw[i], &v, 2); }
+    }
+    void *p; ck(cudaMalloc(&p, raw.size() * 2)); ck(cudaMemcpy(p, raw.data(), raw.size() * 2, cudaMemcpyHostToDevice));
+    return (float *)p;
+}
 template<class T> static T *dev(const std::vector<T> &h) {
     T *p; ck(cudaMalloc(&p, h.size() * sizeof(T))); ck(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice)); return p;
 }
@@ -39,7 +53,7 @@ static uint32_t bits(float x) { uint32_t u; memcpy(&u, &x, 4); return u; }
 
 int main() try {
     setvbuf(stdout, nullptr, _IOLBF, 0);
-    printf("ATTN_SPLIT_GATE chunk=%d\n", attn_split_chunk());
+    printf("ATTN_SPLIT_GATE chunk=%d kv_dtype=%d\n", attn_split_chunk(), g4_kv_dtype());
     int fails = 0;
     // Gate 1
     for (const Layer &L : LAYERS) {
@@ -48,7 +62,7 @@ int main() try {
         std::vector<float> k((size_t)maxd * L.NKV * L.HD), v(k.size()), q((size_t)L.NQ * L.HD);
         for (auto &x : k) x = rng.next(); for (auto &x : v) x = rng.next();
         for (auto &x : q) x = rng.next() * 0.25f;
-        float *dk = dev(k), *dv = dev(v), *dq = dev(q);
+        float *dk = dev_kv(k), *dv = dev_kv(v), *dq = dev(q);
         for (int d : {1, 31, 32, 33, 1023, 1024, 1025, 2048, 8192, 32768}) {
             const int pos = d - 1;
             auto o = run(L, dq, dk, dv, 1, pos, 1, nullptr, pos, 0, d);
@@ -93,7 +107,7 @@ int main() try {
         // Gate 2 batch rows: W slots with their own KV and ragged positions vs S=1 on that slot.
         const int cap = 4096; const long stride = (long)cap * L.NKV * L.HD;
         std::vector<float> bk((size_t)12 * stride), bv(bk.size()); for (auto &x : bk) x = rng.next(); for (auto &x : bv) x = rng.next();
-        float *dbk = dev(bk), *dbv = dev(bv);
+        float *dbk = dev_kv(bk), *dbv = dev_kv(bv);
         for (int W = 1; W <= 12; W++) {
             std::vector<int> pos(W); int mx = 0;
             for (int b = 0; b < W; b++) { pos[b] = (b * 977 + W * 131 + 63) % (cap - 1); mx = std::max(mx, pos[b]); }
@@ -101,7 +115,7 @@ int main() try {
             float *dqs = dev(qs); int *dpos = dev(pos);
             auto multi = run(L, dqs, dbk, dbv, W, 0, 0, dpos, mx, stride, cap);
             for (int b = 0; b < W; b++) {
-                auto single = run(L, dqs + (size_t)b * L.NQ * L.HD, dbk + (size_t)b * stride, dbv + (size_t)b * stride, 1, pos[b], 1,
+                auto single = run(L, dqs + (size_t)b * L.NQ * L.HD, kv_at(dbk, (size_t)b * stride), kv_at(dbv, (size_t)b * stride), 1, pos[b], 1,
                                   nullptr, pos[b], 0, cap);
                 for (size_t i = 0; i < single.size(); i++) if (bits(single[i]) != bits(multi[(size_t)b * L.NQ * L.HD + i])) {
                     printf("GATE2 FAIL batch %s W=%d slot=%d pos=%d elem=%zu\n", L.name, W, b, pos[b], i); fails++; break; }

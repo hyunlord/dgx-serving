@@ -19,6 +19,7 @@
 #include "../runtime/config.h"
 #include "../runtime/manifest_gemma4.h"
 #include "../runtime/weights_gemma4.h"
+#include "../kernels/kv_store.cuh"
 #include "../runtime/decode_state_gemma4.h"
 
 #define CK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
@@ -102,7 +103,7 @@ int main(int argc, char**argv){
                 int full=c.layer_is_full?c.layer_is_full[l]:1;
                 int hd=full?hd_f:hd_s, nkv=full?nkv_f:nkv_s;
                 size_t stride=(size_t)bs.max_len*nkv*hd;
-                Kc[l]=bs.Kc[l]+(size_t)b*stride; Vc[l]=bs.Vc[l]+(size_t)b*stride;
+                Kc[l]=kv_at(bs.Kc[l],(size_t)b*stride); Vc[l]=kv_at(bs.Vc[l],(size_t)b*stride);
             }
             view.Kc=Kc.data(); view.Vc=Vc.data();
             CK(cudaMemcpy(d_tok,h_tok_cat+off,(size_t)Sq*4,cudaMemcpyHostToDevice));

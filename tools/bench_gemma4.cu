@@ -26,6 +26,7 @@
 #include "../runtime/decode_state_gemma4.h"
 #include "../models/gemma4_moe.h"   // 26B-A4B MoE: gemma4_moe_decode / gemma4_moe_decode_batch (dense∥MoE)
 #include "../kernels/rope.cuh"
+#include "../kernels/kv_store.cuh"
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 static float ev(cudaEvent_t a,cudaEvent_t b){ float ms; cudaEventElapsedTime(&ms,a,b); return ms; }
 
@@ -55,12 +56,12 @@ static double moe_single_roofline_ts(const ModelConfig &c, double bw_gbps){
     return (bw_gbps*1e9)/(active*bytes_per);
 }
 
-// per-seq KV bytes(선형 캡 max_len): full=hd_f·nkv_f, sliding=hd_s·nkv_s, ×2(K,V)×4(fp32).
+// per-seq KV bytes(선형 캡 max_len): full=hd_f·nkv_f, sliding=hd_s·nkv_s, ×2(K,V)×G4_KV_DTYPE 바이트.
 static size_t per_seq_bytes(const ModelConfig&c,int ml){
     int hd_s=c.head_dim,nkv_s=c.num_kv_heads;
     int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
     size_t b=0; for(int l=0;l<c.num_layers;l++){ int full=c.layer_is_full?c.layer_is_full[l]:1;
-        int hd=full?hd_f:hd_s,nkv=full?nkv_f:nkv_s; b+=(size_t)ml*nkv*hd*2*4; } return b;
+        int hd=full?hd_f:hd_s,nkv=full?nkv_f:nkv_s; b+=(size_t)ml*nkv*hd*2*g4_kv_elem(); } return b;
 }
 
 int main(int argc,char**argv){

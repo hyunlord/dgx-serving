@@ -125,6 +125,7 @@ struct FlashAttnSharedAccess<512, BR, BC> {
 };
 __device__ __forceinline__ __nv_bfloat16 fa_kv_bf16(__nv_bfloat16 value) { return value; }
 __device__ __forceinline__ __nv_bfloat16 fa_kv_bf16(float value) { return __float2bfloat16(value); }
+__device__ __forceinline__ __nv_bfloat16 fa_kv_bf16(__half value) { return __float2bfloat16(__half2float(value)); }   // R15 f16 KV
 
 template<int HD, int BR, int BC, int NW, typename KV>
 static __global__ void flash_attn2bs_p1_custom_kernel(const float *Q, const KV *Kc, const KV *Vc,
@@ -273,7 +274,7 @@ template<int HD, int BC, int NW, typename KV>
 static inline void launch_flash_attn2bs(const float *Q, const KV *Kc, const KV *Vc, float *O,
                                         int Sq, int NQ, int NKV, int base, cudaStream_t st=0,
                                         const unsigned *anc=nullptr, float scale=0.f, int window=0) {
-    static_assert(std::is_same<KV,float>::value || std::is_same<KV,__nv_bfloat16>::value,"unsupported KV type");
+    static_assert(std::is_same<KV,float>::value || std::is_same<KV,__nv_bfloat16>::value || std::is_same<KV,__half>::value,"unsupported KV type");
     int maxlen=base+Sq, NS=(maxlen+FD_SPLIT_KV-1)/FD_SPLIT_KV;
     size_t need=(size_t)Sq*NQ*NS;
     reserve_flash_attn_scratch(need,HD);

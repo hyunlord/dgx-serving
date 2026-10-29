@@ -11,6 +11,7 @@
 #include "../runtime/rope_gemma4.h"    // ★rope 테이블 host 생성(manifest 권위·partial proportional — 절대 게이트 참조)
 #include "../models/gemma4_moe.h"      // 26B-A4B MoE 분기(gemma4_moe_decode_batch·prefill_batch_slot)
 #include "../kernels/rope.cuh"
+#include "../kernels/kv_store.cuh"
 
 #define CK(x) do{cudaError_t e=(x);if(e!=cudaSuccess){fprintf(stderr,"[online] CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);}}while(0)
 
@@ -57,7 +58,7 @@ struct Gemma4OnlineBackend : OnlineBackend {
         for(int l=0;l<s->L;l++){
             const int full=c.layer_is_full?c.layer_is_full[l]:1;
             const size_t stride=(size_t)s->max_len*(full?nkv_f*hd_f:nkv_s*hd_s);   // gemma4_batch.cu kv_stride
-            view.Kc[l]=s->Kc[l]+(size_t)b*stride; view.Vc[l]=s->Vc[l]+(size_t)b*stride;
+            view.Kc[l]=kv_at(s->Kc[l],(size_t)b*stride); view.Vc[l]=kv_at(s->Vc[l],(size_t)b*stride);
         }
         Relay r{on_step, opaque}; G4GenerationStats gs;
         const int accepted=gemma4_generate(c,w,view,first,max_steps,-1,d_cf,d_sf,d_cs,d_ss,uq,&relay,&r,&gs);
