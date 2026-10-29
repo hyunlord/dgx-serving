@@ -34,7 +34,11 @@ def classify(kind, name, short, block, grid, lm_head):
     if "quantize" in short:
         return "activation_quantize"
     if "attn" in short or "soft_max" in short:
-        if kind == "engine":
+        if kind == "engine" and short.startswith("attn_split"):
+            m = re.search(r"attn_split_\w+<\(int\)(\d+)|attn_split_\w+<(\d+)", name)
+            hd = int(m.group(1) or m.group(2)) if m else 0
+            sub = "full" if hd >= 512 else "sliding"
+        elif kind == "engine":
             sub = "full" if block[0] >= 512 else "sliding"
         else:
             m = re.search(r"flash_attn_ext_f16<\(int\)(\d+)", name) or re.search(r"<\(int\)(\d+)", name)
