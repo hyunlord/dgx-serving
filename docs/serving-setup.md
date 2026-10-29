@@ -124,7 +124,7 @@ The spec daemon reads both the `mtp_*.bin` head weights and the RoPE tables from
 ```bash
 python tools/extract_weights_assistant.py --model google/gemma-4-12B-it-assistant \
     --out artifacts/gemma4-12b-assistant/weights
-python tools/serve_api.py --model gemma4-spec --tokenizer google/gemma-4-12B-it \
+python tools/serve_api.py --model gemma4-spec --tokenizer ~/models/qat/gemma-4-12B-it-qat-q4_0-unquantized \
     --weights artifacts/gemma4-12b-qat-ident-fp16/weights \
     --assistant artifacts/gemma4-12b-assistant/weights --port 8000
 ```
@@ -138,7 +138,7 @@ levers, see [`gemma-assistant-spec-measured.md`](./gemma-assistant-spec-measured
 
 ```bash
 # Gemma (12B shown; 31B / 26B-A4B identical shape, no --golden needed)
-python tools/serve_api.py --model gemma4 --tokenizer google/gemma-4-12B-it \
+python tools/serve_api.py --model gemma4 --tokenizer ~/models/qat/gemma-4-12B-it-qat-q4_0-unquantized \
     --weights artifacts/gemma4-12b-qat-ident-fp16/weights --port 8000
 
 # Qwen plain (27B shown; 35B-A3B identical shape)
@@ -150,6 +150,12 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
     --weights artifacts/qwen35-27b/weights --golden artifacts/qwen35-27b/mtp_golden --port 8000
 ```
 
+- **Gemma 12B tokenizer = the QAT checkpoint directory** downloaded in §2
+  (`~/models/qat/gemma-4-12B-it-qat-q4_0-unquantized`): it carries `tokenizer.json`,
+  `chat_template.jinja` and `generation_config.json` (EOS `[1, 106, 50]`), so `/v1/chat/completions`
+  uses the real chat template offline. A hub id such as `google/gemma-4-12B-it` only works if that
+  exact id (case-sensitive) is in the local HF cache with its tokenizer files; on the reference box it
+  is not (only `config.json` of `google/gemma-4-12b-it` is cached).
 - **`--tokenizer` must match the served model** — the chat template and the EOS/stop token ids come
   from it (the default is a Gemma tokenizer; Qwen serving without the flag will tokenize wrongly).
 - Wait for `[online] ready` on stderr: big models spend minutes in weight loading on a cold start —
@@ -165,6 +171,11 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   another request arrives. Outputs are bit-identical to the batch path. `G4_SERVE_FASTPATH=0` keeps
   every request on the batch path; `G4_CUDA_GRAPH=0` runs the single-stream session eagerly.
   Sampling requests (temperature > 0) always use the batch path.
+- Dense Gemma decode attention is split-KV (flash-decoding, GQA-shared) and the KV cache is stored
+  as f16 by default (R15): no context-length limit from shared memory and half the KV memory of
+  fp32. `G4_KV_DTYPE=fp32|f16|bf16` selects the storage; `G4_ATTN_SPLIT=0` restores the original
+  decode kernels (and then defaults the KV to fp32, which they require). 26B-A4B (MoE) always keeps
+  fp32 KV.
 - `stop` (string or up to 4 strings) follows OpenAI semantics: the matched text is not returned and
   `finish_reason` is `stop`. A stop match or a dropped streaming connection cancels the request on
   the GPU (`CANCEL <id>` to the daemon); a dropped non-streaming connection is noticed only when the
