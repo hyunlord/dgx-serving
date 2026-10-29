@@ -187,12 +187,19 @@ tests/%: tests/%.cu $(HEADERS)
 # 빌드 + 모든 테스트 실행
 #   ★긴 생성 rope 붕괴(theta·partial_rotary_factor 2연속 오진)의 절대 봉인 = test_gemma4_rope_table.py.
 #     spec==plain 상대 게이트가 두 번 놓친 축이라 상시 회귀에 편입(골든 자산 없으면 우아하게 skip — 신선 클론 안전).
-test: $(TEST_BINS)
+test: $(TEST_BINS) tools/knobs_dump
+	@echo "=== run tools/knobs_lint.sh + tests/test_knobs.py (knob registry) ==="
+	@sh tools/knobs_lint.sh || exit 1
+	@python3 tests/test_knobs.py || exit 1
 	@for t in $(TEST_BINS); do echo "=== run $$t ==="; $$t || exit 1; done
 	@echo "=== run tests/test_gemma4_rope_table.py (절대 골든 — 긴 생성 rope 봉인) ==="
 	@python3 tests/test_gemma4_rope_table.py || exit 1
 	@echo "=== run tests/test_longgen_degen.py (긴 생성 축퇴 게이트 — 스캐너 감도 자가증명; 라이브 스캔은 DEGEN_SERVE_URL 지정 시) ==="
 	@python3 tests/test_longgen_degen.py || exit 1
+
+# Knob registry export (runtime/knobs.h → JSON / Markdown); host-only.
+tools/knobs_dump: tools/knobs_dump.cu runtime/knobs.h
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) tools/knobs_dump.cu -o $@
 
 clean:
 	rm -f $(TEST_BINS)
