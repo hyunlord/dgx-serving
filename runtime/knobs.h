@@ -80,6 +80,11 @@ static const KnobDef g_knobs[] = {
  "golden (claimed bitwise: same compute order)", "MLP GEMV unroll factor"},
 {"MOE_FUSED",           KNOB_ENUM,  "1",   "0|1",           KNOB_TUNABLE, "MoE block (qwen 35B-A3B, gemma4 26B-A4B)",
  "golden, batch==single (claimed bit-identical k-order)", "1 = device-fused grouped expert GEMV; 0 = naive host loop"},
+// ---- Gemma 4 speculative serving (serve_daemon_gemma4_spec_online) ---------------------------------------------------
+{"G4_SPEC_K",           KNOB_INT,   "4",   "1..8",          KNOB_TUNABLE, "gemma4 spec daemon draft length",
+ "spec==greedy (K only changes speed)", "draft tokens per cycle; overrides the daemon's K argument (serve_api --spec-k)"},
+{"G4_SPEC_DRAFT_UQ",    KNOB_ENUM,  "2",   "0|2",           KNOB_TUNABLE, "gemma4 spec daemon drafter precision",
+ "spec==greedy (drafter only changes proposals)", "assistant drafter weights: 2 = W4A8, 0 = fp32; overrides the daemon's ast_uq argument"},
 // ---- Qwen speculative serving (bench_serve_spec / serve_daemon_qwen_spec_online) --------------------------------------
 {"MTP_Q4",              KNOB_ENUM,  "0",   "0|1",           KNOB_TUNABLE, "qwen MTP draft head",
  "spec==greedy (draft only changes proposals)", "q4 MTP draft weights"},

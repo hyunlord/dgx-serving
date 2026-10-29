@@ -59,6 +59,15 @@ confirms it on the target model.
 | golden | 12B / 31B / MoE golden tests | `make test`, `tests/test_gemma4` |
 | prefill_slot | chunked prefill slot equals c1tok | `tests/test_gemma4_prefill_slot` |
 
+## Speculative decoding knobs
+
+`G4_SPEC_K` (draft length, 1..8) and `G4_SPEC_DRAFT_UQ` (assistant drafter precision, 2 = W4A8,
+0 = fp32) are tunable: speculative output equals plain greedy output for every K and drafter
+(spec==greedy, `tests/test_gemma4_spec_e2e`, `tests/test_gemma4_spec_serving.py`), so they need no
+quality gate, only the spec==greedy gate and a speed measurement. They override the spec daemon's
+positional arguments (`serve_api.py --spec-k`); priority is env > recipe file > argument > default (4,
+W4A8). When an env or recipe value differs from an explicit argument, the daemon logs which value won.
+
 ## Searching numeric knobs
 
 A trial that changes a numeric knob is not comparable on speed alone. Before a configuration that

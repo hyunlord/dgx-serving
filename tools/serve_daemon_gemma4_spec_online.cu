@@ -52,8 +52,19 @@ int main(int argc,char**argv){
     const int uq     = argc>3?atoi(argv[3]):2;
     const int maxlen = argc>4?atoi(argv[4]):384;
     const int Bmax   = argc>5?atoi(argv[5]):4;
-    const int K      = argc>6?atoi(argv[6]):4;         // 3관문 최적점(code 1.54×·chat 1.34×)
-    const int ast_uq = argc>7?atoi(argv[7]):2;         // drafter 정밀도(2=W4A8 기본[Lever1 게이트 후]·0=fp32)
+    // K and drafter precision: registry knob (env > recipe) > positional argument > default.
+    //   Output is independent of both (spec==greedy), so a conflicting argument only warns.
+    auto spec_arg=[&](const char *knob, int argi, int dflt){
+        int v = argc>argi ? atoi(argv[argi]) : dflt;
+        if(const char *e=knob_raw(knob)){
+            const int ev=atoi(e);
+            if(argc>argi && ev!=v) fprintf(stderr,"[spec-online] %s=%d (%s) overrides argument %d\n",knob,ev,knob_source(knob),v);
+            v=ev;
+        }
+        return v;
+    };
+    const int K      = spec_arg("G4_SPEC_K",6,4);           // 3관문 최적점(code 1.54×·chat 1.34×)
+    const int ast_uq = spec_arg("G4_SPEC_DRAFT_UQ",7,2);    // drafter 정밀도(2=W4A8 기본[Lever1 게이트 후]·0=fp32)
     double ma = mem_avail_gb();
     fprintf(stderr,"[spec-online] MemAvailable=%.1fGB (필요 ~12GB: 12B q4 7.5+assistant fp32 1.7+KV)\n", ma);
     if(ma>0 && ma<14){ fprintf(stderr,"[spec-online] 메모리 여유 부족(<14GB) — 크래시 가드 중단.\n"); return 1; }
