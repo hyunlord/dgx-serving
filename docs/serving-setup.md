@@ -176,13 +176,19 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   fp32. `G4_KV_DTYPE=fp32|f16|bf16` selects the storage; `G4_ATTN_SPLIT=0` restores the original
   decode kernels (and then defaults the KV to fp32, which they require). 26B-A4B (MoE) always keeps
   fp32 KV.
+- Dense Gemma norms use a parallel RMSNorm row function with q/k norm+RoPE (+KV store) and
+  post-norm+residual fused by default (R16): about +5.5% decode at d0 and +2.6~4.5% prefill, chat PPL
+  +0.62% (within the quality gate). `G4_NORM_FUSED=0` restores the per-kernel norms. MoE keeps them.
+- Every engine environment setting is a registered knob ([knobs.md](./knobs.md)); out-of-range values
+  stop the process with exit code 2, and each binary prints its effective settings as one `KNOBS {...}`
+  line on stderr.
 - `stop` (string or up to 4 strings) follows OpenAI semantics: the matched text is not returned and
   `finish_reason` is `stop`. A stop match or a dropped streaming connection cancels the request on
   the GPU (`CANCEL <id>` to the daemon); a dropped non-streaming connection is noticed only when the
   response is written.
 - Dense Gemma W4A8 uses MMQ for amortized prefill by default. Set `G4_MMQ_PREFILL=0` to use the
-  previous SB path. `G4_MMQ_MIN_S` selects the minimum row count (default 16; smaller values clamp
-  to 16; invalid values fall back to 16). Decode and non-amortized calls retain their existing paths.
+  previous SB path. `G4_MMQ_MIN_S` selects the minimum row count (default 16; values below 16 or
+  non-integers are rejected at startup, see [knobs.md](./knobs.md)). Decode and non-amortized calls retain their existing paths.
   `tools/bench_gemma4` now defaults to amortized prefill; `BENCH_G4_AMORT=0` reproduces its prior
   plain GEMV prefill path. This setting does not change the scale dtype selected by the weight manifest.
 - Dense Gemma prefill attention uses flash by default. Set `G4_FLASH_PREFILL=0` to restore

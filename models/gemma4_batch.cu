@@ -10,7 +10,7 @@
 #include "../kernels/attention_decode_split.cuh"
 #include "../kernels/kv_store.cuh"
 #include "../kernels/norm_fused.cuh"
-bool g4_norm_fused();   // gemma4_decode.cu (G4_NORM_FUSED)
+bool g4_norm_fused(const ModelConfig &c);   // gemma4_decode.cu (G4_NORM_FUSED)
 #include "../kernels/gemv_w4a8.cuh"   // W4A8 batch: B≤8 SB 커널(27b 축1 이식)
 #include "../kernels/gemm_mmq.cuh"    // W4A8 batch: BM=16 split-K(B≥14 opt-in)
 #include "../kernels/quantize_x.cuh"  // W4A8: 활성화 int8 양자화
@@ -83,7 +83,7 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
                          const float *d_cos_s, const float *d_sin_s,
                          float *d_logits, int commit, int use_q4,
                          const int *d_pos_b, const int *h_pos_b) {
-    const bool nf=g4_norm_fused();   // dense only; the MoE batch path keeps its kernels
+    const bool nf=g4_norm_fused(c);   // dense only; the MoE batch path keeps its kernels
     gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
     const int B=st.B, H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
@@ -412,7 +412,7 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
                           const float *d_cos_f, const float *d_sin_f,
                           const float *d_cos_s, const float *d_sin_s,
                           float *d_logits_cat, int use_q4, float *d_prenorm_cat){
-    const bool nf=g4_norm_fused();   // dense only; the MoE batch path keeps its kernels
+    const bool nf=g4_norm_fused(c);   // dense only; the MoE batch path keeps its kernels
     gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;

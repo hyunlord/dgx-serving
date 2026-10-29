@@ -104,10 +104,19 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
 // Dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel by default (R15);
 // G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
 static bool g4_attn_split(){ static const bool on=[](){ const char* v=knob_raw("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
-// G4_NORM_FUSED=1 (R16, opt-in): every norm of the dense graph uses the parallel row function
+// G4_NORM_FUSED (R16, default on; 0 restores the per-kernel norms): every norm of the dense graph uses the parallel row function
 // (norm_fused.cuh), with q/k norm+RoPE(+KV store) and post-norm+residual(+next pre-norm) fused.
 // Shared with gemma4_batch.cu so decode, verify, batch, concat and prefill rows stay bit-identical.
-bool g4_norm_fused(){ static const bool on=[](){ const char* v=knob_raw("G4_NORM_FUSED"); return v && strcmp(v,"1")==0; }(); return on; }
+static bool g4_norm_fused_requested(){ static const bool on=[](){ const char* v=knob_raw("G4_NORM_FUSED"); return !(v && strcmp(v,"0")==0); }(); return on; }
+// Dense configs whose hidden/head sizes the row function supports; elsewhere the default quietly keeps the
+// per-kernel norms, and an explicit G4_NORM_FUSED=1 is an error.
+bool g4_norm_fused(const ModelConfig &c){
+    if(!g4_norm_fused_requested() || c.num_experts) return false;
+    const int hd_s=c.head_dim, hd_f=c.global_head_dim?c.global_head_dim:hd_s;
+    const bool ok=norm_par_supported(c.hidden_size) && norm_par_supported(hd_s) && norm_par_supported(hd_f) && hd_s<=512 && hd_f<=512;
+    if(!ok && knob_raw("G4_NORM_FUSED")){ fprintf(stderr,"G4_NORM_FUSED=1 needs hidden and head sizes divisible by 4 (head <= 512)\n"); exit(1); }
+    return ok;
+}
 
 struct G4DecodeGraph {
     cudaStream_t stream=nullptr;
@@ -264,9 +273,7 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         (void)g4d_mmq_min_s();
     }
     const bool attn_split=g4_attn_split() && !(flash_prefill && Sq>=flash_min_s);
-    const bool nf=g4_norm_fused();
-    if(nf && !(norm_par_supported(H) && norm_par_supported(hd_s) && norm_par_supported(hd_f) && hd_max<=512)){
-        fprintf(stderr,"G4_NORM_FUSED=1 needs hidden and head sizes divisible by 4 (head <= 512)\n"); exit(1); }
+    const bool nf=g4_norm_fused(c);
     const bool nf_store=nf && !g4_kv_stats_enabled();   // KV statistics keep the separate kv_store kernel
     if(attn_split) attn_split_reserve(Sq,NQ,st.max_len,hd_max);   // before any capture; max_len bound
     if(Sq==1 && c.num_layers>0 && !attn_split)
