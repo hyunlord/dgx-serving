@@ -99,8 +99,9 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
     else              launch_gemv_f32(X,m.wf,Y,IN,OUT,S,stream);
 }
 
-// G4_ATTN_SPLIT=1: dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel.
-static bool g4_attn_split(){ static const bool on=[](){ const char* v=getenv("G4_ATTN_SPLIT"); return v && strcmp(v,"1")==0; }(); return on; }
+// Dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel by default (R15);
+// G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
+static bool g4_attn_split(){ static const bool on=[](){ const char* v=getenv("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
 
 struct G4DecodeGraph {
     cudaStream_t stream=nullptr;

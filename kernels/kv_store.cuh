@@ -1,6 +1,7 @@
 #ifndef DGX_KV_STORE_CUH
 #define DGX_KV_STORE_CUH
-// KV cache storage dtype (process-wide knob G4_KV_DTYPE = fp32 | f16 | bf16, default fp32).
+// KV cache storage dtype (process-wide knob G4_KV_DTYPE = fp32 | f16 | bf16). Default (R15): f16, or fp32
+//   when G4_ATTN_SPLIT=0 (the original decode kernels read fp32 only).
 //   Caches keep their float* handles; for 16-bit dtypes the buffer holds that dtype and every element
 //   offset must go through kv_at() (byte arithmetic). fp32 behaves exactly as before (kv_at == p + n).
 //   K/V are produced in fp32 scratch and written with kv_store() (round-to-nearest conversion); readers
@@ -24,7 +25,11 @@ inline int g4_kv_dtype() {
     if (g_kv_dtype_override >= 0) return g_kv_dtype_override;
     static const int dtype = []() {
         const char *v = getenv("G4_KV_DTYPE");
-        if (!v || !*v || !strcmp(v, "fp32")) return (int)KV_FP32;
+        if (!v || !*v) {
+            const char *split = getenv("G4_ATTN_SPLIT");
+            return (split && !strcmp(split, "0")) ? (int)KV_FP32 : (int)KV_F16;
+        }
+        if (!strcmp(v, "fp32")) return (int)KV_FP32;
         if (!strcmp(v, "f16")) return (int)KV_F16;
         if (!strcmp(v, "bf16")) return (int)KV_BF16;
         fprintf(stderr, "Invalid G4_KV_DTYPE=%s (fp32, f16 or bf16)\n", v); exit(1);

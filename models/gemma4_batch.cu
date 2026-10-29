@@ -48,8 +48,9 @@ void free_g4_batch_state(G4BatchState &s){
 //     B≤8 → gemv_w4a8_sb(SMAX dispatch, 1적재) / B≥14 opt-in split-K(BM16, borderline flip=스킴 변경) / else gemm_batch_w4a8.
 //     ★bit-identical은 같은 SB family 내(SMAX 버킷 동일)서 성립 — 버킷/커널 경계 넘으면 W4A8 스킴 변경(flip 가능).
 //   use_q4!=2 (q4): gemm_batch_q4(B-무관 canonical, 기존 경로 무변경).
-// G4_ATTN_SPLIT=1: dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel.
-static bool g4_attn_split(){ static const bool on=[](){ const char* v=getenv("G4_ATTN_SPLIT"); return v && strcmp(v,"1")==0; }(); return on; }
+// Dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel by default (R15);
+// G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
+static bool g4_attn_split(){ static const bool on=[](){ const char* v=getenv("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
 static int gb_sdtype, gb_use_q4;
 static int8_t *gb_xq=nullptr; static float *gb_xs=nullptr; static int32_t *gb_xsum=nullptr; static size_t gb_xcap=0;
 static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT, int B){
