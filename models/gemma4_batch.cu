@@ -24,6 +24,7 @@
 static float *bdm(size_t n){ float*p; BK(cudaMalloc(&p,n*4)); return p; }
 
 G4BatchState alloc_g4_batch_state(const ModelConfig &c, int B, int max_len){
+    if(c.num_experts>0) g4_kv_force_fp32("MoE model");
     G4BatchState s{}; s.B=B; s.max_len=max_len; s.n_past=0; s.L=c.num_layers;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;

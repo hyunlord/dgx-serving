@@ -17,7 +17,11 @@
 
 enum { KV_FP32 = 0, KV_F16 = 1, KV_BF16 = 2 };
 
-static inline int g4_kv_dtype() {
+// Process-wide override (shared across translation units): MoE models keep fp32 KV (their batch
+// attention path is unchanged), see g4_kv_force_fp32().
+inline int g_kv_dtype_override = -1;
+inline int g4_kv_dtype() {
+    if (g_kv_dtype_override >= 0) return g_kv_dtype_override;
     static const int dtype = []() {
         const char *v = getenv("G4_KV_DTYPE");
         if (!v || !*v || !strcmp(v, "fp32")) return (int)KV_FP32;
@@ -26,6 +30,12 @@ static inline int g4_kv_dtype() {
         fprintf(stderr, "Invalid G4_KV_DTYPE=%s (fp32, f16 or bf16)\n", v); exit(1);
     }();
     return dtype;
+}
+// Called when a MoE model's state is allocated (before any KV access in that process).
+inline void g4_kv_force_fp32(const char *why) {
+    if (g_kv_dtype_override == 0) return;
+    if (getenv("G4_KV_DTYPE") && strcmp(getenv("G4_KV_DTYPE"), "fp32")) fprintf(stderr, "G4_KV_DTYPE ignored (%s): fp32 KV\n", why);
+    g_kv_dtype_override = 0;
 }
 static inline size_t g4_kv_elem() { return g4_kv_dtype() == KV_FP32 ? 4 : 2; }
 template<class P> static inline P *kv_at(P *p, size_t elems) {

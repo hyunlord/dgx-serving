@@ -35,6 +35,7 @@ static inline float* g4d_grow(float*&p,size_t&cap,size_t n){ if(cap<n){ if(p)cud
 
 // ---- KV 캐시 alloc/free (A-1: 캡=max_len 선형; A-2에서 sliding 캡) ----
 G4DecodeState alloc_g4_decode_state(const ModelConfig &c, int max_len) {
+    if(c.num_experts>0) g4_kv_force_fp32("MoE model");
     G4DecodeState s{}; s.max_len=max_len; s.n_past=0; s.L=c.num_layers;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
