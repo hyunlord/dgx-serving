@@ -19,6 +19,7 @@
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/gemm_mmq_tmpl.cuh"
+#include "../kernels/gemm_mmq_v2.cuh"   // R20 PART C (bit-identical MMQ data-movement variants)
 #include "../kernels/gemm_tiled.cuh"
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
@@ -91,7 +92,7 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
     if(use_q4==2){
         launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S,stream);
         if(g4d_mmq_prefill() && gd_amort==1 && S>=g4d_mmq_min_s() && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
-            launch_gemm_mmq_w4a8_auto(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
+            launch_gemm_mmq_w4a8_g4(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
         } else if(gd_amort && S>1){  // 프리필: SB 커널로 weight 1회/≤16행 amortize(비-amortized plain gemv의 S× 재적재 제거).
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
             for(int s0=0;s0<S;s0+=16){ int sq=(S-s0<16)?(S-s0):16;

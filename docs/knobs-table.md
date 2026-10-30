@@ -4,6 +4,9 @@
 
 | knob | type | default | range | scope | gates to re-run | description |
 |---|---|---|---|---|---|---|
+| `G4_MMQ_UNPACK` | enum | `0` | `0\|1` | gemma4 prefill MMQ (W4A8, S >= G4_MMQ_MIN_S) | golden, prefill_slot (same mma fragments and accumulation) | unpack the int4 B tile to int8 once per K-tile in shared memory |
+| `G4_MMQ_SCALE_ASYNC` | enum | `0` | `0\|1` | gemma4 prefill MMQ | golden, prefill_slot (same scale values) | row/column scales loaded with cp.async into double buffers with the tiles |
+| `G4_MMQ_CP16` | enum | `0` | `0\|1` | gemma4 prefill MMQ | golden, prefill_slot (copy width only) | 16-byte cp.async for the A tile (and B with G4_MMQ_UNPACK=1) |
 | `G4_CUDA_GRAPH` | enum | `2` | `0\|1\|2` | gemma4 single-stream decode (generate session, gemma4_decode) | graph_on==off, fastpath==batch | decode launch mode: unset/2 = Graph v2 session, 1 = per-step v1 capture, 0 = eager |
 | `G4_GRAPH_OVERLAP` | enum | `1` | `0\|1` | gemma4 Graph v2 session | graph_on==off | overlap host bookkeeping with the next replay (v2 only) |
 | `G4_GRAPH_NODE_UPDATE` | enum | `0` | `0\|1` | gemma4 Graph v2 session | graph_on==off | direct kernel-node parameter patching instead of per-step capture + exec update (v2 only) |
