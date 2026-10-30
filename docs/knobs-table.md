@@ -11,8 +11,9 @@
 | `MMQ256` | enum | `0` | `0\|1\|2` | MMQ prefill/verify GEMM tile (gemma4, qwen) | golden (claimed bitwise: same K-reduction order) | MMQ tile: 0 = 128x128, 1 = 256x64, 2 = per-(N,K) table |
 | `MLP_U` | enum | `2` | `2\|3\|4\|6` | qwen W4A8 MLP GEMV | golden (claimed bitwise: same compute order) | MLP GEMV unroll factor |
 | `MOE_FUSED` | enum | `1` | `0\|1` | MoE block (qwen 35B-A3B, gemma4 26B-A4B) | golden, batch==single (claimed bit-identical k-order) | 1 = device-fused grouped expert GEMV; 0 = naive host loop |
-| `G4_SPEC_K` | int | `4` | `1..8` | gemma4 spec daemon draft length | spec==greedy (K only changes speed) | draft tokens per cycle; overrides the daemon's K argument (serve_api --spec-k) |
+| `G4_SPEC_K` | int | `3` | `1..8` | gemma4 spec daemon draft length | spec==greedy (K only changes speed) | draft tokens per cycle; overrides the daemon's K argument (serve_api --spec-k) |
 | `G4_SPEC_DRAFT_UQ` | enum | `2` | `0\|2` | gemma4 spec daemon drafter precision | spec==greedy (drafter only changes proposals) | assistant drafter weights: 2 = W4A8, 0 = fp32; overrides the daemon's ast_uq argument |
+| `G4_SPEC_SERVE` | enum | `0` | `0\|1` | gemma4 online daemon with a drafter (serve_api --model gemma4 --assistant) | spec==greedy, fastpath==batch (switch at cycle boundaries) | serve a lone greedy request with speculative cycles (K = G4_SPEC_K) |
 | `MTP_Q4` | enum | `0` | `0\|1` | qwen MTP draft head | spec==greedy (draft only changes proposals) | q4 MTP draft weights |
 | `DRAFT_GEMV` | enum | `0` | `0\|1` | qwen draft matmul | spec==greedy | GEMV draft matmul instead of gemm_batch |
 | `DRAFT_SEQ` | enum | `0` | `0\|1` | qwen draft scheduling | spec==greedy | sequential per-slot draft |

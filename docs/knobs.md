@@ -65,8 +65,13 @@ confirms it on the target model.
 0 = fp32) are tunable: speculative output equals plain greedy output for every K and drafter
 (spec==greedy, `tests/test_gemma4_spec_e2e`, `tests/test_gemma4_spec_serving.py`), so they need no
 quality gate, only the spec==greedy gate and a speed measurement. They override the spec daemon's
-positional arguments (`serve_api.py --spec-k`); priority is env > recipe file > argument > default (4,
+positional arguments (`serve_api.py --spec-k`); priority is env > recipe file > argument > default (3,
 W4A8). When an env or recipe value differs from an explicit argument, the daemon logs which value won.
+
+**Tie rule for tunable defaults.** When two values of a tunable knob measure within noise of each other,
+the default is the cheaper one. `G4_SPEC_K` defaults to 3: in R17 serving (12 prompts, W4A8 drafter,
+3 alternating rounds) K=3 and K=4 measured +69.2% and +69.0% over plain, a tie, and K=3 wastes fewer
+rejected verify rows and less verify memory.
 
 ## Searching numeric knobs
 

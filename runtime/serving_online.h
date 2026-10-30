@@ -108,7 +108,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
     const char* spec_env = knob_raw("G4_SPEC_SERVE");
     const bool spec_serve = be.spec_ready() && spec_env && std::string(spec_env) == "1";
     const char* speck_env = knob_raw("G4_SPEC_K");
-    const int spec_k = speck_env ? atoi(speck_env) : 4;
+    const int spec_k = speck_env ? atoi(speck_env) : 3;
     unsigned long long n_spec_switch=0;
     if(spec_serve) fprintf(stderr,"[online] spec serving: K=%d (single greedy requests)\n",spec_k);
     std::thread reader([&]{

@@ -324,7 +324,7 @@ def main():
     ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen","spec","gemma4-spec"])  # daemon 종류(arg 레이아웃 상이; spec=27b MTP·gemma4-spec=12B+0.4B assistant)
     ap.add_argument("--golden", default="")                        # qwen/spec rope+MTP golden dir(필수 — gemma4는 dummy rope)
     ap.add_argument("--assistant", default="")                     # gemma4-spec: 0.4B assistant weights dir(extract_weights_assistant.py)
-    ap.add_argument("--spec-k", type=int, default=4)               # gemma4-spec: draft 길이 K(3관문 최적 4)
+    ap.add_argument("--spec-k", type=int, default=3)               # gemma4-spec: draft 길이 K(R17 서빙 측정 K=3·4 동률 → 3)
     ap.add_argument("--uq", type=int, default=2)                   # recipe 없을 때 양자화(2=W4A8·1=q4·0=fp32)
     ap.add_argument("--model-id", default="")                      # recipe 없을 때 모델 표시명
     ap.add_argument("--port", type=int, default=8000)

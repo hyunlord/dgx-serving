@@ -6,7 +6,7 @@
 //   stdout "<rid> <tok>"/"<rid> END <stop|length>", stderr "[online] ready". serve_api OnlineDaemon 그대로 붙음.
 //   동시성 = 슬롯별 라운드로빈 사이클(per-slot 순차 = 단독과 동일 계산 = 격리 구성적 — 배칭 이득은 후속 perf).
 //   rope = 온디바이스 생성(plain daemon 동일 — target/assistant 같은 테이블 = 내적 일관·spec 불변식 성립).
-//   사용법: serve_daemon_gemma4_spec_online <tgt_weights> <ast_weights> [uq=2] [maxlen=384] [Bmax=4] [K=4] [ast_uq=2]
+//   사용법: serve_daemon_gemma4_spec_online <tgt_weights> <ast_weights> [uq=2] [maxlen=384] [Bmax=4] [K=3] [ast_uq=2]
 #include "runtime/knobs.h"
 #include <cstdio>
 #include <cstdlib>
@@ -63,7 +63,7 @@ int main(int argc,char**argv){
         }
         return v;
     };
-    const int K      = spec_arg("G4_SPEC_K",6,4);           // 3관문 최적점(code 1.54×·chat 1.34×)
+    const int K      = spec_arg("G4_SPEC_K",6,3);           // R17 서빙 측정: K=3·4 동률 → 작은 K(docs/knobs.md)
     const int ast_uq = spec_arg("G4_SPEC_DRAFT_UQ",7,2);    // drafter 정밀도(2=W4A8 기본[Lever1 게이트 후]·0=fp32)
     double ma = mem_avail_gb();
     fprintf(stderr,"[spec-online] MemAvailable=%.1fGB (필요 ~12GB: 12B q4 7.5+assistant fp32 1.7+KV)\n", ma);
