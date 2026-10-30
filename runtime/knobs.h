@@ -66,7 +66,7 @@ static const KnobDef g_knobs[] = {
  "golden, spec==greedy, batch==single (same quantized bytes)", "q/k/v and gate/up reuse one int8 activation quantization; 0 = quantize before every matmul"},
 {"G4_GEMV_PF",          KNOB_ENUM,  "2",   "0|2|4",         KNOB_TUNABLE, "gemma4 dense W4A8 GEMV (plain and SB)",
  "golden, spec==greedy, batch==single (prefetch only)", "prefetch.global.L2 of the weight chunk this many iterations ahead; 0 = none"},
-{"G4_GEMV_U",           KNOB_ENUM,  "1",   "1|2",           KNOB_TUNABLE, "gemma4 dense W4A8 plain GEMV (S=1 decode, per-slot verify rows)",
+{"G4_GEMV_U",           KNOB_ENUM,  "2",   "1|2",           KNOB_TUNABLE, "gemma4 dense W4A8 plain GEMV (S=1 decode, per-slot verify rows)",
  "golden, spec==greedy, batch==single (same accumulation order)", "k-loop unroll: chunks loaded before they are accumulated"},
 {"G4_GEMV_PERM",        KNOB_ENUM,  "0",   "0|1",           KNOB_TUNABLE, "gemma4 dense W4A8 GEMV (plain and SB)",
  "golden, spec==greedy, batch==single (same int32 dot)", "nibble unpack with __byte_perm + __vsub4 instead of shifts and masks"},
