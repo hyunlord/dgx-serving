@@ -28,7 +28,7 @@
     {"name": "G4_QUANT_SHARE", "type": "enum", "default": "1", "range": "0|1", "class": "tunable",
      "scope": "gemma4 dense W4A8 decode/verify/batch/concat/prefill matmuls", "gates": "golden, spec==greedy, batch==single (same quantized bytes)", "desc": "q/k/v and gate/up reuse one int8 activation quantization; 0 = quantize before every matmul",
      "choices": ["0", "1"]},
-    {"name": "G4_GEMV_PF", "type": "enum", "default": "0", "range": "0|2|4", "class": "tunable",
+    {"name": "G4_GEMV_PF", "type": "enum", "default": "2", "range": "0|2|4", "class": "tunable",
      "scope": "gemma4 dense W4A8 GEMV (plain and SB)", "gates": "golden, spec==greedy, batch==single (prefetch only)", "desc": "prefetch.global.L2 of the weight chunk this many iterations ahead; 0 = none",
      "choices": ["0", "2", "4"]},
     {"name": "G4_GEMV_U", "type": "enum", "default": "1", "range": "1|2", "class": "tunable",

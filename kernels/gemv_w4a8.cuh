@@ -290,7 +290,7 @@ static inline const G4GemvCfg &g4_gemv_cfg() {
     static const G4GemvCfg c = [] {
         G4GemvCfg r;
         const char *v;
-        v = knob_raw("G4_GEMV_PF");   r.pf = v ? atoi(v) : 0;
+        v = knob_raw("G4_GEMV_PF");   r.pf = v ? atoi(v) : 2;
         v = knob_raw("G4_GEMV_U");    r.u = v ? atoi(v) : 1;
         v = knob_raw("G4_GEMV_PERM"); r.perm = v && strcmp(v, "1") == 0;
         if (r.pf != 0 && r.pf != 2 && r.pf != 4) { fprintf(stderr, "G4_GEMV_PF must be 0, 2 or 4\n"); exit(1); }
