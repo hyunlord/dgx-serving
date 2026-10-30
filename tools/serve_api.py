@@ -362,6 +362,7 @@ def main():
     if args.model == "gemma4":
         gbin = os.environ.get("DAEMON_BIN_GEMMA4") or os.path.join(REPO,"tools","serve_daemon_gemma4_online")  # A/B 테스트용 바이너리 오버라이드(기본=표준 경로)
         cmd = [gbin, args.weights, str(uq), str(args.maxlen), str(args.bmax)]
+        if args.assistant: cmd.append(args.assistant)            # R17: drafter for the spec path (G4_SPEC_SERVE=1)
     elif args.model == "gemma4-spec":                              # 12B + 0.4B assistant draft-spec(4관문) — spec==greedy 불변
         if not args.assistant: sys.exit("[serve_api] --model gemma4-spec 은 --assistant(0.4B weights dir) 필수")
         cmd = [os.path.join(REPO,"tools","serve_daemon_gemma4_spec_online"), args.weights, args.assistant,

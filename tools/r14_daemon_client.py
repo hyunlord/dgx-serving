@@ -32,11 +32,12 @@ def main():
     ap.add_argument("--plan", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--stop-ids", default="1")  # serve_api default tokenizer generation_config eos
+    ap.add_argument("--assistant", default="")  # R17: drafter weights dir (5th daemon argument)
     a = ap.parse_args()
     plan = json.load(open(a.plan))
     base = os.path.dirname(os.path.abspath(a.plan))
     env = {**os.environ, "STOP_IDS": a.stop_ids}
-    cmd = [a.daemon, a.weights, str(a.uq), str(a.maxlen), str(a.bmax)]
+    cmd = [a.daemon, a.weights, str(a.uq), str(a.maxlen), str(a.bmax)] + ([a.assistant] if a.assistant else [])
     p = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, bufsize=1)
     err_lines, ready = [], threading.Event()

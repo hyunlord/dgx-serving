@@ -52,6 +52,15 @@ struct OnlineBackend {
                                   int (*on_step)(int, void*), void* opaque, SingleStats* stats) { return 0; }
     // 최근 logit rows개(V씩)를 host로 D2H 복사(backend가 cuda 소유 — 루프는 순수 host). prefill 후 rows=1, decode 후 rows=Bmax.
     virtual void  logits_to_host(float* h_dst, int rows) = 0;
+    // 선택(R17): 슬롯 b 단일 greedy 요청의 speculative 사이클. KV 길이 pos, 아직 KV에 없는 최근 토큰 cur에서
+    //   drafter K토큰 → verify(K+1행) → 수락 접두사 m + 교정 1 = tokens[0..n-1](n=m+1) 확정. KV는 pos..pos+m 행이
+    //   확정(나머지 verify 행은 다음 사이클이 덮음). K=0 또는 drafter 상태(h)가 없으면 verify 1행 = plain 1스텝.
+    //   확정 토큰·KV는 decode_step(W=1) 경로와 비트 동일해야 한다(spec==greedy). spec_invalidate(b)는 슬롯 b가
+    //   다른 경로로 진행했을 때 drafter 상태를 버린다.
+    struct SpecCycle { int tokens[16]; int n=0, drafted=0, accepted=0, k=0; };
+    virtual bool  spec_ready() const { return false; }
+    virtual void  spec_invalidate(int b) {}
+    virtual void  spec_cycle(void* st, int b, int pos, int cur, int K, SpecCycle* out) {}
 };
 
 namespace serving_online_detail {
@@ -62,7 +71,9 @@ namespace serving_online_detail {
                   float temp=0.f, topp=1.f, repp=1.f;                                // 샘플러(요청별)
                   std::mt19937_64 rng; std::vector<int> hist;                        // seed-결정 RNG·생성 이력(반복 페널티)
                   int fast_steps=0, batch_steps=0, fast_entries=0;                   // 경로 카운터(로그)
-                  unsigned long long fast_tail=0; };
+                  unsigned long long fast_tail=0;
+                  int spec_cycles=0, spec_entries=0, spec_tokens=0; long spec_drafted=0, spec_accepted=0;
+};
 }
 
 // 모델-중립 온라인 daemon 루프. be=구성된 backend(weight 로드 완료), Bmax=동시 활성 슬롯 상한.
@@ -93,6 +104,13 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
     const char* fast_env = knob_raw("G4_SERVE_FASTPATH");
     const bool fastpath = be.single_stream() && !(fast_env && std::string(fast_env) == "0");
     unsigned long long n_fast_req=0, n_batch_req=0, n_switch=0, n_tail=0;
+    // R17 spec 경로(opt-in G4_SPEC_SERVE=1, drafter 적재 backend만): 단일 greedy 요청을 speculative 사이클로.
+    const char* spec_env = knob_raw("G4_SPEC_SERVE");
+    const bool spec_serve = be.spec_ready() && spec_env && std::string(spec_env) == "1";
+    const char* speck_env = knob_raw("G4_SPEC_K");
+    const int spec_k = speck_env ? atoi(speck_env) : 4;
+    unsigned long long n_spec_switch=0;
+    if(spec_serve) fprintf(stderr,"[online] spec serving: K=%d (single greedy requests)\n",spec_k);
     std::thread reader([&]{
         std::string line;
         while(std::getline(std::cin, line)){
@@ -167,6 +185,9 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
         if(s.fast_steps) ++n_fast_req; else ++n_batch_req;
         fprintf(stderr,"[online] PATH req=%ld reason=%s fast_steps=%d batch_steps=%d fast_entries=%d fast_tail=%llu sampling=%d totals_fast_req=%llu totals_batch_req=%llu totals_switch=%llu totals_tail=%llu\n",
                 s.req,reason,s.fast_steps,s.batch_steps,s.fast_entries,s.fast_tail,s.temp>0.f?1:0,n_fast_req,n_batch_req,n_switch,n_tail);
+        if(s.spec_cycles)
+            fprintf(stderr,"[online] SPEC req=%ld cycles=%d entries=%d tokens=%d drafted=%ld accepted=%ld discarded=%ld totals_spec_switch=%llu\n",
+                    s.req,s.spec_cycles,s.spec_entries,s.spec_tokens,s.spec_drafted,s.spec_accepted,s.spec_drafted-s.spec_accepted,n_spec_switch);
         s=Slot();
     };
     // CANCEL 적용(스텝 경계): 대기 큐에서 제거하거나 활성 슬롯 종료. 알 수 없는 id는 무시.
@@ -199,6 +220,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
                 int budget=maxlen-P; if(r.max_tokens>budget) r.max_tokens=budget;
                 be.reset_slot(st, b);                              // 슬롯 재사용 잔재 clear(qwen GDN state; gemma4 no-op)
                 be.prefill_ids(st, b, r.ids.data(), P);            // 슬롯 b KV[0..P-1] + logits[0:V]=마지막
+                be.spec_invalidate(b);                             // drafter 상태(h)는 첫 spec 사이클이 만든다
                 be.logits_to_host(hlog.data(), 1);
                 slot[b] = Slot{}; Slot& sl=slot[b];
                 sl.req=r.id; sl.pos=P; sl.max_tokens=r.max_tokens;
@@ -220,6 +242,33 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
         int A=n_active();
         if(A==0){ if(shutdown){ std::lock_guard<std::mutex> lk(mtx); if(queue.empty()) break; } continue; }
 
+        // 2s) R17 spec 경로: 활성 1개·greedy·대기 없음·G4_SPEC_SERVE=1. 사이클마다 m+1토큰 확정, 한 토큰씩
+        //     기존 규칙(EOS 미출력 종료·max_tokens·maxlen)으로 방출하고 경계를 넘은 토큰은 버린다. 새 요청/CANCEL은
+        //     사이클 경계에서 감지해 배치 루프로 복귀(슬롯 pos/last가 이어받음 — 미수락 draft KV 행은 이후 덮임).
+        if(spec_serve && A==1){
+            int b=0; while(slot[b].req<0) ++b;
+            Slot& s=slot[b];
+            if(s.temp<=0.f && s.gen<s.max_tokens && s.pos<maxlen-1 && !pending(s.req)){
+                ++s.spec_entries;
+                const long req=s.req; bool done=false;
+                while(!done){
+                    const int kroom=std::max(0,(maxlen-2)-s.pos);          // verify 행 pos..pos+K < maxlen-1
+                    OnlineBackend::SpecCycle cy;
+                    be.spec_cycle(st, b, s.pos, s.last, std::min(spec_k,kroom), &cy);
+                    ++s.spec_cycles; s.spec_drafted+=cy.drafted; s.spec_accepted+=cy.accepted;
+                    for(int i=0;i<cy.n;i++){
+                        const int next=cy.tokens[i];
+                        if(is_stop(next)){ finish(s,"stop"); done=true; break; }
+                        printf("%ld %d\n", s.req, next); fflush(stdout);
+                        s.last=next; s.pos++; s.gen++; s.spec_tokens++;
+                        if(s.gen>=s.max_tokens || s.pos>=maxlen-1){ finish(s,"length"); done=true; break; }
+                    }
+                    if(!done && pending(req)){ ++n_spec_switch; break; }
+                }
+                continue;
+            }
+        }
+
         // 2a) 단일 스트림 fast-path: 활성 1개·greedy·대기 없음. 스텝 처리는 아래 3)과 같은 규칙(EOS·길이 종료).
         //     새 요청/CANCEL이 생기면 그 스텝 뒤 멈추고 배치 루프로 복귀(슬롯 pos/last가 이어받음).
         if(fastpath && A==1){
@@ -239,6 +288,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
                 const long req=s.req; const int start=s.pos; ++s.fast_entries;
                 OnlineBackend::SingleStats ss;
                 be.generate_single(st, b, s.pos, s.last, room, &FastCtx::call, &ctx, &ss);
+                be.spec_invalidate(b);
                 n_tail+=ss.speculative; if(s.req==req) s.fast_tail+=ss.speculative;
                 if(std::string(why)=="switch") ++n_switch;
                 fprintf(stderr,"[online] FASTPATH req=%ld start_pos=%d accepted=%llu executed=%llu tail=%llu exit=%s\n",
@@ -260,6 +310,7 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
 
         // 3) 슬롯별 토큰 선택(greedy=argmax 그대로·샘플링=옵션) → 스트림 → 피드백 → 완료(슬롯 격리). active는 0..W-1.
         for(int b=0;b<W;b++){ Slot&s=slot[b]; if(s.req<0) continue;
+            be.spec_invalidate(b);
             int next=pick_row(b, s); ++s.batch_steps;
             if(is_stop(next)){ finish(s,"stop"); continue; }  // ★EOS: 토큰 미출력·종료(계산 불변 — 값 그대로 판정)
             printf("%ld %d\n", s.req, next); fflush(stdout);

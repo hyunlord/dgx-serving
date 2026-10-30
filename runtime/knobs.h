@@ -85,6 +85,8 @@ static const KnobDef g_knobs[] = {
  "spec==greedy (K only changes speed)", "draft tokens per cycle; overrides the daemon's K argument (serve_api --spec-k)"},
 {"G4_SPEC_DRAFT_UQ",    KNOB_ENUM,  "2",   "0|2",           KNOB_TUNABLE, "gemma4 spec daemon drafter precision",
  "spec==greedy (drafter only changes proposals)", "assistant drafter weights: 2 = W4A8, 0 = fp32; overrides the daemon's ast_uq argument"},
+{"G4_SPEC_SERVE",       KNOB_ENUM,  "0",   "0|1",           KNOB_TUNABLE, "gemma4 online daemon with a drafter (serve_api --model gemma4 --assistant)",
+ "spec==greedy, fastpath==batch (switch at cycle boundaries)", "serve a lone greedy request with speculative cycles (K = G4_SPEC_K)"},
 // ---- Qwen speculative serving (bench_serve_spec / serve_daemon_qwen_spec_online) --------------------------------------
 {"MTP_Q4",              KNOB_ENUM,  "0",   "0|1",           KNOB_TUNABLE, "qwen MTP draft head",
  "spec==greedy (draft only changes proposals)", "q4 MTP draft weights"},
