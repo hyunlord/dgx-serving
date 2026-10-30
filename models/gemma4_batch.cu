@@ -55,6 +55,7 @@ void free_g4_batch_state(G4BatchState &s){
 // G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
 static bool g4_attn_split(){ static const bool on=[](){ const char* v=knob_raw("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
 static int gb_sdtype, gb_use_q4;
+static bool gb_g4v=false;   // dense Gemma 4 entry points: R20 GEMV variants (launch_*_g4); the MoE batch keeps the originals
 static int8_t *gb_xq=nullptr; static float *gb_xs=nullptr; static int32_t *gb_xsum=nullptr; static size_t gb_xcap=0;
 bool g4_quant_share();   // gemma4_decode.cu (G4_QUANT_SHARE)
 static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT, int B, bool requant=true){
@@ -64,9 +65,9 @@ static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT,
             BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; requant=true; }
         if(requant || !g4_quant_share()) launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,B);          // B행 X 양자화(1 launch)
         static int USE_BM16 = knob_raw("BM16") ? atoi(knob_raw("BM16")) : 0;
-        if(B<=8)                     launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);
+        if(B<=8)                     { if(gb_g4v) launch_gemv_w4a8_sb_g4(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype); else launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype); }
         else if(USE_BM16 && B>=14)   launch_gemm_bm16_splitk(gb_xq,gb_xs,m.wq,m.sc,Y,B,OUT,IN,gb_sdtype);  // opt-in(스킴 변경)
-        else if(B<=15)               launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);
+        else if(B<=15)               { if(gb_g4v) launch_gemv_w4a8_sb_g4(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype); else launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype); }
         else                         launch_gemm_batch_w4a8(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);   // B=16 특수화
     } else {
         launch_gemm_batch_q4(X, m.wq, m.sc, Y, IN, OUT, B, gb_sdtype);
@@ -85,7 +86,7 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
                          float *d_logits, int commit, int use_q4,
                          const int *d_pos_b, const int *h_pos_b) {
     const bool nf=g4_norm_fused(c);   // dense only; the MoE batch path keeps its kernels
-    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
+    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4; gb_g4v=!c.num_experts;
     const int B=st.B, H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
@@ -212,7 +213,7 @@ void gemma4_moe_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchSt
                              float *d_logits, int commit, int use_q4,
                              const int *d_pos_b, const int *h_pos_b) {
     if(g4_kv_dtype()!=KV_FP32){ fprintf(stderr,"[gemma4_moe_decode_batch] G4_KV_DTYPE must be fp32 (MoE path unchanged)\n"); exit(1); }
-    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
+    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4; gb_g4v=false;
     const int B=st.B, H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
@@ -401,7 +402,7 @@ static inline void mmM(const QMat &m, const float *X, float *Y, int IN, int OUT,
             BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; requant=true; }
         if(requant || !g4_quant_share()) launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,M);
         for(int s0=0;s0<M;s0+=16){ int sq=(M-s0<16)?(M-s0):16;   // ★항상 SB family(≤16행 그룹) — mmB의 B16 gemm_batch 전환 안 탐
-            launch_gemv_w4a8_sb(gb_xq+(size_t)s0*IN, gb_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gb_sdtype); }
+            launch_gemv_w4a8_sb_g4(gb_xq+(size_t)s0*IN, gb_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gb_sdtype); }   // mmM: dense verify_concat only
     } else if(gb_use_q4){
         fprintf(stderr,"[gemma4_verify_concat] uq=1(tiled)은 M-종속 타일=스킴 위험 — per-slot verify_batch 사용. 중단.\n"); exit(1);
     } else launch_gemv_f32(X,m.wf,Y,IN,OUT,M);
@@ -414,7 +415,7 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
                           const float *d_cos_s, const float *d_sin_s,
                           float *d_logits_cat, int use_q4, float *d_prenorm_cat){
     const bool nf=g4_norm_fused(c);   // dense only; the MoE batch path keeps its kernels
-    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4;
+    gb_sdtype=c.scale_dtype; gb_use_q4=use_q4; gb_g4v=!c.num_experts;
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
