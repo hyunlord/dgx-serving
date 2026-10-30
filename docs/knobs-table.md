@@ -7,7 +7,7 @@
 | `G4_QUANT_SHARE` | enum | `1` | `0\|1` | gemma4 dense W4A8 decode/verify/batch/concat/prefill matmuls | golden, spec==greedy, batch==single (same quantized bytes) | q/k/v and gate/up reuse one int8 activation quantization; 0 = quantize before every matmul |
 | `G4_GEMV_PF` | enum | `2` | `0\|2\|4` | gemma4 dense W4A8 GEMV (plain and SB) | golden, spec==greedy, batch==single (prefetch only) | prefetch.global.L2 of the weight chunk this many iterations ahead; 0 = none |
 | `G4_GEMV_U` | enum | `2` | `1\|2` | gemma4 dense W4A8 plain GEMV (S=1 decode, per-slot verify rows) | golden, spec==greedy, batch==single (same accumulation order) | k-loop unroll: chunks loaded before they are accumulated |
-| `G4_GEMV_PERM` | enum | `0` | `0\|1` | gemma4 dense W4A8 GEMV (plain and SB) | golden, spec==greedy, batch==single (same int32 dot) | nibble unpack with __byte_perm + __vsub4 instead of shifts and masks |
+| `G4_GEMV_PERM` | enum | `1` | `0\|1` | gemma4 dense W4A8 GEMV (plain and SB) | golden, spec==greedy, batch==single (same int32 dot) | nibble unpack with __byte_perm + __vsub4 instead of shifts and masks |
 | `G4_CUDA_GRAPH` | enum | `2` | `0\|1\|2` | gemma4 single-stream decode (generate session, gemma4_decode) | graph_on==off, fastpath==batch | decode launch mode: unset/2 = Graph v2 session, 1 = per-step v1 capture, 0 = eager |
 | `G4_GRAPH_OVERLAP` | enum | `1` | `0\|1` | gemma4 Graph v2 session | graph_on==off | overlap host bookkeeping with the next replay (v2 only) |
 | `G4_GRAPH_NODE_UPDATE` | enum | `0` | `0\|1` | gemma4 Graph v2 session | graph_on==off | direct kernel-node parameter patching instead of per-step capture + exec update (v2 only) |
