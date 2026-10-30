@@ -119,7 +119,7 @@ python tools/gen_rope_long.py artifacts/qwen35-27b 8192
 The spec daemon reads both the `mtp_*.bin` head weights and the RoPE tables from the same
 `--golden` directory.
 
-### Gemma4-12B speculative (`--model gemma4-spec`) — adds the official 0.4B assistant drafter
+### Gemma4-12B drafter (speculative decoding) — the official 0.4B assistant
 
 ```bash
 python tools/extract_weights_assistant.py --model google/gemma-4-12B-it-assistant \
@@ -128,6 +128,16 @@ python tools/serve_api.py --model gemma4-spec --tokenizer ~/models/qat/gemma-4-1
     --weights artifacts/gemma4-12b-qat-ident-fp16/weights \
     --assistant artifacts/gemma4-12b-assistant/weights --port 8000
 ```
+
+**Default (R17):** `--model gemma4` loads this drafter automatically when
+`artifacts/gemma4-12b-assistant/weights` exists and matches the target (12B), and serves every lone
+greedy request with speculative cycles (`G4_SPEC_K`, default 3). Concurrent and sampling requests use
+the batch path as before; a new request or CANCEL is picked up at the next cycle boundary. Measured in
+R17 (12 prompts, HTTP single request): +67% decode t/s over plain, identical output, TTFT unchanged,
+concurrent 2/4-request throughput unchanged. `--assistant <dir>` selects another drafter;
+`--no-assistant` or `G4_SPEC_SERVE=0` serves plain. The startup log line `[serve_api] decode: …`
+states which mode is active. The separate `--model gemma4-spec` daemon (multi-slot speculative
+batching) is still available.
 
 Speculative output is verified token-identical to plain greedy (the drafts are only accepted when
 they match the target's own argmax), and measures **~2.1–2.3× faster** end-to-end (client-observed;

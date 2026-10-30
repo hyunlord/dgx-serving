@@ -40,6 +40,16 @@ def load_and_verify_recipe(recipe_path, device_json, model_json):
         print("  [안내] 지문 오차 — claims 재현 미보장. 레시피를 prior로 로컬 재튜닝 권장(warm-start).", file=sys.stderr)
     return recipe
 
+# R17 default drafter for --model gemma4 (docs/serving-setup.md §2): loaded only when it matches the target.
+DEFAULT_ASSISTANT = os.path.join(REPO, "artifacts", "gemma4-12b-assistant", "weights")
+def _assistant_matches(ast_dir, weights_dir):
+    try:
+        a = json.load(open(os.path.join(ast_dir, "manifest.json"))); t = json.load(open(os.path.join(weights_dir, "manifest.json")))
+    except (OSError, ValueError):
+        return False
+    hidden = lambda m: m.get("backbone_hidden_size") or m.get("backbone") or m.get("hidden_size")
+    return t.get("num_experts", 0) in (0, None) and a.get("vocab_size") == t.get("vocab_size") and hidden(a) == t.get("hidden_size")
+
 # ---- C++ 온라인 배칭 daemon 래퍼(영속 프로세스, 태그드 비동기 주입 + 단일 reader 스레드 demux) ----
 # ★직렬화 안 함: 동시 HTTP 스레드가 각자 태그드 요청을 daemon에 주입 → daemon 배치 루프가 연속 배칭.
 #   stdin 쓰기만 락(라인 원자성). stdout은 단일 reader 스레드가 읽어 req_id로 연결별 큐에 분배(경합 방지).
@@ -323,7 +333,8 @@ def main():
     ap.add_argument("--bmax", type=int, default=8)                 # 동시 활성 슬롯 상한(온라인 배칭 폭)
     ap.add_argument("--model", default="gemma4", choices=["gemma4","qwen","spec","gemma4-spec"])  # daemon 종류(arg 레이아웃 상이; spec=27b MTP·gemma4-spec=12B+0.4B assistant)
     ap.add_argument("--golden", default="")                        # qwen/spec rope+MTP golden dir(필수 — gemma4는 dummy rope)
-    ap.add_argument("--assistant", default="")                     # gemma4-spec: 0.4B assistant weights dir(extract_weights_assistant.py)
+    ap.add_argument("--assistant", default="")                     # gemma4-spec: 0.4B assistant weights dir(extract_weights_assistant.py); gemma4: drafter override
+    ap.add_argument("--no-assistant", action="store_true")         # gemma4: serve plain (do not load the default drafter)
     ap.add_argument("--spec-k", type=int, default=3)               # gemma4-spec: draft 길이 K(R17 서빙 측정 K=3·4 동률 → 3)
     ap.add_argument("--uq", type=int, default=2)                   # recipe 없을 때 양자화(2=W4A8·1=q4·0=fp32)
     ap.add_argument("--model-id", default="")                      # recipe 없을 때 모델 표시명
@@ -362,7 +373,16 @@ def main():
     if args.model == "gemma4":
         gbin = os.environ.get("DAEMON_BIN_GEMMA4") or os.path.join(REPO,"tools","serve_daemon_gemma4_online")  # A/B 테스트용 바이너리 오버라이드(기본=표준 경로)
         cmd = [gbin, args.weights, str(uq), str(args.maxlen), str(args.bmax)]
-        if args.assistant: cmd.append(args.assistant)            # R17: drafter for the spec path (G4_SPEC_SERVE=1)
+        # R17: speculative serving of lone greedy requests. Drafter = --assistant, else the documented default
+        #   path when its weights exist and match the target (12B); --no-assistant or G4_SPEC_SERVE=0 serve plain.
+        ast = "" if args.no_assistant else (args.assistant or DEFAULT_ASSISTANT)
+        why = "--no-assistant" if args.no_assistant else ""
+        if ast and not args.assistant and not _assistant_matches(ast, args.weights):
+            why = f"default drafter {ast} missing or not matching the target"; ast = ""
+        if ast: cmd.append(ast)
+        spec_on = bool(ast) and os.environ.get("G4_SPEC_SERVE", "1") != "0"
+        print(f"[serve_api] decode: {'speculative (single greedy requests, drafter ' + ast + ', K=' + os.environ.get('G4_SPEC_K','3') + ')' if spec_on else 'plain'}"
+              + (f" — {why}" if why else ("" if spec_on else " — G4_SPEC_SERVE=0" if ast else " — no drafter")), file=sys.stderr)
     elif args.model == "gemma4-spec":                              # 12B + 0.4B assistant draft-spec(4관문) — spec==greedy 불변
         if not args.assistant: sys.exit("[serve_api] --model gemma4-spec 은 --assistant(0.4B weights dir) 필수")
         cmd = [os.path.join(REPO,"tools","serve_daemon_gemma4_spec_online"), args.weights, args.assistant,

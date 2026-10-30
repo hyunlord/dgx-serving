@@ -104,9 +104,9 @@ inline void run_online_daemon(OnlineBackend& be, int Bmax, const std::vector<int
     const char* fast_env = knob_raw("G4_SERVE_FASTPATH");
     const bool fastpath = be.single_stream() && !(fast_env && std::string(fast_env) == "0");
     unsigned long long n_fast_req=0, n_batch_req=0, n_switch=0, n_tail=0;
-    // R17 spec 경로(opt-in G4_SPEC_SERVE=1, drafter 적재 backend만): 단일 greedy 요청을 speculative 사이클로.
+    // R17 spec 경로(drafter 적재 backend만, 기본 ON — G4_SPEC_SERVE=0이면 끔): 단일 greedy 요청을 speculative 사이클로.
     const char* spec_env = knob_raw("G4_SPEC_SERVE");
-    const bool spec_serve = be.spec_ready() && spec_env && std::string(spec_env) == "1";
+    const bool spec_serve = be.spec_ready() && !(spec_env && std::string(spec_env) == "0");   // default on with a drafter
     const char* speck_env = knob_raw("G4_SPEC_K");
     const int spec_k = speck_env ? atoi(speck_env) : 3;
     unsigned long long n_spec_switch=0;
