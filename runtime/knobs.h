@@ -62,6 +62,8 @@ static const KnobDef g_knobs[] = {
  "golden, ppl, prefill_slot", "smallest prefill row count that uses flash attention"},
 {"G4_NORM_FUSED",       KNOB_ENUM,  "1",   "0|1",           KNOB_NUMERIC, "gemma4 dense decode/verify/batch/concat/prefill norms",
  "golden, ppl, spec==greedy, batch==single, fastpath==batch, graph_on==off", "parallel RMSNorm row function + q/k norm+RoPE(+KV store) and post-norm+residual fusions (R16 default); 0 = per-kernel norms"},
+{"G4_QUANT_SHARE",      KNOB_ENUM,  "1",   "0|1",           KNOB_TUNABLE, "gemma4 dense W4A8 decode/verify/batch/concat/prefill matmuls",
+ "golden, spec==greedy, batch==single (same quantized bytes)", "q/k/v and gate/up reuse one int8 activation quantization; 0 = quantize before every matmul"},
 {"G4_CUDA_GRAPH",       KNOB_ENUM,  "2",   "0|1|2",         KNOB_TUNABLE, "gemma4 single-stream decode (generate session, gemma4_decode)",
  "graph_on==off, fastpath==batch", "decode launch mode: unset/2 = Graph v2 session, 1 = per-step v1 capture, 0 = eager"},
 {"G4_GRAPH_OVERLAP",    KNOB_ENUM,  "1",   "0|1",           KNOB_TUNABLE, "gemma4 Graph v2 session",
