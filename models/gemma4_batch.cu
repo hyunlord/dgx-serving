@@ -56,12 +56,13 @@ void free_g4_batch_state(G4BatchState &s){
 static bool g4_attn_split(){ static const bool on=[](){ const char* v=knob_raw("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
 static int gb_sdtype, gb_use_q4;
 static int8_t *gb_xq=nullptr; static float *gb_xs=nullptr; static int32_t *gb_xsum=nullptr; static size_t gb_xcap=0;
-static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT, int B){
+bool g4_quant_share();   // gemma4_decode.cu (G4_QUANT_SHARE)
+static inline void mmB(const QMat &m, const float *X, float *Y, int IN, int OUT, int B, bool requant=true){
     if(gb_use_q4==2){
         size_t n=(size_t)B*IN;
         if(gb_xcap<n){ if(gb_xq)cudaFree(gb_xq); if(gb_xs)cudaFree(gb_xs); if(gb_xsum)cudaFree(gb_xsum);
-            BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; }
-        launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,B);          // B행 X 양자화(1 launch)
+            BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; requant=true; }
+        if(requant || !g4_quant_share()) launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,B);          // B행 X 양자화(1 launch)
         static int USE_BM16 = knob_raw("BM16") ? atoi(knob_raw("BM16")) : 0;
         if(B<=8)                     launch_gemv_w4a8_sb(gb_xq,gb_xs,m.wq,m.sc,Y,IN,OUT,B,gb_sdtype);
         else if(USE_BM16 && B>=14)   launch_gemm_bm16_splitk(gb_xq,gb_xs,m.wq,m.sc,Y,B,OUT,IN,gb_sdtype);  // opt-in(스킴 변경)
@@ -144,14 +145,14 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
         if(ragged) launch_rope_partial_pos(qn, cosT, sinT, d_pos_b, B, NQ, hd, hd);
         else       launch_rope_partial_batch(qn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, B, NQ, hd, hd);
         }
-        mmB(L.k, norm, kb, H, kvdim, B);
+        mmB(L.k, norm, kb, H, kvdim, B, false);
         if(nf){
             if(full && c.attention_k_eq_v) launch_rmsnorm_par(kb, nullptr, vn, B*nkv, hd, eps);
-            else { mmB(L.v, norm, vb, H, kvdim, B); launch_rmsnorm_par(vb, nullptr, vn, B*nkv, hd, eps); }
+            else { mmB(L.v, norm, vb, H, kvdim, B, false); launch_rmsnorm_par(vb, nullptr, vn, B*nkv, hd, eps); }
             launch_norm_rope_store<float>(kb, L.k_norm, kn, B*nkv, nkv, hd, eps, cosT, sinT, base, 0, ragged?d_pos_b:nullptr, (long)kvdim, 0, true);
         } else {
         if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn, B*nkv, hd, eps);   // V=v_norm(k_proj)
-        else { mmB(L.v, norm, vb, H, kvdim, B); launch_rmsnorm_noscale(vb, vn, B*nkv, hd, eps); }
+        else { mmB(L.v, norm, vb, H, kvdim, B, false); launch_rmsnorm_noscale(vb, vn, B*nkv, hd, eps); }
         launch_rmsnorm(kb, L.k_norm, kn, B*nkv, hd, eps);
         if(ragged) launch_rope_partial_pos(kn, cosT, sinT, d_pos_b, B, nkv, hd, hd);
         else       launch_rope_partial_batch(kn, cosT+(size_t)base*hd, sinT+(size_t)base*hd, B, nkv, hd, hd);
@@ -183,7 +184,7 @@ void gemma4_decode_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
         launch_rmsnorm(after, L.pre_ffn_ln, norm, B, H, eps);
         }
         mmB(L.gate, norm, g, H, FFN, B);
-        mmB(L.up,   norm, u, H, FFN, B);
+        mmB(L.up,   norm, u, H, FFN, B, false);
         launch_geglu(g, u, act, (size_t)B*FFN);
         mmB(L.down, act, dn, FFN, H, B);
         if(nf) launch_post_norm_residual(dn, L.post_ffn_ln, after, x, L.layer_scalar,
@@ -393,12 +394,12 @@ void gemma4_verify_batch(const ModelConfig &c, const G4Weights &w, G4BatchState 
 // ---- spec verify concat 분할상환 (27b 축1 패턴 — 헤더 주석 참조) ----
 //   큰 matmul만 M=ΣNb 행 concat(SB ≤16행 그룹 = gemma4_decode amort_mm 동일 분해·스킴 경계 회피),
 //   rope=행별 위치(rope_partial_pos)·attention/KV append=슬롯별 기존 커널(단독 경로와 동일 수학).
-static inline void mmM(const QMat &m, const float *X, float *Y, int IN, int OUT, int M){
+static inline void mmM(const QMat &m, const float *X, float *Y, int IN, int OUT, int M, bool requant=true){
     if(gb_use_q4==2){
         size_t n=(size_t)M*IN;
         if(gb_xcap<n){ if(gb_xq)cudaFree(gb_xq); if(gb_xs)cudaFree(gb_xs); if(gb_xsum)cudaFree(gb_xsum);
-            BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; }
-        launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,M);
+            BK(cudaMalloc(&gb_xq,n)); BK(cudaMalloc(&gb_xs,(n/QBLK)*4)); BK(cudaMalloc(&gb_xsum,(n/QBLK)*4)); gb_xcap=n; requant=true; }
+        if(requant || !g4_quant_share()) launch_quantize_x_q8(X,gb_xq,gb_xs,gb_xsum,IN,M);
         for(int s0=0;s0<M;s0+=16){ int sq=(M-s0<16)?(M-s0):16;   // ★항상 SB family(≤16행 그룹) — mmB의 B16 gemm_batch 전환 안 탐
             launch_gemv_w4a8_sb(gb_xq+(size_t)s0*IN, gb_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gb_sdtype); }
     } else if(gb_use_q4){
@@ -477,14 +478,14 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
         launch_rmsnorm(qb, L.q_norm, qn, M*NQ, hd, eps);
         launch_rope_partial_pos(qn, cosT, sinT, d_pos_row, M, NQ, hd, hd);   // 행별 절대 위치(ragged 기게이트)
         }
-        mmM(L.k, norm, kb, H, kvdim, M);
+        mmM(L.k, norm, kb, H, kvdim, M, false);
         if(nf){
             if(full && c.attention_k_eq_v) launch_rmsnorm_par(kb, nullptr, vn, M*nkv, hd, eps);
-            else { mmM(L.v, norm, vb, H, kvdim, M); launch_rmsnorm_par(vb, nullptr, vn, M*nkv, hd, eps); }
+            else { mmM(L.v, norm, vb, H, kvdim, M, false); launch_rmsnorm_par(vb, nullptr, vn, M*nkv, hd, eps); }
             launch_norm_rope_store<float>(kb, L.k_norm, kn, M*nkv, nkv, hd, eps, cosT, sinT, 0, 0, d_pos_row, (long)kvdim, 0, true);
         } else {
         if(full && c.attention_k_eq_v) launch_rmsnorm_noscale(kb, vn, M*nkv, hd, eps);   // V=v_norm(k_proj), rope 전
-        else { mmM(L.v, norm, vb, H, kvdim, M); launch_rmsnorm_noscale(vb, vn, M*nkv, hd, eps); }
+        else { mmM(L.v, norm, vb, H, kvdim, M, false); launch_rmsnorm_noscale(vb, vn, M*nkv, hd, eps); }
         launch_rmsnorm(kb, L.k_norm, kn, M*nkv, hd, eps);
         launch_rope_partial_pos(kn, cosT, sinT, d_pos_row, M, nkv, hd, hd);
         }
@@ -519,7 +520,7 @@ void gemma4_verify_concat(const ModelConfig &c, const G4Weights &w, G4BatchState
         launch_rmsnorm(after, L.pre_ffn_ln, norm, M, H, eps);
         }
         mmM(L.gate, norm, g, H, FFN, M);
-        mmM(L.up,   norm, u, H, FFN, M);
+        mmM(L.up,   norm, u, H, FFN, M, false);
         launch_geglu(g, u, act, (size_t)M*FFN);
         mmM(L.down, act, dn, FFN, H, M);
         if(nf) launch_post_norm_residual(dn, L.post_ffn_ln, after, x, L.layer_scalar,

@@ -4,6 +4,7 @@
 
 | knob | type | default | range | scope | gates to re-run | description |
 |---|---|---|---|---|---|---|
+| `G4_QUANT_SHARE` | enum | `1` | `0\|1` | gemma4 dense W4A8 decode/verify/batch/concat/prefill matmuls | golden, spec==greedy, batch==single (same quantized bytes) | q/k/v and gate/up reuse one int8 activation quantization; 0 = quantize before every matmul |
 | `G4_CUDA_GRAPH` | enum | `2` | `0\|1\|2` | gemma4 single-stream decode (generate session, gemma4_decode) | graph_on==off, fastpath==batch | decode launch mode: unset/2 = Graph v2 session, 1 = per-step v1 capture, 0 = eager |
 | `G4_GRAPH_OVERLAP` | enum | `1` | `0\|1` | gemma4 Graph v2 session | graph_on==off | overlap host bookkeeping with the next replay (v2 only) |
 | `G4_GRAPH_NODE_UPDATE` | enum | `0` | `0\|1` | gemma4 Graph v2 session | graph_on==off | direct kernel-node parameter patching instead of per-step capture + exec update (v2 only) |
