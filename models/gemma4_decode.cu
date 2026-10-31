@@ -98,8 +98,8 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
         } else if(gd_amort && S>1){  // 프리필: SB 커널로 weight 1회/≤16행 amortize(비-amortized plain gemv의 S× 재적재 제거).
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
             for(int s0=0;s0<S;s0+=16){ int sq=(S-s0<16)?(S-s0):16;
-                launch_gemv_w4a8_sb(gd_xq+(size_t)s0*IN, gd_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gd_sdtype,stream); }
-        } else launch_gemv_w4a8(gd_xq,gd_xs,gd_xsum,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype,stream);
+                launch_gemv_w4a8_sb_g4(gd_xq+(size_t)s0*IN, gd_xs+(size_t)s0*(IN/QBLK), m.wq, m.sc, Y+(size_t)s0*OUT, IN, OUT, sq, gd_sdtype,stream); }
+        } else launch_gemv_w4a8_g4(gd_xq,gd_xs,gd_xsum,m.wq,m.sc,Y,IN,OUT,S,gd_sdtype,stream);
     } else if(use_q4) launch_gemm_tiled_q4(X,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
     else              launch_gemv_f32(X,m.wf,Y,IN,OUT,S,stream);
 }
