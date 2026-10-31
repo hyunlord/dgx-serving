@@ -34,7 +34,7 @@
     {"name": "G4_GEMV_U", "type": "enum", "default": "1", "range": "1|2", "class": "tunable",
      "scope": "gemma4 dense W4A8 plain GEMV (S=1 decode, per-slot verify rows)", "gates": "golden, spec==greedy, batch==single (same accumulation order)", "desc": "k-loop unroll: chunks loaded before they are accumulated",
      "choices": ["1", "2"]},
-    {"name": "G4_GEMV_PERM", "type": "enum", "default": "0", "range": "0|1", "class": "tunable",
+    {"name": "G4_GEMV_PERM", "type": "enum", "default": "1", "range": "0|1", "class": "tunable",
      "scope": "gemma4 dense W4A8 plain GEMV (S=1 decode, per-slot verify rows; SB only with G4_GEMV_PF)", "gates": "golden, spec==greedy, batch==single (same int32 dot)", "desc": "nibble unpack with __byte_perm + __vsub4 instead of shifts and masks",
      "choices": ["0", "1"]},
     {"name": "G4_CUDA_GRAPH", "type": "enum", "default": "2", "range": "0|1|2", "class": "tunable",
