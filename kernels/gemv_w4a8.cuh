@@ -179,4 +179,172 @@ static inline void launch_gemv_w4a8_sb(const int8_t *xq, const float *xs,
     }
 }
 
+// ── Gemma 4 dense W4A8 GEMV variants (R20 PART B; same outputs as gemv_w4a8_kernel / gemv_w4a8_sb_kernel) ──────────
+// Per output row o and column s the float sum is formed exactly as in the two kernels above: lane l visits
+// base = 8l, 8l + 256, ... in increasing order, dot = dp4a(x[0..3], w[0..3]) then dp4a(x[4..7], w[4..7], dot)
+// (int32), acc = fma(xs * sw, (float)dot, acc), then warp_reduce_sum. The variants only change scheduling and the
+// integer unpack:
+//   U     k-loop unroll (U chunks loaded before they are accumulated, in visiting order; U = 1 is the plain kernel)
+//   PF    prefetch.global.L2 of the weight chunk PF iterations ahead (0 = none)
+//   PERM  nibble unpack with __byte_perm + __vsub4: the same four signed int8 per register as w4a8_pk, so every
+//         dp4a returns the same int32
+static __device__ __forceinline__ void w4a8_pk_perm(unsigned W, int &pk0, int &pk1) {
+    const unsigned lo = W & 0x0F0F0F0Fu, hi = (W >> 4) & 0x0F0F0F0Fu;      // byte i: low / high nibble of byte i
+    pk0 = (int)__vsub4(__byte_perm(lo, hi, 0x5140), 0x08080808u);       // [b0.lo, b0.hi, b1.lo, b1.hi] - 8
+    pk1 = (int)__vsub4(__byte_perm(lo, hi, 0x7362), 0x08080808u);       // [b2.lo, b2.hi, b3.lo, b3.hi] - 8
+}
+template <bool PERM>
+static __device__ __forceinline__ void w4a8_unpack(unsigned W, int &pk0, int &pk1) {
+    if (PERM) w4a8_pk_perm(W, pk0, pk1);
+    else { pk0 = w4a8_pk(W & 0xFF, (W >> 8) & 0xFF); pk1 = w4a8_pk((W >> 16) & 0xFF, (W >> 24) & 0xFF); }
+}
+template <int PF>
+static __device__ __forceinline__ void w4a8_prefetch(const uint8_t *w, int base, int IN) {
+    if (PF > 0) { const int b = base + PF * 256; if (b < IN) asm volatile("prefetch.global.L2 [%0];" :: "l"(w + (b >> 1))); }
+}
+
+// Plain layout (S*OUT warps, one per (s, o)); used for S = 1 decode and the per-slot verify rows.
+template <typename ST, int U, int PF, bool PERM>
+static __global__ void gemv_w4a8_g4_kernel(const int8_t *xq, const float *xs, const uint8_t *Wq, const ST *sw,
+                                           float *Y, int IN, int OUT, int S) {
+    long gw = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (gw >= (long)S * OUT) return;
+    int s = (int)(gw / OUT), o = (int)(gw % OUT);
+    const int8_t *xqr = xq + (size_t)s * IN;
+    const float *xsr = xs + (size_t)s * (IN / QBLK);
+    const uint8_t *w = Wq + (size_t)o * (IN / 2);
+    const ST *swr = sw + (size_t)o * (IN / QBLK);
+    float acc = 0.f;
+    for (int g = lane * 8; g < IN; g += 256 * U) {
+        unsigned Wv[U]; int x0v[U], x1v[U]; float scb[U];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const int base = g + u * 256;
+            if (base < IN) {
+                w4a8_prefetch<PF>(w, base, IN);
+                const int blk = base / QBLK;
+                scb[u] = xsr[blk] * sval(swr[blk]);
+                Wv[u] = *reinterpret_cast<const unsigned *>(w + (base >> 1));
+                x0v[u] = *reinterpret_cast<const int *>(xqr + base);
+                x1v[u] = *reinterpret_cast<const int *>(xqr + base + 4);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            if (g + u * 256 < IN) {
+                int pk0, pk1; w4a8_unpack<PERM>(Wv[u], pk0, pk1);
+                int dot = __dp4a(x0v[u], pk0, 0);
+                dot = __dp4a(x1v[u], pk1, dot);
+                acc += scb[u] * (float)dot;
+            }
+        }
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) Y[(size_t)s * OUT + o] = acc;
+}
+
+// SB layout (OUT warps, weight read once for all S columns).
+template <typename ST, int SMAX, int PF, bool PERM>
+static __global__ void gemv_w4a8_sb_g4_kernel(const int8_t *xq, const float *xs, const uint8_t *Wq, const ST *sw,
+                                              float *Y, int IN, int OUT, int S) {
+    long warp = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp >= (long)OUT) return;
+    int o = (int)warp;
+    const uint8_t *w = Wq + (size_t)o * (IN / 2);
+    const ST *swr = sw + (size_t)o * (IN / QBLK);
+    float acc[SMAX];
+#pragma unroll
+    for (int s = 0; s < SMAX; s++) acc[s] = 0.f;
+    for (int base = lane * 8; base < IN; base += 32 * 8) {
+        w4a8_prefetch<PF>(w, base, IN);
+        int blk = base / QBLK;
+        unsigned W = *reinterpret_cast<const unsigned *>(w + (base >> 1));
+        int pk0, pk1; w4a8_unpack<PERM>(W, pk0, pk1);
+        float swb = sval(swr[blk]);
+#pragma unroll
+        for (int s = 0; s < SMAX; s++) {
+            if (s < S) {
+                const int8_t *xqr = xq + (size_t)s * IN;
+                int x0 = *reinterpret_cast<const int *>(xqr + base);
+                int x1 = *reinterpret_cast<const int *>(xqr + base + 4);
+                int dot = __dp4a(x0, pk0, 0);
+                dot = __dp4a(x1, pk1, dot);
+                acc[s] += xs[(size_t)s * (IN / QBLK) + blk] * swb * (float)dot;
+            }
+        }
+    }
+#pragma unroll
+    for (int s = 0; s < SMAX; s++) {
+        if (s < S) {
+            float r = warp_reduce_sum(acc[s]);
+            if (lane == 0) Y[(size_t)s * OUT + o] = r;
+        }
+    }
+}
+
+// Gemma 4 dense knobs (runtime/knobs.h): G4_GEMV_PF (B2), G4_GEMV_U (B3), G4_GEMV_PERM (B5).
+struct G4GemvCfg { int pf, u; bool perm; };
+static inline const G4GemvCfg &g4_gemv_cfg() {
+    static const G4GemvCfg c = [] {
+        G4GemvCfg r;
+        const char *v;
+        v = knob_raw("G4_GEMV_PF");   r.pf = v ? atoi(v) : 0;
+        v = knob_raw("G4_GEMV_U");    r.u = v ? atoi(v) : 1;
+        v = knob_raw("G4_GEMV_PERM"); r.perm = v && strcmp(v, "1") == 0;
+        if (r.pf != 0 && r.pf != 2 && r.pf != 4) { fprintf(stderr, "G4_GEMV_PF must be 0, 2 or 4\n"); exit(1); }
+        if (r.u != 1 && r.u != 2) { fprintf(stderr, "G4_GEMV_U must be 1 or 2\n"); exit(1); }
+        return r;
+    }();
+    return c;
+}
+template <typename ST, int U, int PF>
+static inline void g4_plain_launch3(bool perm, unsigned grid, cudaStream_t st, const int8_t *xq, const float *xs, const uint8_t *Wq,
+                                    const void *sw, float *Y, int IN, int OUT, int S) {
+    if (perm) gemv_w4a8_g4_kernel<ST, U, PF, true><<<grid, 256, 0, st>>>(xq, xs, Wq, (const ST *)sw, Y, IN, OUT, S);
+    else      gemv_w4a8_g4_kernel<ST, U, PF, false><<<grid, 256, 0, st>>>(xq, xs, Wq, (const ST *)sw, Y, IN, OUT, S);
+}
+template <typename ST>
+static inline void g4_plain_launch(const G4GemvCfg &c, unsigned grid, cudaStream_t st, const int8_t *xq, const float *xs,
+                                   const uint8_t *Wq, const void *sw, float *Y, int IN, int OUT, int S) {
+#define G4P(UU, PP) if (c.u == UU && c.pf == PP) { g4_plain_launch3<ST, UU, PP>(c.perm, grid, st, xq, xs, Wq, sw, Y, IN, OUT, S); return; }
+    G4P(1, 0) G4P(1, 2) G4P(1, 4) G4P(2, 0) G4P(2, 2) G4P(2, 4)
+#undef G4P
+}
+// Drop-in for launch_gemv_w4a8 on the Gemma 4 dense path. U=1, PF=0 and PERM off -> the original kernel.
+static inline void launch_gemv_w4a8_g4(const int8_t *xq, const float *xs, const int32_t *xsum, const uint8_t *Wq,
+                                       const void *sw, float *Y, int IN, int OUT, int S, int scale_dtype = 0, cudaStream_t st = 0) {
+    const G4GemvCfg &c = g4_gemv_cfg();
+    if (c.u == 1 && c.pf == 0 && !c.perm) { launch_gemv_w4a8(xq, xs, xsum, Wq, sw, Y, IN, OUT, S, scale_dtype, st); return; }
+    const unsigned grid = (unsigned)(((long)S * OUT * 32 + 255) / 256);
+    if (scale_dtype == 1) g4_plain_launch<__half>(c, grid, st, xq, xs, Wq, sw, Y, IN, OUT, S);
+    else                  g4_plain_launch<float>(c, grid, st, xq, xs, Wq, sw, Y, IN, OUT, S);
+}
+template <typename ST, int SMAX, int PF>
+static inline void g4_sb_launch3(bool perm, unsigned grid, cudaStream_t st, const int8_t *xq, const float *xs, const uint8_t *Wq,
+                                 const void *sw, float *Y, int IN, int OUT, int S) {
+    if (perm) gemv_w4a8_sb_g4_kernel<ST, SMAX, PF, true><<<grid, 256, 0, st>>>(xq, xs, Wq, (const ST *)sw, Y, IN, OUT, S);
+    else      gemv_w4a8_sb_g4_kernel<ST, SMAX, PF, false><<<grid, 256, 0, st>>>(xq, xs, Wq, (const ST *)sw, Y, IN, OUT, S);
+}
+template <typename ST, int PF>
+static inline void g4_sb_launch(const G4GemvCfg &c, unsigned grid, cudaStream_t st, const int8_t *xq, const float *xs,
+                                const uint8_t *Wq, const void *sw, float *Y, int IN, int OUT, int S) {
+    if (S > 8) g4_sb_launch3<ST, 16, PF>(c.perm, grid, st, xq, xs, Wq, sw, Y, IN, OUT, S);
+    else       g4_sb_launch3<ST, 8, PF>(c.perm, grid, st, xq, xs, Wq, sw, Y, IN, OUT, S);
+}
+// Drop-in for launch_gemv_w4a8_sb on the Gemma 4 dense path. PF=0 -> the original SB kernel.
+static inline void launch_gemv_w4a8_sb_g4(const int8_t *xq, const float *xs, const uint8_t *Wq, const void *sw,
+                                          float *Y, int IN, int OUT, int S, int scale_dtype = 0, cudaStream_t st = 0) {
+    const G4GemvCfg &c = g4_gemv_cfg();
+    // G4_GEMV_PERM applies to the plain kernel only: the SB variant (slower at W=8, R20 §9) runs only with G4_GEMV_PF.
+    if (c.pf == 0) { launch_gemv_w4a8_sb(xq, xs, Wq, sw, Y, IN, OUT, S, scale_dtype, st); return; }
+    const unsigned grid = (unsigned)(((long)OUT * 32 + 255) / 256);
+#define G4S(PP) if (c.pf == PP) { if (scale_dtype == 1) g4_sb_launch<__half, PP>(c, grid, st, xq, xs, Wq, sw, Y, IN, OUT, S); \
+                                  else g4_sb_launch<float, PP>(c, grid, st, xq, xs, Wq, sw, Y, IN, OUT, S); return; }
+    G4S(0) G4S(2) G4S(4)
+#undef G4S
+}
+
+
 #endif // DGX_GEMV_W4A8_CUH
