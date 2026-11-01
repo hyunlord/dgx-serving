@@ -65,7 +65,7 @@ int main(int argc, char** argv){
         reset_g4_decode_state(st);                            // n_past=0(KV 재사용, 요청 독립)
         // 프리필: Sq=P, commit=1(n_past=P), last_only=1(마지막 위치 logit) → 첫 생성 토큰 argmax
         CK(cudaMemcpy(d_tok, prompt.data(), (size_t)P*4, cudaMemcpyHostToDevice));
-        gemma4_decode(c,w,st,d_tok,P,d_cf,d_sf,d_cs,d_ss,d_logit,/*commit*/1,uq,/*last_only*/1);
+        gemma4_decode(c,w,st,d_tok,P,d_cf,d_sf,d_cs,d_ss,d_logit,/*commit*/1,uq,/*last_only*/1,/*amort*/0,nullptr,/*prefill*/1);
         int next = argmax();
         long gen = 0;
         if(mt>0){ printf("%d\n", next); fflush(stdout); gen++; }  // 스트리밍(토큰마다 flush)

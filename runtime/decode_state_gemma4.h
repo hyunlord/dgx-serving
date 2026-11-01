@@ -33,7 +33,11 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const float *d_cos_f, const float *d_sin_f,
                    const float *d_cos_s, const float *d_sin_s,
                    float *d_logits, int commit, int use_q4, int last_only = 0, int amort_mm = 0,
-                   float *d_prenorm = nullptr);
+                   float *d_prenorm = nullptr, int prefill = 0);
+// prefill=1 marks a prompt prefill chunk: its attention takes flash for Sq >= G4_FLASH_MIN_S (default 1), so any
+// chunking of a prompt is bit-identical. prefill=0 (decode, verify, legacy callers) keeps flash only for Sq >= 16.
+// Host-side per-call counts of the two attention routes (flash, split/decode kernel) since process start.
+void gemma4_attn_route_counts(unsigned long *flash, unsigned long *split);
 
 // Explicit single-stream generation step. G4_CUDA_GRAPH=1 captures only
 // Sq=1, commit!=0, amort_mm=0 calls; all other calls retain eager execution.

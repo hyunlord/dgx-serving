@@ -32,7 +32,7 @@ machine-readable form is `tools/autotune/profiles/knobs.json` (`tools/knobs_dump
   Every bench, daemon and ppl `main` calls it. Diagnostic knobs appear only when set.
 
 Behavior change from v1 (intended): values the old parsers silently clamped or ignored are now
-rejected, e.g. `G4_MMQ_MIN_S=8` (was clamped to 16), `G4_ATTN_SPLIT=2` (was treated as on),
+rejected, e.g. `G4_MMQ_MIN_S=0` (R21: range `1..`; before R21 values below 16 were clamped to 16), `G4_ATTN_SPLIT=2` (was treated as on),
 `REP_WINDOW=-1` (was clamped to 0).
 
 ## Classes
@@ -58,6 +58,29 @@ confirms it on the target model.
 | graph_on==off | Graph v2 (overlap / node update) equals eager | `tools/r13_graph_gate`, `G4_CUDA_GRAPH_STATS` re-instantiation count 0 |
 | golden | 12B / 31B / MoE golden tests | `make test`, `tests/test_gemma4` |
 | prefill_slot | chunked prefill slot equals c1tok | `tests/test_gemma4_prefill_slot` |
+| chunk invariance | one prompt gives the same KV and last logits however its prefill is chunked | `tests/test_gemma4_prefill_chunk` (also checks the route counters) |
+
+## Prefill attention routing
+
+Dense Gemma 4 calls `gemma4_decode` for prompt prefill, decode and verify alike, so the caller states which
+it is: prefill callers pass `prefill=1` (`gemma4_prefill_batch_slot`, the daemon prefills, the
+`bench_gemma4` depth fill and prefill measurement, the `ppl_gemma4` whole window).
+
+| call | prefill flag | attention kernel | layer matmuls (W4A8, amortized) |
+|---|---|---|---|
+| prompt prefill chunk, any `Sq` | 1 | flash when `Sq >= G4_FLASH_MIN_S` (default 1: always) | MMQ when `Sq >= G4_MMQ_MIN_S` (default 1: always) |
+| decode (`Sq=1`), verify, concat, other callers | 0 | flash only when `Sq >= 16` (fixed); otherwise the split-KV decode kernel | MMQ only when `Sq >= 16` (fixed); otherwise SB/GEMV |
+
+- `G4_FLASH_MIN_S` and `G4_MMQ_MIN_S` (default 1, range `1..`) apply to prefill-mode calls only. Decode and
+  verify never read them, so verify stays bit-identical to decode.
+- With the defaults every prefill chunk takes flash, whose key tiles and KV splits are fixed by absolute
+  position, and MMQ, whose rows do not depend on the row count. One prompt therefore gives the same KV
+  and last logits however it is chunked (1030 = 1024+6 = 512+512+6 = 16x64+6).
+- `G4_FLASH_MIN_S=16` or `G4_MMQ_MIN_S=16` restores the pre-R21 rule for A/B diagnosis only: a chunk with
+  `Sq < 16` then goes to the split kernel or to SB/GEMV and **chunk invariance breaks** (1024+6 differs
+  from 1030).
+- The last-only lm_head row keeps its pre-R21 route (one row in every chunking).
+- All of these knobs are numeric: they change output values.
 
 ## Speculative decoding knobs
 

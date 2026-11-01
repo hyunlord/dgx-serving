@@ -367,7 +367,7 @@ int main(int argc,char **argv) {
             for(int p=0;p<length;++p)
                 gemma4_decode(c,w,st,ids+p,1,cf,sf,cs,ss,logits+mul(p,V),1,o.uq,0,0,nullptr);
         } else {
-            gemma4_decode(c,w,st,ids,length,cf,sf,cs,ss,logits,1,o.uq,0,1,nullptr);
+            gemma4_decode(c,w,st,ids,length,cf,sf,cs,ss,logits,1,o.uq,0,1,nullptr,/*prefill*/1);
         }
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize()); const double interval_end=epoch_seconds();
         fprintf(stderr,"PPL_INTERVAL window=%d start=%.17g end=%.17g scope=%s\n",win,interval_start,interval_end,o.decode?"decode_teacher_forced":"gemma4_decode_prefill");

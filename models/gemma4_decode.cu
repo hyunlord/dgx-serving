@@ -64,6 +64,7 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
 static int gd_amort=0;   // 1=프리필 MMQ/SB 매트멀. 기본0=plain gemv(golden 경로 무변경).
+static int gd_prefill=0; // R21: 1 = prefill-mode call; its layer matmuls take MMQ for S >= G4_MMQ_MIN_S (default 1).
 static void g4d_reserve_quant(size_t n){
     if(gd_cap<n){ if(gd_xq)cudaFree(gd_xq); if(gd_xs)cudaFree(gd_xs); if(gd_xsum)cudaFree(gd_xsum);
         DK(cudaMalloc(&gd_xq,n)); DK(cudaMalloc(&gd_xs,(n/QBLK)*4)); DK(cudaMalloc(&gd_xsum,(n/QBLK)*4)); gd_cap=n; }
@@ -72,15 +73,17 @@ static bool g4d_mmq_prefill(){
     static const bool enabled=[](){ const char* v=knob_raw("G4_MMQ_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     return enabled;
 }
+// G4_MMQ_MIN_S applies to prefill-mode calls only (default 1: every prefill chunk's layer matmuls take MMQ,
+// whose rows are independent of the row count, so any chunking gives the same KV and logits). Other amortized
+// calls (verify) keep the fixed pre-R21 rule, MMQ for S >= 16, and never read this knob. The MMQ kernel is unchanged.
 static int g4d_mmq_min_s(){
     static const int min_s=[](){
-        int value=16;
+        int value=1;
         if(const char* v=knob_raw("G4_MMQ_MIN_S")){
             char* end=nullptr; errno=0;
             const long parsed=strtol(v,&end,10);
-            if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
-                value=parsed<16?16:(int)parsed;
-            else fprintf(stderr,"Invalid G4_MMQ_MIN_S=%s; using 16\n",v);
+            if(errno==0 && end!=v && *end=='\0' && parsed>=1 && parsed<=INT_MAX) value=(int)parsed;
+            else fprintf(stderr,"Invalid G4_MMQ_MIN_S=%s; using 1\n",v);
         }
         fprintf(stderr,"G4_MMQ_MIN_S=%d\n",value);
         return value;
@@ -93,7 +96,7 @@ bool g4_quant_share(){ static const bool on=[](){ const char* v=knob_raw("G4_QUA
 static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, int S, int use_q4, cudaStream_t stream, bool requant=true){
     if(use_q4==2){
         if(requant || !g4_quant_share()) launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S,stream);
-        if(g4d_mmq_prefill() && gd_amort==1 && S>=g4d_mmq_min_s() && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
+        if(g4d_mmq_prefill() && gd_amort==1 && S>=(gd_prefill?g4d_mmq_min_s():16) && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
             launch_gemm_mmq_w4a8_auto(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
         } else if(gd_amort && S>1){  // 프리필: SB 커널로 weight 1회/≤16행 amortize(비-amortized plain gemv의 S× 재적재 제거).
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
@@ -217,25 +220,33 @@ static void g4d_run_graph(Enqueue &&enqueue, int base){
 
 using G4PreparedStep = std::function<cudaError_t(cudaStream_t,int,const int*,float*)>;
 
+// Attention route counters (host side, one per call): R21 routing gate reads them through gemma4_attn_route_counts.
+static unsigned long g4_route_flash=0, g4_route_split=0;
+void gemma4_attn_route_counts(unsigned long *flash, unsigned long *split){ *flash=g4_route_flash; *split=g4_route_split; }
+
 static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const int *d_tokens, int Sq,
                    const float *d_cos_f, const float *d_sin_f,
                    const float *d_cos_s, const float *d_sin_s,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
-                   float *d_prenorm, bool graph_request, G4PreparedStep *prepared=nullptr) {
-    gd_sdtype=c.scale_dtype; gd_amort=amort_mm;
+                   float *d_prenorm, bool graph_request, G4PreparedStep *prepared=nullptr, int prefill=0) {
+    gd_sdtype=c.scale_dtype; gd_amort=amort_mm; gd_prefill=prefill;
     static const bool flash_prefill=[](){ const char* v=knob_raw("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
+    // G4_FLASH_MIN_S applies to prefill-mode calls only (default 1: every prefill chunk takes flash, so any
+    // chunking of a prompt gives the same KV and logits). Calls without the prefill flag (decode, verify, legacy
+    // callers) keep the fixed pre-R21 rule, flash for Sq >= 16, and never read this knob.
     static const int flash_min_s=[](){
-        int value=16;
+        int value=1;
         if(const char* v=knob_raw("G4_FLASH_MIN_S")){
             char* end=nullptr; errno=0;
             const long parsed=strtol(v,&end,10);
-            if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
-                value=parsed<16?16:(int)parsed;
-            else fprintf(stderr,"Invalid G4_FLASH_MIN_S=%s; using 16\n",v);
+            if(errno==0 && end!=v && *end=='\0' && parsed>=1 && parsed<=INT_MAX) value=(int)parsed;
+            else fprintf(stderr,"Invalid G4_FLASH_MIN_S=%s; using 1\n",v);
         }
         return value;
     }();
+    const bool use_flash=flash_prefill && Sq>=(prefill?flash_min_s:16);
+    (use_flash?g4_route_flash:g4_route_split)++;
     const int H=c.hidden_size, FFN=c.intermediate_size, V=c.vocab_size, NQ=c.num_q_heads;
     const int hd_s=c.head_dim, nkv_s=c.num_kv_heads;
     const int hd_f=c.global_head_dim?c.global_head_dim:hd_s, nkv_f=c.num_global_kv_heads?c.num_global_kv_heads:nkv_s;
@@ -275,7 +286,7 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
         (void)g4d_mmq_prefill();
         (void)g4d_mmq_min_s();
     }
-    const bool attn_split=g4_attn_split() && !(flash_prefill && Sq>=flash_min_s);
+    const bool attn_split=g4_attn_split() && !use_flash;
     const bool nf=g4_norm_fused(c);
     const bool nf_store=nf && !g4_kv_stats_enabled();   // KV statistics keep the separate kv_store kernel
     if(attn_split) attn_split_reserve(Sq,NQ,st.max_len,hd_max);   // before any capture; max_len bound
@@ -336,7 +347,7 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
             kv_store(vn, kv_at(st.Vc[l],(size_t)base*kvdim), (size_t)Sq*kvdim, 1, stream);
         }
         }
-        if(flash_prefill && Sq>=flash_min_s){
+        if(use_flash){
             if(kv32) launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
             else if(g4_kv_dtype()==KV_F16) launch_flash_attn<__half>(qn, (const __half*)st.Kc[l], (const __half*)st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
             else launch_flash_attn<__nv_bfloat16>(qn, (const __nv_bfloat16*)st.Kc[l], (const __nv_bfloat16*)st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
@@ -381,6 +392,7 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
     if(!nf || c.num_layers==0) launch_rmsnorm(x, w.final_norm, norm, Sq, H, eps, stream);
     const float *hn = last_only ? norm+(size_t)(Sq-1)*H : norm;
     int rows = last_only ? 1 : Sq;
+    gd_prefill=0;   // lm_head rows do not depend on chunking (last_only: always 1 row); keep its pre-R21 route
     mm(w.lm_head, hn, d_logits, H, V, rows, use_q4, stream);
     if(c.final_logit_softcapping>0.f) launch_softcap(d_logits, d_logits, c.final_logit_softcapping, (size_t)rows*V, stream);
     return cudaSuccess;
@@ -401,9 +413,9 @@ void gemma4_decode(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,
                    const float *d_cos_f, const float *d_sin_f,
                    const float *d_cos_s, const float *d_sin_s,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
-                   float *d_prenorm){
+                   float *d_prenorm, int prefill){
     gemma4_decode_impl(c,w,st,d_tokens,Sq,d_cos_f,d_sin_f,d_cos_s,d_sin_s,
-                      d_logits,commit,use_q4,last_only,amort_mm,d_prenorm,false);
+                      d_logits,commit,use_q4,last_only,amort_mm,d_prenorm,false,nullptr,prefill);
 }
 
 void gemma4_decode_step(const ModelConfig &c, const G4Weights &w, G4DecodeState &st,

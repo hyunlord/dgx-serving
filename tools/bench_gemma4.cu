@@ -164,7 +164,7 @@ int main(int argc,char**argv){
                 std::vector<int> ones(depth,1); int* dp; CK(cudaMalloc(&dp,(size_t)depth*4));
                 CK(cudaMemcpy(dp,ones.data(),(size_t)depth*4,cudaMemcpyHostToDevice));
                 for(int o=0;o<depth;o+=2048){ int n=depth-o<2048?depth-o:2048;
-                    gemma4_decode(c,w,st,dp+o,n,cf,sf,cs,ss,d_logit,1,sq,1,1); }
+                    gemma4_decode(c,w,st,dp+o,n,cf,sf,cs,ss,d_logit,1,sq,1,1,nullptr,/*prefill*/1); }
                 CK(cudaDeviceSynchronize()); cudaFree(dp);
             }
         };
@@ -223,12 +223,11 @@ int main(int argc,char**argv){
       const int amort=!amort_env || strcmp(amort_env,"0")!=0;
       const char* mmq_env=knob_raw("G4_MMQ_PREFILL");
       const bool mmq_enabled=!mmq_env || strcmp(mmq_env,"0")!=0;
-      int mmq_min_s=16;
+      int mmq_min_s=1;   // bench prefill runs in prefill mode (G4_MMQ_MIN_S is prefill-only, default 1)
       if(const char* v=knob_raw("G4_MMQ_MIN_S")){
           char* end=nullptr; errno=0;
           const long parsed=strtol(v,&end,10);
-          if(errno==0 && end!=v && *end=='\0' && parsed>=INT_MIN && parsed<=INT_MAX)
-              mmq_min_s=parsed<16?16:(int)parsed;
+          if(errno==0 && end!=v && *end=='\0' && parsed>=1 && parsed<=INT_MAX) mmq_min_s=(int)parsed;
       }
       const bool aligned=c.hidden_size%32==0 && c.intermediate_size%32==0 &&
           ((size_t)c.num_q_heads*c.head_dim)%32==0 &&
@@ -241,11 +240,11 @@ int main(int argc,char**argv){
              prefill_path,amort,mmq_min_s);
       std::vector<int> tk(ctx,1); int* d_p; CK(cudaMalloc(&d_p,ctx*4)); CK(cudaMemcpy(d_p,tk.data(),ctx*4,cudaMemcpyHostToDevice));
       reset_g4_decode_state(st);
-      if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);   // 워밍
+      if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort,nullptr,/*prefill*/1);   // 워밍
       CK(cudaDeviceSynchronize()); reset_g4_decode_state(st);
       if(!min_sec_env){
       CK(cudaEventRecord(t0));
-      if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);
+      if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1); else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort,nullptr,/*prefill*/1);
       CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
       double ms=ev(t0,t1); prefill_ts=ctx/(ms/1000.0);
       printf("\n  프리필(B=1 통짜 %d토큰): %.2f tok/s (%.3f ms) — 참고치(chunked 아님, TTFT 주장 아님)\n",ctx,prefill_ts,ms);
@@ -259,7 +258,7 @@ int main(int argc,char**argv){
           do {
               reset_g4_decode_state(st);
               if(is_moe) gemma4_moe_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1);
-              else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort);
+              else gemma4_decode(c,w,st,d_p,ctx,cf,sf,cs,ss,d_logit,0,uq,1,amort,nullptr,/*prefill*/1);
               if(reps==0) CK(cudaMemcpy(first.data(),d_logit,(size_t)V*4,cudaMemcpyDeviceToHost));
               ++reps;
               CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));

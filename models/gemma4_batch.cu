@@ -357,7 +357,7 @@ void gemma4_prefill_batch_slot(const ModelConfig &c, const G4Weights &w, G4Batch
     view.Kc=Kc.data(); view.Vc=Vc.data();
     // commit=0(뷰의 n_past 불필요 — 스케줄러가 위치 관리), last_only=1(마지막 로짓만; 서빙은 discard),
     // amort_mm=1(프리필 SB 커널로 weight amortize — 비-amortized plain gemv의 net-loss 해소, bit-id 유지)
-    gemma4_decode(c,w,view,d_tokens,P,d_cos_f,d_sin_f,d_cos_s,d_sin_s,d_logits,0,use_q4,1,1);
+    gemma4_decode(c,w,view,d_tokens,P,d_cos_f,d_sin_f,d_cos_s,d_sin_s,d_logits,0,use_q4,1,1,nullptr,/*prefill*/1);
 }
 
 // ---- spec chain verify (슬롯-b 뷰): 검증필 gemma4_decode(Sq=Nb, commit=0, 전 위치 로짓) 재사용 ----

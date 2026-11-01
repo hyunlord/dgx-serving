@@ -173,7 +173,7 @@ int main(int argc,char**argv){
                 int budget=maxlen-P-(K+2); if(r.max_tokens>budget) r.max_tokens=budget;
                 CK(cudaMemcpy(d_tok,r.ids.data(),(size_t)P*4,cudaMemcpyHostToDevice));
                 G4DecodeState pv=view_of(b,0);
-                gemma4_decode(c,w,pv,d_tok,P,d_cf,d_sf,d_cs,d_ss,d_lg,0,uq,1,1,d_pn);   // last_only·amort(prefill_batch_slot 동일)·prenorm
+                gemma4_decode(c,w,pv,d_tok,P,d_cf,d_sf,d_cs,d_ss,d_lg,0,uq,1,1,d_pn,/*prefill*/1);   // last_only·amort(prefill_batch_slot 동일)·prenorm
                 launch_argmax(d_lg,V,d_am); int first; CK(cudaMemcpy(&first,d_am,4,cudaMemcpyDeviceToHost));
                 CK(cudaMemcpy(d_h+(size_t)b*H, d_pn+(size_t)(P-1)*H, (size_t)H*4, cudaMemcpyDeviceToDevice));  // h0
                 slot[b]=SpecSlot{r.id,P,0,r.max_tokens,first};

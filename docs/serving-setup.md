@@ -197,15 +197,17 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   the GPU (`CANCEL <id>` to the daemon); a dropped non-streaming connection is noticed only when the
   response is written.
 - Dense Gemma W4A8 uses MMQ for amortized prefill by default. Set `G4_MMQ_PREFILL=0` to use the
-  previous SB path. `G4_MMQ_MIN_S` selects the minimum row count (default 16; values below 16 or
-  non-integers are rejected at startup, see [knobs.md](./knobs.md)). Decode and non-amortized calls retain their existing paths.
+  previous SB path. `G4_MMQ_MIN_S` selects the minimum prefill chunk (prefill mode only, default 1:
+  every chunk; values below 1 or non-integers are rejected at startup, see [knobs.md](./knobs.md#prefill-attention-routing)).
+  Decode, verify and non-amortized calls retain their existing paths.
   `tools/bench_gemma4` now defaults to amortized prefill; `BENCH_G4_AMORT=0` reproduces its prior
   plain GEMV prefill path. This setting does not change the scale dtype selected by the weight manifest.
 - Dense Gemma prefill attention uses flash by default. Set `G4_FLASH_PREFILL=0` to restore
-  fp32 attention. `G4_FLASH_MIN_S` sets the minimum query count (default 16; values below 16
-  clamp to 16; invalid values fall back to 16). KV storage remains fp32; flash converts inputs
-  to bf16 for MMA. Single-token decode and the existing verify calls with at most 9 queries
-  retain the previous attention path. This setting does not affect 26B MoE.
+  fp32 attention. Prefill callers mark their calls as prefill mode; every prefill chunk then takes
+  flash (`G4_FLASH_MIN_S`, default 1), so splitting a prompt into chunks gives the same KV and
+  logits. Single-token decode and verify calls are not prefill mode and keep the split-KV path;
+  they do not read `G4_FLASH_MIN_S` (see [knobs.md](./knobs.md#prefill-attention-routing)).
+  This setting does not affect 26B MoE.
 - Optional: `--recipe recipes/gemma4-12b-gb10.yaml` serves with a tuned config after verifying the
   device fingerprint and memory budget at startup — see [`recipe-schema.md`](./recipe-schema.md).
 
