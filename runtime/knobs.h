@@ -62,6 +62,8 @@ static const KnobDef g_knobs[] = {
  "golden, ppl, prefill_slot, chunk invariance", "prefill-mode only: smallest prefill chunk that uses flash (1 = every chunk, chunk-invariant; 16 = pre-R21, breaks chunk invariance); decode/verify ignore it"},
 {"G4_FLASH_V2",         KNOB_ENUM,  "0",   "0|1",           KNOB_NUMERIC, "gemma4 prefill attention",
  "golden, ppl, chunk invariance", "1 = R21 prefill flash v2 for prefill-mode chunks (GQA-shared KV tile, all-warp MMA, register softmax, no KV split); 0 = v1"},
+{"G4_FLASH_F16_MMA",    KNOB_ENUM,  "0",   "0|1",           KNOB_NUMERIC, "gemma4 prefill attention",
+ "golden, ppl, chunk invariance", "with G4_FLASH_V2=1: 1 = f16 MMA operands (f16 KV used unchanged), fp32 accumulation; 0 = bf16 operands"},
 {"G4_NORM_FUSED",       KNOB_ENUM,  "1",   "0|1",           KNOB_NUMERIC, "gemma4 dense decode/verify/batch/concat/prefill norms",
  "golden, ppl, spec==greedy, batch==single, fastpath==batch, graph_on==off", "parallel RMSNorm row function + q/k norm+RoPE(+KV store) and post-norm+residual fusions (R16 default); 0 = per-kernel norms"},
 {"G4_QUANT_SHARE",      KNOB_ENUM,  "1",   "0|1",           KNOB_TUNABLE, "gemma4 dense W4A8 decode/verify/batch/concat/prefill matmuls",

@@ -7,7 +7,8 @@
 //   (2) 30 launches bit-identical (G3), (3) the last rows launched alone (base+s1, Sq-s1 rows) equal the
 //   same rows of the full launch bit for bit (row composition independence, the kernel half of G2).
 //   The v1 kernel's error on the same inputs is printed for reference only.
-//   Usage: ./tests/test_flash_v2 [quick]   (quick: Sq <= 512, base <= 1024)
+//   f16 mode (R21 PART C): f16 MMA operands; the reference then uses Q rounded to f16 and the f16 K/V exactly.
+//   Usage: ./tests/test_flash_v2 [quick] [f16]   (quick: Sq <= 512, base <= 1024)
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -27,11 +28,14 @@
 
 static float rnd(uint32_t &s) { s = s * 1664525u + 1013904223u; return (float)(s >> 8) / 8388608.0f - 1.0f; }
 static float bf(float x) { return __bfloat162float(__float2bfloat16(x)); }
+static float hf(float x) { return __half2float(__float2half(x)); }
 
 struct Shape { const char *name; int hd, nq, nkv, window; };
 
 int main(int argc, char **argv) {
-    const bool quick = argc > 1 && strcmp(argv[1], "quick") == 0;
+    bool quick = false, f16 = false;
+    for (int i = 1; i < argc; i++) { if (!strcmp(argv[i], "quick")) quick = true; if (!strcmp(argv[i], "f16")) f16 = true; }
+    printf("[mode] %s operands\n", f16 ? "f16" : "bf16");
     const Shape shapes[] = {{"sliding", 256, 16, 8, 1024}, {"full", 512, 16, 1, 0}};
     const int sqs[] = {1, 6, 15, 16, 17, 512, 1024, 2048}, extra[] = {0, 1024, 8192};
     const int threads = std::max(1u, std::thread::hardware_concurrency());
@@ -43,17 +47,17 @@ int main(int argc, char **argv) {
         std::vector<float> q(nqe), qr(nqe), kr(nke), vr(nke);
         std::vector<__half> k(nke), v(nke);
         uint32_t seed = 2101u + hd * 17u + sq * 43u + base * 59u;
-        for (size_t i = 0; i < nqe; i++) { q[i] = rnd(seed); qr[i] = bf(q[i]); }
+        for (size_t i = 0; i < nqe; i++) { q[i] = rnd(seed); qr[i] = f16 ? hf(q[i]) : bf(q[i]); }
         for (size_t i = 0; i < nke; i++) {
             k[i] = __float2half(rnd(seed)); v[i] = __float2half(rnd(seed));
-            kr[i] = bf(__half2float(k[i])); vr[i] = bf(__half2float(v[i]));
+            kr[i] = f16 ? __half2float(k[i]) : bf(__half2float(k[i])); vr[i] = f16 ? __half2float(v[i]) : bf(__half2float(v[i]));
         }
         float *dq, *dout, *dtail, *dold; __half *dk, *dv;
         CK(cudaMalloc(&dq, nqe * 4)); CK(cudaMalloc(&dout, nqe * 4)); CK(cudaMalloc(&dtail, nqe * 4)); CK(cudaMalloc(&dold, nqe * 4));
         CK(cudaMalloc(&dk, nke * 2)); CK(cudaMalloc(&dv, nke * 2));
         CK(cudaMemcpy(dq, q.data(), nqe * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dk, k.data(), nke * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dv, v.data(), nke * 2, cudaMemcpyHostToDevice));
-        auto launch = [&] { launch_flash_attn_v2<__half>(dq, dk, dv, dout, sq, nq, nkv, hd, base, 0, 0.f, sh.window); CK(cudaGetLastError()); CK(cudaDeviceSynchronize()); };
+        auto launch = [&] { launch_flash_attn_v2<__half>(dq, dk, dv, dout, sq, nq, nkv, hd, base, 0, 0.f, sh.window, f16); CK(cudaGetLastError()); CK(cudaDeviceSynchronize()); };
         launch();
         std::vector<float> out(nqe), next(nqe), tail(nqe), old(nqe);
         CK(cudaMemcpy(out.data(), dout, nqe * 4, cudaMemcpyDeviceToHost));
@@ -66,7 +70,7 @@ int main(int argc, char **argv) {
         const int s1 = sq > 6 ? sq - 6 : (sq > 1 ? sq - 1 : 0);
         bool comp = true; long comp_row = -1;
         if (s1 > 0) {
-            launch_flash_attn_v2<__half>(dq + (size_t)s1 * nq * hd, dk, dv, dtail, sq - s1, nq, nkv, hd, base + s1, 0, 0.f, sh.window);
+            launch_flash_attn_v2<__half>(dq + (size_t)s1 * nq * hd, dk, dv, dtail, sq - s1, nq, nkv, hd, base + s1, 0, 0.f, sh.window, f16);
             CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
             CK(cudaMemcpy(tail.data(), dtail, (size_t)(sq - s1) * nq * hd * 4, cudaMemcpyDeviceToHost));
             const float *a = out.data() + (size_t)s1 * nq * hd;

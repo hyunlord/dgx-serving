@@ -41,6 +41,32 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], unsigned a0, unsigned a1
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
+__device__ __forceinline__ void mma_f16(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+template <bool F16> __device__ __forceinline__ void mma_t(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    if constexpr (F16) mma_f16(c, a0, a1, a2, a3, b0, b1); else mma_bf16(c, a0, a1, a2, a3, b0, b1);
+}
+// Two floats -> one 32-bit pair of MMA operands (round to nearest).
+template <bool F16> __device__ __forceinline__ unsigned pack2(float a, float b) {
+    if constexpr (F16) { __half2 h = __floats2half2_rn(a, b); return *reinterpret_cast<unsigned *>(&h); }
+    else { __nv_bfloat162 h = __floats2bfloat162_rn(a, b); return *reinterpret_cast<unsigned *>(&h); }
+}
+// R21 PART C: 8 KV elements as f16 operands. An f16 cache is copied unchanged (no conversion).
+__device__ __forceinline__ uint4 kv8_f16(const __half *p) { return __ldg(reinterpret_cast<const uint4 *>(p)); }
+__device__ __forceinline__ uint4 kv8_f16(const __nv_bfloat16 *p) {
+    const uint4 raw = __ldg(reinterpret_cast<const uint4 *>(p)); const __nv_bfloat162 *h = reinterpret_cast<const __nv_bfloat162 *>(&raw);
+    uint4 out; unsigned *o = reinterpret_cast<unsigned *>(&out);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) o[i] = pack2<true>(__low2float(h[i]), __high2float(h[i]));
+    return out;
+}
+__device__ __forceinline__ uint4 kv8_f16(const float *p) {
+    const float4 a = __ldg(reinterpret_cast<const float4 *>(p)), b = __ldg(reinterpret_cast<const float4 *>(p) + 1);
+    return make_uint4(pack2<true>(a.x, a.y), pack2<true>(a.z, a.w), pack2<true>(b.x, b.y), pack2<true>(b.z, b.w));
+}
+template <bool F16, typename KV> __device__ __forceinline__ uint4 kv8(const KV *p);
 // 8 consecutive KV elements -> 8 bf16 (one 16-byte shared store). f16 and bf16 sources are one 16-byte load.
 __device__ __forceinline__ uint4 kv8_bf16(const __half *p) {
     const uint4 raw = __ldg(reinterpret_cast<const uint4 *>(p)); const __half2 *h = reinterpret_cast<const __half2 *>(&raw);
@@ -58,6 +84,10 @@ __device__ __forceinline__ uint4 kv8_bf16(const float *p) {
     return out;
 }
 
+template <bool F16, typename KV> __device__ __forceinline__ uint4 kv8(const KV *p) {
+    if constexpr (F16) return kv8_f16(p); else return kv8_bf16(p);
+}
+
 template <int HD, int RG, int WPR, int BC, int KCH>
 struct Cfg {
     static constexpr int R = RG * 16, NW = RG * WPR, NT = NW * 32;
@@ -71,16 +101,16 @@ struct Cfg {
     static_assert(BC % 16 == 0 && 512 % BC == 0, "tile");
 };
 
-template <int HD, int RG, int WPR, int BC, int KCH, typename KV>
+template <int HD, int RG, int WPR, int BC, int KCH, typename KV, bool F16>
 __global__ void __launch_bounds__(RG * WPR * 32, 1)
 flash_v2_kernel(const float *__restrict__ Q, const KV *__restrict__ Kc, const KV *__restrict__ Vc, float *__restrict__ O,
                 int Sq, int NQ, int NKV, int base, float scale, int window) {
     using C = Cfg<HD, RG, WPR, BC, KCH>;
     extern __shared__ __align__(16) unsigned char smem[];
-    __nv_bfloat16 *sQ = reinterpret_cast<__nv_bfloat16 *>(smem);
-    __nv_bfloat16 *sK = sQ + C::R * C::SQ;
-    __nv_bfloat16 *sV = sK + BC * C::SK;
-    __nv_bfloat16 *sP = sV + BC * C::SV;
+    unsigned short *sQ = reinterpret_cast<unsigned short *>(smem);
+    unsigned short *sK = sQ + C::R * C::SQ;
+    unsigned short *sV = sK + BC * C::SK;
+    unsigned short *sP = sV + BC * C::SV;
     float *sMax = reinterpret_cast<float *>(sP + C::R * C::SP);   // [R][WPR]
     float *sSum = sMax + C::R * WPR;                              // [R][WPR]
 
@@ -97,8 +127,8 @@ flash_v2_kernel(const float *__restrict__ Q, const KV *__restrict__ Kc, const KV
         const int r = i / (HD / 4), c = (i % (HD / 4)) * 4, tok = q0 + r / GRP, h = kv * GRP + r % GRP;
         float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
         if (tok < Sq) v = __ldg(reinterpret_cast<const float4 *>(Q + ((size_t)tok * NQ + h) * HD + c));
-        __nv_bfloat162 *d = reinterpret_cast<__nv_bfloat162 *>(sQ + r * C::SQ + c);
-        d[0] = __floats2bfloat162_rn(v.x, v.y); d[1] = __floats2bfloat162_rn(v.z, v.w);
+        unsigned *d = reinterpret_cast<unsigned *>(sQ + r * C::SQ + c);
+        d[0] = pack2<F16>(v.x, v.y); d[1] = pack2<F16>(v.z, v.w);
     }
     // Rows of this thread: lr0 = rg*16+g, lr1 = lr0+8.
     const int lr0 = rg * 16 + g, lr1 = lr0 + 8;
@@ -122,7 +152,7 @@ flash_v2_kernel(const float *__restrict__ Q, const KV *__restrict__ Kc, const KV
         for (int i = tid; i < BC * (HD / 8); i += C::NT) {
             const int r = i / (HD / 8), c = (i % (HD / 8)) * 8, gk = j0 + r;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (gk < hi) v = kv8_bf16(Vc + (size_t)gk * kvrow + (size_t)kv * HD + c);
+            if (gk < hi) v = kv8<F16>(Vc + (size_t)gk * kvrow + (size_t)kv * HD + c);
             *reinterpret_cast<uint4 *>(sV + r * C::SV + c) = v;
         }
         float s[C::NPK][4];
@@ -134,7 +164,7 @@ flash_v2_kernel(const float *__restrict__ Q, const KV *__restrict__ Kc, const KV
             for (int i = tid; i < BC * (KCH / 8); i += C::NT) {
                 const int r = i / (KCH / 8), c = (i % (KCH / 8)) * 8, gk = j0 + r;
                 uint4 v = make_uint4(0, 0, 0, 0);
-                if (gk < hi) v = kv8_bf16(Kc + (size_t)gk * kvrow + (size_t)kv * HD + kc + c);
+                if (gk < hi) v = kv8<F16>(Kc + (size_t)gk * kvrow + (size_t)kv * HD + kc + c);
                 *reinterpret_cast<uint4 *>(sK + r * C::SK + c) = v;
             }
             __syncthreads();
@@ -146,12 +176,12 @@ flash_v2_kernel(const float *__restrict__ Q, const KV *__restrict__ Kc, const KV
                 if constexpr (C::NPK == 2) {
                     unsigned b0, b1, b2, b3;
                     ldsm_x4(b0, b1, b2, b3, sK + (wp * C::KPW + (lane & 7) + (lane >> 4) * 8) * C::SK + ks + ((lane >> 3) & 1) * 8);
-                    mma_bf16(s[0], a0, a1, a2, a3, b0, b1);
-                    mma_bf16(s[C::NPK - 1], a0, a1, a2, a3, b2, b3);
+                    mma_t<F16>(s[0], a0, a1, a2, a3, b0, b1);
+                    mma_t<F16>(s[C::NPK - 1], a0, a1, a2, a3, b2, b3);
                 } else {
                     unsigned b0, b1;
                     ldsm_x2(b0, b1, sK + (wp * C::KPW + (lane & 7)) * C::SK + ks + ((lane >> 3) & 1) * 8);
-                    mma_bf16(s[0], a0, a1, a2, a3, b0, b1);
+                    mma_t<F16>(s[0], a0, a1, a2, a3, b0, b1);
                 }
             }
         }
@@ -190,8 +220,8 @@ flash_v2_kernel(const float *__restrict__ Q, const KV *__restrict__ Kc, const KV
             }
             ps0 += p[0]; ps0 += p[1]; ps1 += p[2]; ps1 += p[3];
             const int kcol = wp * C::KPW + n * 8 + 2 * t;
-            *reinterpret_cast<__nv_bfloat162 *>(sP + lr0 * C::SP + kcol) = __floats2bfloat162_rn(p[0], p[1]);
-            *reinterpret_cast<__nv_bfloat162 *>(sP + lr1 * C::SP + kcol) = __floats2bfloat162_rn(p[2], p[3]);
+            *reinterpret_cast<unsigned *>(sP + lr0 * C::SP + kcol) = pack2<F16>(p[0], p[1]);
+            *reinterpret_cast<unsigned *>(sP + lr1 * C::SP + kcol) = pack2<F16>(p[2], p[3]);
         }
         ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1); ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
         ps1 += __shfl_xor_sync(0xffffffffu, ps1, 1); ps1 += __shfl_xor_sync(0xffffffffu, ps1, 2);
@@ -212,8 +242,8 @@ flash_v2_kernel(const float *__restrict__ Q, const KV *__restrict__ Kc, const KV
             for (int n = 0; n < C::ONT; n += 2) {
                 unsigned b0, b1, b2, b3;
                 ldsm_x4_t(b0, b1, b2, b3, sV + (ks + (lane & 7) + ((lane >> 3) & 1) * 8) * C::SV + wp * C::ODIM + n * 8 + (lane >> 4) * 8);
-                mma_bf16(acc[n], a0, a1, a2, a3, b0, b1);
-                mma_bf16(acc[n + 1], a0, a1, a2, a3, b2, b3);
+                mma_t<F16>(acc[n], a0, a1, a2, a3, b0, b1);
+                mma_t<F16>(acc[n + 1], a0, a1, a2, a3, b2, b3);
             }
         }
     }
@@ -228,12 +258,12 @@ flash_v2_kernel(const float *__restrict__ Q, const KV *__restrict__ Kc, const KV
     }
 }
 
-template <int HD, int RG, int WPR, int BC, int KCH, typename KV>
+template <int HD, int RG, int WPR, int BC, int KCH, typename KV, bool F16>
 static inline void launch_v2(const float *Q, const KV *Kc, const KV *Vc, float *O, int Sq, int NQ, int NKV, int base,
                              cudaStream_t st, float scale, int window) {
     using C = Cfg<HD, RG, WPR, BC, KCH>;
     static const bool configured = [] {
-        cudaError_t e = cudaFuncSetAttribute(flash_v2_kernel<HD, RG, WPR, BC, KCH, KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)C::SMEM);
+        cudaError_t e = cudaFuncSetAttribute(flash_v2_kernel<HD, RG, WPR, BC, KCH, KV, F16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)C::SMEM);
         if (e != cudaSuccess) { fprintf(stderr, "[flash_v2] HD%d needs %zu shared bytes: %s\n", HD, C::SMEM, cudaGetErrorString(e)); abort(); }
         return true;
     }();
@@ -242,18 +272,22 @@ static inline void launch_v2(const float *Q, const KV *Kc, const KV *Vc, float *
     if (NQ % NKV || C::R % GRP) { fprintf(stderr, "[flash_v2] GQA group %d must divide %d rows\n", GRP, C::R); abort(); }
     const int Tq = C::R / GRP;
     dim3 grid((Sq + Tq - 1) / Tq, NKV);
-    flash_v2_kernel<HD, RG, WPR, BC, KCH, KV><<<grid, C::NT, C::SMEM, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base, scale == 0.f ? 1.0f / sqrtf((float)HD) : scale, window);
+    flash_v2_kernel<HD, RG, WPR, BC, KCH, KV, F16><<<grid, C::NT, C::SMEM, st>>>(Q, Kc, Vc, O, Sq, NQ, NKV, base, scale == 0.f ? 1.0f / sqrtf((float)HD) : scale, window);
 }
 
 }  // namespace fav2
 
 // Tile configuration (compile-time; see the design notes in docs): HD256: 64 rows, 8 warps (4 row groups x 2),
 // BC 32. HD512: 32 rows, 8 warps (2 row groups x 4), BC 32, K loaded in two 256-dim chunks (shared-memory budget).
+// f16_mma (R21 PART C, G4_FLASH_F16_MMA): Q, P and K/V as f16 MMA operands (an f16 cache is used unchanged),
+// fp32 accumulation as before. Otherwise bf16 operands.
 template <typename KV>
 static inline void launch_flash_attn_v2(const float *Q, const KV *Kc, const KV *Vc, float *O, int Sq, int NQ, int NKV, int HD, int base,
-                                        cudaStream_t st = 0, float scale = 0.f, int window = 0) {
-    if (HD == 256) fav2::launch_v2<256, 4, 2, 32, 256, KV>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st, scale, window);
-    else if (HD == 512) fav2::launch_v2<512, 2, 4, 32, 256, KV>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st, scale, window);
+                                        cudaStream_t st = 0, float scale = 0.f, int window = 0, bool f16_mma = false) {
+    if (HD == 256 && f16_mma) fav2::launch_v2<256, 4, 2, 32, 256, KV, true>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st, scale, window);
+    else if (HD == 256) fav2::launch_v2<256, 4, 2, 32, 256, KV, false>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st, scale, window);
+    else if (HD == 512 && f16_mma) fav2::launch_v2<512, 2, 4, 32, 256, KV, true>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st, scale, window);
+    else if (HD == 512) fav2::launch_v2<512, 2, 4, 32, 256, KV, false>(Q, Kc, Vc, O, Sq, NQ, NKV, base, st, scale, window);
     else { fprintf(stderr, "[flash_v2] unsupported head_dim=%d (256/512 only)\n", HD); abort(); }
 }
 
