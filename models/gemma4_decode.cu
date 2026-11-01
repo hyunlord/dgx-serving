@@ -23,6 +23,7 @@
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
 #include "../kernels/attention_flash.cuh"
+#include "../kernels/attention_flash_v2.cuh"
 #include "../kernels/attention_decode_split.cuh"
 #include "../kernels/kv_store.cuh"
 #include "../kernels/norm_fused.cuh"
@@ -109,6 +110,9 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
 
 // Dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel by default (R15);
 // G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
+// G4_FLASH_V2 (R21, opt-in): prefill-mode flash calls use attention_flash_v2.cuh (GQA-shared KV tiles, all-warp MMA,
+// register softmax, no KV split); calls without the prefill flag keep v1.
+static bool g4_flash_v2(){ static const bool on=[](){ const char* v=knob_raw("G4_FLASH_V2"); return v && strcmp(v,"1")==0; }(); return on; }
 static bool g4_attn_split(){ static const bool on=[](){ const char* v=knob_raw("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
 // G4_NORM_FUSED (R16, default on; 0 restores the per-kernel norms): every norm of the dense graph uses the parallel row function
 // (norm_fused.cuh), with q/k norm+RoPE(+KV store) and post-norm+residual(+next pre-norm) fused.
@@ -347,7 +351,12 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
             kv_store(vn, kv_at(st.Vc[l],(size_t)base*kvdim), (size_t)Sq*kvdim, 1, stream);
         }
         }
-        if(use_flash){
+        if(use_flash && prefill && g4_flash_v2()){
+            if(kv32) launch_flash_attn_v2<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, ascale, window);
+            else if(g4_kv_dtype()==KV_F16) launch_flash_attn_v2<__half>(qn, (const __half*)st.Kc[l], (const __half*)st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, ascale, window);
+            else launch_flash_attn_v2<__nv_bfloat16>(qn, (const __nv_bfloat16*)st.Kc[l], (const __nv_bfloat16*)st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, ascale, window);
+        }
+        else if(use_flash){
             if(kv32) launch_flash_attn<float>(qn, st.Kc[l], st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
             else if(g4_kv_dtype()==KV_F16) launch_flash_attn<__half>(qn, (const __half*)st.Kc[l], (const __half*)st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
             else launch_flash_attn<__nv_bfloat16>(qn, (const __nv_bfloat16*)st.Kc[l], (const __nv_bfloat16*)st.Vc[l], attn, Sq, NQ, nkv, hd, base, stream, nullptr, ascale, window);
