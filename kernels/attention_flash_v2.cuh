@@ -1,7 +1,7 @@
 #ifndef DGX_ATTENTION_FLASH_V2_CUH
 #define DGX_ATTENTION_FLASH_V2_CUH
-// Prefill flash attention v2 (R21, opt-in G4_FLASH_V2=1; Gemma 4 dense prefill only, the v1 kernel in
-// attention_flash.cuh stays for Qwen and for G4_FLASH_V2=0).
+// Prefill flash attention v2 (R21, G4_FLASH_V2 default 1; Gemma 4 dense prefill-mode chunks only, the v1 kernel in
+// attention_flash.cuh stays for Qwen, non-prefill calls and G4_FLASH_V2=0).
 //
 // Block = Tq query tokens x all GRP query heads that share one kv head (rows = Tq*GRP = RG*16), so each
 // K/V tile is loaded once for every head of the group. NW = RG*WPR warps: warp (rg, wp) owns query rows

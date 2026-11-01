@@ -207,6 +207,8 @@ python tools/serve_api.py --model spec --tokenizer Qwen/Qwen3.5-27B \
   flash (`G4_FLASH_MIN_S`, default 1), so splitting a prompt into chunks gives the same KV and
   logits. Single-token decode and verify calls are not prefill mode and keep the split-KV path;
   they do not read `G4_FLASH_MIN_S` (see [knobs.md](./knobs.md#prefill-attention-routing)).
+  Prefill chunks use the R21 flash v2 kernel (`G4_FLASH_V2`, default 1: GQA-shared KV tiles, bf16
+  MMA, fp32 accumulation); `G4_FLASH_V2=0` restores the previous kernel.
   This setting does not affect 26B MoE.
 - Optional: `--recipe recipes/gemma4-12b-gb10.yaml` serves with a tuned config after verifying the
   device fingerprint and memory budget at startup — see [`recipe-schema.md`](./recipe-schema.md).

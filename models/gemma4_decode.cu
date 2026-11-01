@@ -110,9 +110,9 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
 
 // Dense decode-type attention (S=1, verify, concat, batch) uses the split-KV kernel by default (R15);
 // G4_ATTN_SPLIT=0 restores the original per-query-head kernels.
-// G4_FLASH_V2 (R21, opt-in): prefill-mode flash calls use attention_flash_v2.cuh (GQA-shared KV tiles, all-warp MMA,
-// register softmax, no KV split); calls without the prefill flag keep v1.
-static bool g4_flash_v2(){ static const bool on=[](){ const char* v=knob_raw("G4_FLASH_V2"); return v && strcmp(v,"1")==0; }(); return on; }
+// G4_FLASH_V2 (R21, default on; 0 restores v1): prefill-mode flash calls use attention_flash_v2.cuh (GQA-shared KV
+// tiles, all-warp MMA, register softmax, no KV split); calls without the prefill flag keep v1.
+static bool g4_flash_v2(){ static const bool on=[](){ const char* v=knob_raw("G4_FLASH_V2"); return !(v && strcmp(v,"0")==0); }(); return on; }
 // G4_FLASH_F16_MMA (R21 PART C, with G4_FLASH_V2=1): f16 MMA operands (f16 KV used unchanged), fp32 accumulation.
 static bool g4_flash_f16_mma(){ static const bool on=[](){ const char* v=knob_raw("G4_FLASH_F16_MMA"); return v && strcmp(v,"1")==0; }(); return on; }
 static bool g4_attn_split(){ static const bool on=[](){ const char* v=knob_raw("G4_ATTN_SPLIT"); return !(v && strcmp(v,"0")==0); }(); return on; }
