@@ -19,6 +19,8 @@ finish() {
     if [ "$LOCKED" = 1 ]; then rmdir "$PARENT/lock"; fi
 }
 trap finish EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 exec > "$OUT/cooled.log" 2>&1
 remaining() {
     [ "$(date -u +%s)" -lt "$DEADLINE" ] || { echo R24_DEADLINE_REACHED; exit 124; }
@@ -38,7 +40,8 @@ bash "$REPO/tools/r24_deadline.sh" nvcc -O2 -std=c++17 -lineinfo -arch=sm_121 \
     > "$OUT/build_grid.log" 2>&1
 sha256sum "$OUT/r24_grid" > "$OUT/build.outputs.sha256"
 idle() {
-    local name=$1 apps now util temp sm zero_since=0
+    local name=$1 apps now util temp sm idle_since
+    idle_since=$(date -u +%s)
     printf 'epoch,utilization_gpu,temperature_gpu,clocks_sm\n' > "$OUT/idle_$name.csv"
     while true; do
         remaining
@@ -49,12 +52,11 @@ idle() {
         [[ "$util" =~ ^[0-9]+$ ]] || { echo INVALID_GPU_UTILIZATION; exit 89; }
         now=$(date -u +%s)
         printf '%s,%s,%s,%s\n' "$now" "$util" "$temp" "$sm" >> "$OUT/idle_$name.csv"
-        if [ "$util" = 0 ]; then
-            if [ "$zero_since" = 0 ]; then zero_since=$now; fi
-            if [ $((now-zero_since)) -ge 120 ]; then break; fi
-        else
-            zero_since=0
-        fi
+        temp=${temp//[[:space:]]/}
+        [[ "$temp" =~ ^[0-9]+$ ]] || { echo INVALID_GPU_TEMPERATURE; exit 89; }
+        # Desktop GPU activity is allowed; external compute was rejected above.
+        # This is cooldown between owned experiments, not external-job resumption.
+        if [ $((now-idle_since)) -ge 120 ] && [ "$temp" -le 60 ]; then break; fi
         sleep 1
     done
     nvidia-smi --query-gpu=timestamp,temperature.gpu,clocks.sm,clocks_throttle_reasons.active \
