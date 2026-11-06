@@ -4,6 +4,8 @@
 
 | knob | type | default | range | scope | gates to re-run | description |
 |---|---|---|---|---|---|---|
+| `G4_MMQ_RASTER` | enum | `0` | `0\|1\|2` | gemma4 dense prefill layer MMQ only | byte identity, determinism, chunk invariance, engine byte identity, golden, spec, batch | 0 = existing MMQ; 1 = token-fast R1; 2 = grouped R2 diagnostic; MMQ256 nonzero retains its complete existing policy; decode/verify/lm_head/Qwen/MoE unchanged |
+| `G4_MMQ_RASTER_GROUP` | enum | `8` | `4\|8\|16` | gemma4 dense prefill R2 only | byte identity, determinism, chunk invariance, engine byte identity | weight tiles per R2 group; ignored for raster 0/1; no automatic shape-dependent selection |
 | `G4_QUANT_SHARE` | enum | `1` | `0\|1` | gemma4 dense W4A8 decode/verify/batch/concat/prefill matmuls | golden, spec==greedy, batch==single (same quantized bytes) | q/k/v and gate/up reuse one int8 activation quantization; 0 = quantize before every matmul |
 | `G4_GEMV_PF` | enum | `0` | `0\|2\|4` | gemma4 dense W4A8 GEMV (plain and SB) | golden, spec==greedy, batch==single (prefetch only) | prefetch.global.L2 of the weight chunk this many iterations ahead; 0 = none |
 | `G4_GEMV_U` | enum | `1` | `1\|2` | gemma4 dense W4A8 plain GEMV (S=1 decode, per-slot verify rows) | golden, spec==greedy, batch==single (same accumulation order) | k-loop unroll: chunks loaded before they are accumulated |

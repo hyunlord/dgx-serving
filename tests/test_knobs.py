@@ -32,6 +32,22 @@ def check(name, ok, detail=""):
 rc, err, k = run({})
 check("default resolves", rc == 0 and k["G4_KV_DTYPE"] == {"value": "f16", "source": "default", "class": "numeric"}, err)
 check("default graph mode", k is not None and k["G4_CUDA_GRAPH"]["value"] == "2")
+# Given no overrides, the R25 rollout is opt-in and grouped diagnostics use G8.
+check("raster default off", k is not None and k.get("G4_MMQ_RASTER", {}).get("value") == "0")
+check("raster group default eight", k is not None and k.get("G4_MMQ_RASTER_GROUP", {}).get("value") == "8")
+# Given registered raster/group choices, effective configuration preserves each choice.
+for raster in ("0", "1", "2"):
+    for group in ("4", "8", "16"):
+        rc, err, k = run({"G4_MMQ_RASTER": raster, "G4_MMQ_RASTER_GROUP": group})
+        check(f"raster {raster} group {group} accepted", rc == 0 and k is not None
+              and k.get("G4_MMQ_RASTER", {}).get("value") == raster
+              and k.get("G4_MMQ_RASTER_GROUP", {}).get("value") == group, err)
+# Given unsupported values, registry initialization must reject rather than silently route.
+for name, value in (("G4_MMQ_RASTER", "-1"), ("G4_MMQ_RASTER", "3"),
+                    ("G4_MMQ_RASTER_GROUP", "0"), ("G4_MMQ_RASTER_GROUP", "3"),
+                    ("G4_MMQ_RASTER_GROUP", "32")):
+    rc, err, k = run({name: value})
+    check(f"{name}={value} rejected", rc == 2 and f"{name}={value}" in err, err)
 rc, err, k = run({"G4_KV_DTYPE": "bf16"})
 check("env value", rc == 0 and k["G4_KV_DTYPE"]["value"] == "bf16" and k["G4_KV_DTYPE"]["source"] == "env", err)
 rc, err, k = run({"G4_KV_DTYPE": "fp8"})
@@ -51,6 +67,16 @@ rc, err, k = run({"DGX_KNOBS_FILE": recipe})
 check("recipe value", rc == 0 and k["G4_ATTN_CHUNK"] == {"value": "128", "source": "recipe", "class": "numeric"}, err)
 rc, err, k = run({"DGX_KNOBS_FILE": recipe, "G4_ATTN_CHUNK": "32"})
 check("env overrides recipe", rc == 0 and k["G4_ATTN_CHUNK"]["value"] == "32" and k["G4_ATTN_CHUNK"]["source"] == "env", err)
+with open(recipe, "w") as f:
+    f.write("G4_MMQ_RASTER=2\nG4_MMQ_RASTER_GROUP=16\n")
+rc, err, k = run({"DGX_KNOBS_FILE": recipe})
+check("raster recipe values", rc == 0 and k is not None
+      and k["G4_MMQ_RASTER"]["value"] == "2"
+      and k["G4_MMQ_RASTER_GROUP"]["value"] == "16", err)
+rc, err, k = run({"DGX_KNOBS_FILE": recipe, "G4_MMQ_RASTER": "1"})
+check("raster env overrides recipe", rc == 0 and k is not None
+      and k["G4_MMQ_RASTER"]["value"] == "1"
+      and k["G4_MMQ_RASTER"]["source"] == "env", err)
 with open(recipe, "w") as f:
     f.write("G4_ATTN_CHUNK=100\n")
 rc, err, k = run({"DGX_KNOBS_FILE": recipe})

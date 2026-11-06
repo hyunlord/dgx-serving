@@ -19,6 +19,7 @@
 #include "../kernels/quantize_x.cuh"
 #include "../kernels/gemv_w4a8.cuh"
 #include "../kernels/gemm_mmq_tmpl.cuh"
+#include "../kernels/gemm_mmq_raster.cuh"
 #include "../kernels/gemm_tiled.cuh"
 #include "../kernels/rope.cuh"
 #include "../kernels/attention.cuh"
@@ -64,6 +65,7 @@ void reset_g4_decode_state(G4DecodeState &s){ s.n_past=0; }
 // ---- mm dispatch (gemma4.cu와 동일 규약) ----
 static int8_t *gd_xq=nullptr; static float *gd_xs=nullptr; static int32_t *gd_xsum=nullptr; static size_t gd_cap=0;
 static int gd_sdtype;
+static bool gd_dense=false;
 static int gd_amort=0;   // 1=프리필 MMQ/SB 매트멀. 기본0=plain gemv(golden 경로 무변경).
 static int gd_prefill=0; // R21: 1 = prefill-mode call; its layer matmuls take MMQ for S >= G4_MMQ_MIN_S (default 1).
 static void g4d_reserve_quant(size_t n){
@@ -91,6 +93,20 @@ static int g4d_mmq_min_s(){
     }();
     return min_s;
 }
+// R25: only dense prefill layer MMQ calls use raster scheduling. MMQ256 wins
+// as a whole policy, including its 128x128 fallback when MMQ256=2.
+static int g4d_mmq_raster(){
+    static const int value=[](){ const char* v=knob_raw("G4_MMQ_RASTER"); return v?atoi(v):0; }();
+    return value;
+}
+static int g4d_mmq_raster_group(){
+    static const int value=[](){ const char* v=knob_raw("G4_MMQ_RASTER_GROUP"); return v?atoi(v):8; }();
+    return value;
+}
+static bool g4d_mmq_default_tile(){
+    static const bool value=[](){ const char* v=knob_raw("MMQ256"); return !v || atoi(v)==0; }();
+    return value;
+}
 // G4_QUANT_SHARE (R20 B1, default on): matmuls that read the same activation (q/k/v, gate/up) reuse the int8
 // quantization of the first one (requant=0). The quantized bytes are the same, so outputs are unchanged.
 bool g4_quant_share(){ static const bool on=[](){ const char* v=knob_raw("G4_QUANT_SHARE"); return !(v && strcmp(v,"0")==0); }(); return on; }
@@ -98,7 +114,11 @@ static inline void mm(const QMat &m, const float *X, float *Y, int IN, int OUT, 
     if(use_q4==2){
         if(requant || !g4_quant_share()) launch_quantize_x_q8(X,gd_xq,gd_xs,gd_xsum,IN,S,stream);
         if(g4d_mmq_prefill() && gd_amort==1 && S>=(gd_prefill?g4d_mmq_min_s():16) && IN%QBLK==0 && (gd_sdtype==0 || gd_sdtype==1)){
-            launch_gemm_mmq_w4a8_auto(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
+            if(gd_prefill && gd_dense && g4d_mmq_default_tile() && g4d_mmq_raster()!=0)
+                launch_gemm_mmq_raster_w4a8(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,
+                                           g4d_mmq_raster(),g4d_mmq_raster_group(),stream);
+            else
+                launch_gemm_mmq_w4a8_auto(gd_xq,gd_xs,m.wq,m.sc,Y,S,OUT,IN,gd_sdtype,stream);
         } else if(gd_amort && S>1){  // 프리필: SB 커널로 weight 1회/≤16행 amortize(비-amortized plain gemv의 S× 재적재 제거).
             //   SB per-row == plain gemv per-row bit-identical(test_gemma4_prefill_slot 게이트 확증) → golden 불변.
             for(int s0=0;s0<S;s0+=16){ int sq=(S-s0<16)?(S-s0):16;
@@ -236,7 +256,7 @@ static void gemma4_decode_impl(const ModelConfig &c, const G4Weights &w, G4Decod
                    const float *d_cos_s, const float *d_sin_s,
                    float *d_logits, int commit, int use_q4, int last_only, int amort_mm,
                    float *d_prenorm, bool graph_request, G4PreparedStep *prepared=nullptr, int prefill=0) {
-    gd_sdtype=c.scale_dtype; gd_amort=amort_mm; gd_prefill=prefill;
+    gd_sdtype=c.scale_dtype; gd_amort=amort_mm; gd_prefill=prefill; gd_dense=c.num_experts==0;
     static const bool flash_prefill=[](){ const char* v=knob_raw("G4_FLASH_PREFILL"); return !v || strcmp(v,"0")!=0; }();
     // G4_FLASH_MIN_S applies to prefill-mode calls only (default 1: every prefill chunk takes flash, so any
     // chunking of a prompt gives the same KV and logits). Calls without the prefill flag (decode, verify, legacy
