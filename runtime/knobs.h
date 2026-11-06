@@ -56,7 +56,7 @@ static const KnobDef g_knobs[] = {
  "golden, ppl, prefill_slot", "1 = MMQ tensor-core prefill GEMM for prefill-mode chunks with S >= G4_MMQ_MIN_S (verify: S >= 16); 0 = SB/GEMV prefill"},
 {"G4_MMQ_MIN_S",        KNOB_INT,   "1",   "1..",           KNOB_NUMERIC, "gemma4 prefill linear layers",
  "golden, ppl, prefill_slot, chunk invariance", "prefill-mode only: smallest prefill chunk whose layer matmuls use MMQ (1 = every chunk, chunk-invariant; 16 = pre-R21, breaks chunk invariance); verify/decode ignore it"},
-{"G4_MMQ_RASTER",       KNOB_ENUM,  "0",   "0|1|2",         KNOB_TUNABLE, "gemma4 dense prefill layer MMQ only",
+{"G4_MMQ_RASTER",       KNOB_ENUM,  "1",   "0|1|2",         KNOB_TUNABLE, "gemma4 dense prefill layer MMQ only",
  "byte identity, determinism, chunk invariance, engine byte identity, golden, spec, batch", "0 = existing MMQ; 1 = token-fast R1; 2 = grouped R2 diagnostic; MMQ256 nonzero retains its complete existing policy; decode/verify/lm_head/Qwen/MoE unchanged"},
 {"G4_MMQ_RASTER_GROUP", KNOB_ENUM,  "8",   "4|8|16",        KNOB_TUNABLE, "gemma4 dense prefill R2 only",
  "byte identity, determinism, chunk invariance, engine byte identity", "weight tiles per R2 group; ignored for raster 0/1; no automatic shape-dependent selection"},

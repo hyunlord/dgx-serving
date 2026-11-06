@@ -17,7 +17,7 @@
      "choices": ["0", "1"]},
     {"name": "G4_MMQ_MIN_S", "type": "int", "default": "1", "range": "1..", "class": "numeric",
      "scope": "gemma4 prefill linear layers", "gates": "golden, ppl, prefill_slot, chunk invariance", "desc": "prefill-mode only: smallest prefill chunk whose layer matmuls use MMQ (1 = every chunk, chunk-invariant; 16 = pre-R21, breaks chunk invariance); verify/decode ignore it"},
-    {"name": "G4_MMQ_RASTER", "type": "enum", "default": "0", "range": "0|1|2", "class": "tunable",
+    {"name": "G4_MMQ_RASTER", "type": "enum", "default": "1", "range": "0|1|2", "class": "tunable",
      "scope": "gemma4 dense prefill layer MMQ only", "gates": "byte identity, determinism, chunk invariance, engine byte identity, golden, spec, batch", "desc": "0 = existing MMQ; 1 = token-fast R1; 2 = grouped R2 diagnostic; MMQ256 nonzero retains its complete existing policy; decode/verify/lm_head/Qwen/MoE unchanged",
      "choices": ["0", "1", "2"]},
     {"name": "G4_MMQ_RASTER_GROUP", "type": "enum", "default": "8", "range": "4|8|16", "class": "tunable",

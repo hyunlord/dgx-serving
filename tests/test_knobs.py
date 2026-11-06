@@ -32,8 +32,9 @@ def check(name, ok, detail=""):
 rc, err, k = run({})
 check("default resolves", rc == 0 and k["G4_KV_DTYPE"] == {"value": "f16", "source": "default", "class": "numeric"}, err)
 check("default graph mode", k is not None and k["G4_CUDA_GRAPH"]["value"] == "2")
-# Given no overrides, the R25 rollout is opt-in and grouped diagnostics use G8.
-check("raster default off", k is not None and k.get("G4_MMQ_RASTER", {}).get("value") == "0")
+# Given no overrides, the R25 rollout uses R1 and grouped diagnostics use G8.
+check("raster default R1", k is not None and k.get("G4_MMQ_RASTER") ==
+      {"value": "1", "source": "default", "class": "tunable"})
 check("raster group default eight", k is not None and k.get("G4_MMQ_RASTER_GROUP", {}).get("value") == "8")
 # Given registered raster/group choices, effective configuration preserves each choice.
 for raster in ("0", "1", "2"):

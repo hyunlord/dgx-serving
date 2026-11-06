@@ -71,7 +71,7 @@ it is: prefill callers pass `prefill=1` (`gemma4_prefill_batch_slot`, the daemon
 | prompt prefill chunk, any `Sq` | 1 | flash when `Sq >= G4_FLASH_MIN_S` (default 1: always) | MMQ when `Sq >= G4_MMQ_MIN_S` (default 1: always) |
 | decode (`Sq=1`), verify, concat, other callers | 0 | flash only when `Sq >= 16` (fixed); otherwise the split-KV decode kernel | MMQ only when `Sq >= 16` (fixed); otherwise SB/GEMV |
 
-- `G4_MMQ_RASTER` (default `0`, choices `0|1|2`) controls CTA ordering only in dense Gemma
+- `G4_MMQ_RASTER` (default `1`, choices `0|1|2`) controls CTA ordering only in dense Gemma
   prefill layer MMQ: `0` keeps the existing path, `1` selects token-fast R1, and `2` enables
   grouped R2 diagnostics. `G4_MMQ_RASTER_GROUP` (default `8`, choices `4|8|16`) applies only
   to R2. There is no automatic shape-dependent choice. These controls preserve activation

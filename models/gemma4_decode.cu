@@ -96,7 +96,7 @@ static int g4d_mmq_min_s(){
 // R25: only dense prefill layer MMQ calls use raster scheduling. MMQ256 wins
 // as a whole policy, including its 128x128 fallback when MMQ256=2.
 static int g4d_mmq_raster(){
-    static const int value=[](){ const char* v=knob_raw("G4_MMQ_RASTER"); return v?atoi(v):0; }();
+    static const int value=[](){ const char* v=knob_raw("G4_MMQ_RASTER"); return v?atoi(v):1; }();
     return value;
 }
 static int g4d_mmq_raster_group(){
